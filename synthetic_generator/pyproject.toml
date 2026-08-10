@@ -1,0 +1,9 @@
+[project]
+name = "synthetic_generator"
+version = "0.1.0"
+description = "Rule-based CATIA synthetic generator for sheet-metal parts with sparse fastening-point counts (see docs/synthetic_two_joint_generation_roadmap.md)"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "../annotation_tool/src"]
+testpaths = ["tests"]
