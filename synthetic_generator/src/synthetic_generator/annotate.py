@@ -1,6 +1,7 @@
 """生成パラメータから joints.json 用の Joint を直接組み立てる。
 
-人手アノテーションと異なり生成時に真値が既知なので、annotation_tool.schema を
+人手アノテーションと異なり生成時に真値が既知なので、annotation_schema(2026-08-10、
+AutoMetalSheetのannotation_tool.schemaからPartMaker独立のためベンダーコピーしたもの)を
 再利用してそのまま書き出せる。各締結点は1部品のみを参照する単独joint
 (mounting_holeの実データパターンと同じ、schema.pyのJointはparts>=1を許容)として
 記録する — 合成生成では相手部品(締結相手)そのものは生成対象外のため。
@@ -8,7 +9,7 @@
 
 from __future__ import annotations
 
-from annotation_tool.schema import Axis, Joint, PartRef
+from synthetic_generator.annotation_schema import Axis, Joint, PartRef
 
 from synthetic_generator.classify import FasteningPoint
 

@@ -4,8 +4,9 @@
 joints.json書き出しまでのオーケストレーションだけをCATIA無しでテストできる
 (tests/test_batch_generate.py参照)。
 
-生成物(STP/CATPart/joints.json)は既定でPartMaker配下に出力する。AutoMetalSheetは
-生成エンジンのコード置き場、PartMakerは生成物の置き場、という役割分担。
+生成物(STP/CATPart/joints.json)は既定で`synthetic_parts/`配下に出力する(2026-08-10、
+本パッケージ自体をAutoMetalSheetから独立したPartMakerリポジトリへ移管したため、
+コード・生成物とも本リポジトリ内で完結する)。
 """
 
 from __future__ import annotations
@@ -15,9 +16,8 @@ import pathlib
 import random
 from typing import Protocol
 
-from annotation_tool.schema import AnnotationDocument, PartEntry
-
 from synthetic_generator.annotate import build_two_joint_pair
+from synthetic_generator.annotation_schema import AnnotationDocument, PartEntry
 from synthetic_generator.reinforcement import ReinforcementParams, sample_reinforcement
 from synthetic_generator.templates.parallel_same_offset import TwoJointSpec
 from synthetic_generator.templates.parallel_same_offset import sample as sample_two_joint_spec
