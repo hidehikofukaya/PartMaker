@@ -2,7 +2,9 @@
 
 Date: 2026-08-02
 Author: fable5 (claude-fable-5), ユーザーとの設計討議に基づく
-Status: Phase 1(parallel_same_offset+フランジ、CATPart/STP出力込み)は実機検証・頑健性検証(15/15)まで完了。Phase 1.5(余肉削減)を新設し、ラフサイジング(min_bearing_radius_mm基準)まで着手済み、正確な長円トリムのCATIA実装が残タスク。ビード補強はPhase3以降に計画。
+Status: Phase 1(parallel_same_offset、CATPart/STP出力込み)は実機検証・頑健性検証まで完了。フランジ補強は実装済みだが2026-08-07に一時無効化(§6.16)。Phase 1.5(余肉削減・長円トリム)は2026-08-07に完了(§6.17/6.19)。ビード補強はPhase3以降に計画。
+
+**リポジトリ移管(2026-08-10)**: 本プロジェクト(`synthetic_generator/`一式とこのdoc)は元々`AutoMetalSheet`配下にあったが、独立リポジトリ`PartMaker`(github.com/hidehikofukaya/PartMaker)へ完全に切り出した。§1で参照する`fable5_progress_to_constraint_point_generation.md`/`fable5_alternative_generation_paradigms.md`は移管対象外のためAutoMetalSheet側に残っている(背景資料として参照するのみで、依存関係はない)。
 
 ## 1. 背景・目的
 
