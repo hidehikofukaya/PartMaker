@@ -53,8 +53,11 @@ from synthetic_generator.classify import (
     MIN_NEUTRAL_PLANE_RADIUS_MM,
     FasteningPoint,
     Vec3,
+    end_panel_corners,
     fold_tangent_length_mm,
+    ramp_fold_angles_rad,
     tangent_length_for_bend_angle_rad,
+    two_point_frame,
 )
 from synthetic_generator.reinforcement import ReinforcementParams
 from synthetic_generator.templates.parallel_same_offset import TwoJointSpec
@@ -134,97 +137,6 @@ def _panel_corners(
         )
 
     return [pt(run0, -half_width, height0), pt(run0, half_width, height0), pt(run1, half_width, height1), pt(run1, -half_width, height1)]
-
-
-# ---------------------------------------------------------------- 任意法線・任意位置への一般化(2026-08-10、純粋関数)
-#
-# roadmap SS6.20参照。_jog_frameは締結点1の法線nを全体の基準にしており、n1≈n2
-# (parallel_sameクラス)でしか正しくない。一般化のコアは「全ての折れ目を単一の共通方向w
-# に平行にする」制約を保ったまま、flat1(法線n1)側とflat2(法線n2)側でそれぞれ別の
-# ローカル走行方向(u1/u2)を持たせること — n1=n2のとき_jog_frameと数値的に一致することを
-# テストで確認済み(u1=u2=axis_dir、w=width_dirに厳密に退化する)。
-
-
-@dataclasses.dataclass(frozen=True)
-class _TwoPointFrame:
-    w: Vec3  # 全ての折れ目に共通な方向(幅方向)。n1・n2両方に直交する
-    u1: Vec3  # 締結点1でのローカル走行方向(締結点2の方へ向く単位ベクトル)
-    u2: Vec3  # 締結点2でのローカル走行方向(u1と同じ「順方向」の意味、締結点1から見て奥へ向く)
-    n1: Vec3
-    n2: Vec3
-
-
-def _two_point_frame(point1: FasteningPoint, point2: FasteningPoint) -> _TwoPointFrame:
-    """任意の法線・任意の位置の2締結点から、共通幅方向wと各点のローカル走行方向u1/u2を求める。
-
-    wは「flat1(法線n1)にもflat2(法線n2)にも直線の折れ目を許す」ために両方の法線に
-    直交する必要がある。n1とn2が平行でなければ`w = normalize(n1 x n2)`の1つ(符号除く)に
-    一意に決まる。n1 ∥ n2(現行のparallel_sameクラス。反平行のparallel_oppositeクラスも
-    n1×n2=0で同じ分岐に入る)のときは、_jog_frameと同じフォールバック(締結点間の接平面内
-    変位方向を使う)で決める。両方退化する場合(法線一致かつ横方向変位ゼロ)は
-    _jog_frameと同じくInfeasible(ValueError)。
-
-    u1/u2の符号は、両方とも「締結点1→2への変位ベクトルと正の内積を持つ」側を選ぶことで、
-    (符号が反転しうる外積由来のベクトルに対して)一貫した「順方向」を与える — n1=n2の
-    退化ケースでは、この符号解決を経てu1=u2=_jog_frameのaxis_dirに厳密に一致する
-    (テストで確認済み)。
-    """
-    n1 = _normalize(point1.normal_xyz)
-    n2 = _normalize(point2.normal_xyz)
-    delta = _sub(point2.position_xyz, point1.position_xyz)
-
-    cross = _cross(n1, n2)
-    cross_len = math.sqrt(sum(c * c for c in cross))
-    if cross_len > 1e-9:
-        w = tuple(c / cross_len for c in cross)
-    else:
-        offset = _dot(delta, n1)
-        tangential = tuple(delta[i] - offset * n1[i] for i in range(3))
-        tangential_len = math.sqrt(sum(c * c for c in tangential))
-        if tangential_len < 1e-6:
-            raise ValueError("point1/point2 must be laterally separated when normals are parallel")
-        axis_fallback = tuple(c / tangential_len for c in tangential)
-        w = _normalize(_cross(n1, axis_fallback))
-
-    def _resolve_sign(u_raw: Vec3) -> Vec3:
-        return u_raw if _dot(u_raw, delta) >= 0 else tuple(-c for c in u_raw)
-
-    u1 = _resolve_sign(_cross(w, n1))
-    u2 = _resolve_sign(_cross(w, n2))
-
-    return _TwoPointFrame(w=w, u1=u1, u2=u2, n1=n1, n2=n2)
-
-
-def _end_panel_corners(origin: Vec3, u: Vec3, w: Vec3, near: float, far: float, half_width: float) -> list[Vec3]:
-    """origin中心のローカル(u,w)フレームで、走行方向near〜far・幅方向±half_widthの
-    平坦矩形の4隅を返す(_panel_cornersのheight0=height1=0特殊形に相当、n方向成分は
-    常に0=originが乗る平面上)。順序は[near,-hw],[near,hw],[far,hw],[far,-hw]
-    (_panel_cornersと同じ規約)。
-    """
-
-    def pt(run: float, width: float) -> Vec3:
-        return tuple(origin[i] + run * u[i] + width * w[i] for i in range(3))
-
-    return [pt(near, -half_width), pt(near, half_width), pt(far, half_width), pt(far, -half_width)]
-
-
-def _ramp_fold_angles_rad(mid_near: Vec3, mid_far: Vec3, u1: Vec3, u2: Vec3) -> tuple[float, float]:
-    """ランプ中心線(mid_near->mid_far)とflat1/flat2それぞれのローカル走行方向(u1/u2)との
-    なす角[ラジアン]を返す(fold1の折れ角, fold2の折れ角)。
-
-    tangent_length_for_bend_angle_rad(classify.py)にそのまま渡せる「外向きの曲がり角」の
-    定義に合わせている: 折れなし(flat1の延長線上にランプがある)なら0、垂直な折れなら
-    90度。n1=n2(平行ケース)のときu1=u2なので両方の角度が等しくなり、既存の
-    fold_tangent_length_mm(offset,ramp_extent,R)が返すalpha=atan2(offset,ramp_extent)と
-    厳密に一致する(テストで確認済み) — 対称なジグザグという特殊ケースを含む一般化になっている。
-    """
-
-    def _angle(a: Vec3, b: Vec3) -> float:
-        d = max(-1.0, min(1.0, _dot(a, b)))
-        return math.acos(d)
-
-    ramp_dir = _normalize(_sub(mid_far, mid_near))
-    return _angle(u1, ramp_dir), _angle(u2, ramp_dir)
 
 
 # ---------------------------------------------------------------- Phase 1.5 余肉削減(円弧トリム、純粋関数)
@@ -887,7 +799,7 @@ class SyntheticPartBuilder:
     ) -> GeneratedPart:
         """任意の法線・任意の位置の締結点2点を、flat1・ランプ・flat2の3ピースでつなぐ。
 
-        `_two_point_frame`(共通幅方向w、締結点ごとのローカル走行方向u1/u2)を使い、
+        `classify.two_point_frame`(共通幅方向w、締結点ごとのローカル走行方向u1/u2)を使い、
         `build_parallel_same_offset`のn1=n2専用ロジックを一般化したもの。フランジ・
         Phase 1.5トリム(円弧)は未対応 — まずメイン形状生成の成功を優先する方針
         (ユーザー確定、2026-08-10)。トリムは`trimmed_end_panel`の円弧掃引角が
@@ -909,20 +821,20 @@ class SyntheticPartBuilder:
                 "Infeasible; not attempting construction."
             )
 
-        frame = _two_point_frame(point1, point2)
+        frame = two_point_frame(point1, point2)
         margin = min_bearing_radius_mm
 
-        flat1_corners = _end_panel_corners(
+        flat1_corners = end_panel_corners(
             point1.position_xyz, frame.u1, frame.w, -margin, fold1_run_mm, half_width_mm
         )
-        flat2_corners = _end_panel_corners(
+        flat2_corners = end_panel_corners(
             point2.position_xyz, frame.u2, frame.w, -fold2_run_mm, margin, half_width_mm
         )
         ramp_corners = [flat1_corners[3], flat1_corners[2], flat2_corners[1], flat2_corners[0]]
 
         mid_near = tuple((flat1_corners[2][i] + flat1_corners[3][i]) / 2 for i in range(3))
         mid_far = tuple((flat2_corners[0][i] + flat2_corners[1][i]) / 2 for i in range(3))
-        fold1_angle, fold2_angle = _ramp_fold_angles_rad(mid_near, mid_far, frame.u1, frame.u2)
+        fold1_angle, fold2_angle = ramp_fold_angles_rad(mid_near, mid_far, frame.u1, frame.u2)
 
         tangent1 = tangent_length_for_bend_angle_rad(fold1_angle, bend_radius_mm)
         tangent2 = tangent_length_for_bend_angle_rad(fold2_angle, bend_radius_mm)
