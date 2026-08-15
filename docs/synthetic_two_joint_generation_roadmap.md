@@ -485,6 +485,16 @@ Phase 1の意図的な単純化(`gsd_build.build_parallel_same_offset`のdocstri
 
 **検証**: 単体テスト4件追加(複数configuration classの出現確認、製造制約レンジの遵守、bend_radiusが独立再計算した実行可能上限に収まるか強制最小値になっているかの照合、決定論性)。実際の生産コード経路(`build_general_two_point`)で40部品バッチを実行し、**31/40成功(77.5%)・CATIA呼び出し自体の失敗は0件**・成功した31件は全て単一シェル。configuration class分布はoblique 31件・parallel_same_offset 6件・orthogonal 2件・parallel_opposite 1件と、意図通り複数クラスが自然に出現した。目視でも2件確認し、いずれも物理的に妥当な(自己交差やねじれのない)折れ曲がりブラケット形状であることを確認した。
 
+### 6.23 `batch_generate.py`の一般ケース対応と本番バッチ生成(2026-08-10)
+
+**ユーザー方針**: フランジ・複数ランプ(大角度の折れ角分割)は今は不要、まず`batch_generate.py`を一般ケースにも対応させ本番バッチを生成することを優先する。
+
+**実装**: `generate_batch`(parallel_same_offset専用)とは別に`generate_general_batch`を新設(`GeneralPartBuilder`Protocol・`GeneratedGeneralPartRecord`も新設)。既存の`generate_batch`と同じskip-and-retry方針(ValueErrorはスキップ・それ以外の例外はバッチ全体を中断)をそのまま踏襲。`build_parallel_same_offset`(spec+reinforcement引数)と`build_general_two_point`(point1/point2+個別キーワード引数)は引数の形が異なるため、共通の抽象化は作らず素直に別関数にした。テスト4件追加(オーケストレーション検証、決定論性、skip-and-retry)。
+
+**本番バッチ生成**: `PartMaker/synthetic_parts/general_two_point_batch1/`に`generate_general_batch(seed=2000, count=40)`で40部品生成。**40/40成功・全件単一シェル**。`joints.json`から実際のconfiguration class分布を再集計したところ、oblique 23件・parallel_same_offset 11件・orthogonal 6件(parallel_oppositeは今回は非出現、角度分布上まれなセグメント)。目視で1件確認し、物理的に妥当な折れ曲がりブラケット形状であることを確認した。
+
+これで「任意の法線・任意の位置の組み合わせでメイン形状生成を成功させる」という優先目標が、幾何・サンプリング・バッチ生成の全レイヤーで完結した。フランジ・Phase 1.5トリムの一般ケースへの適用、大角度での複数ランプ化は、ユーザー確認の上で引き続き未着手(必要になった時点で着手)。
+
 ## 7. 評価・検証計画
 
 - 合成データは**train専用**。既存のtrain/val part分割(seed13等)に、合成パーツを新規idとしてtrainにのみ追加する形にし、valは実データのみで固定する(リーク防止)。

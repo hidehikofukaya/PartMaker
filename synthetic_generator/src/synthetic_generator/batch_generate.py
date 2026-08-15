@@ -1,4 +1,9 @@
-"""parallel_same_offsetクラスの締結点2点部品をバッチ生成する(Phase 1 PoCのエントリポイント)。
+"""締結点2点部品をバッチ生成する(Phase 1 PoCのエントリポイント)。
+
+2つの生成経路がある: `generate_batch`(法線がほぼ一致するparallel_same_offsetクラス専用、
+フランジ・Phase 1.5トリム対応)と`generate_general_batch`(任意の法線・任意の位置、
+roadmap SS6.20〜6.22。フランジ・トリムは未対応、まずメイン形状生成の成功を優先する
+2026-08-10の方針転換による)。
 
 実機(CATIA V5-6)で動作確認済み。builder引数にスタブを渡せば、サンプリング〜
 joints.json書き出しまでのオーケストレーションだけをCATIA無しでテストできる
@@ -19,6 +24,8 @@ from typing import Protocol
 from synthetic_generator.annotate import build_two_joint_pair
 from synthetic_generator.annotation_schema import AnnotationDocument, PartEntry
 from synthetic_generator.reinforcement import ReinforcementParams, sample_reinforcement
+from synthetic_generator.templates.general_two_point import GeneralTwoJointSpec
+from synthetic_generator.templates.general_two_point import sample as sample_general_two_point
 from synthetic_generator.templates.parallel_same_offset import TwoJointSpec
 from synthetic_generator.templates.parallel_same_offset import sample as sample_two_joint_spec
 
@@ -33,6 +40,22 @@ class GeneratedPartLike(Protocol):
 class PartBuilder(Protocol):
     def build_parallel_same_offset(
         self, spec: TwoJointSpec, reinforcement: ReinforcementParams, out_dir: str, part_name: str
+    ) -> GeneratedPartLike: ...
+
+
+class GeneralPartBuilder(Protocol):
+    def build_general_two_point(
+        self,
+        point1,
+        point2,
+        *,
+        min_bearing_radius_mm: float,
+        half_width_mm: float,
+        fold1_run_mm: float,
+        fold2_run_mm: float,
+        bend_radius_mm: float,
+        out_dir: str,
+        part_name: str,
     ) -> GeneratedPartLike: ...
 
 
@@ -103,6 +126,83 @@ def generate_batch(
                 part_id=part_id,
                 spec=spec,
                 reinforcement=reinforcement,
+                stp_path=generated.stp_path,
+                catpart_path=generated.catpart_path,
+            )
+        )
+
+    doc.save()
+    return records
+
+
+@dataclasses.dataclass(frozen=True)
+class GeneratedGeneralPartRecord:
+    part_id: str
+    spec: GeneralTwoJointSpec
+    stp_path: str
+    catpart_path: str
+
+
+def generate_general_batch(
+    builder: GeneralPartBuilder,
+    out_dir: pathlib.Path = DEFAULT_OUTPUT_ROOT,
+    *,
+    count: int,
+    seed: int,
+    max_attempts_per_part: int = 50,
+) -> list[GeneratedGeneralPartRecord]:
+    """任意の法線・任意の位置の締結点ペア(roadmap SS6.20〜6.22)でcount件の成功パーツを
+    生成する。`generate_batch`(parallel_same_offsetクラス専用)と同じskip-and-retry
+    方針(ValueErrorはスキップして次のシードで再試行、それ以外の例外はバッチ全体を中断)。
+    フランジ・Phase 1.5トリムは未対応(`build_general_two_point`自体が未対応、SS6.21参照)。
+    """
+    rng = random.Random(seed)
+    out_dir = pathlib.Path(out_dir)
+
+    doc = AnnotationDocument(assembly_dir=out_dir, full_assembly_stp="synthetic")
+    records: list[GeneratedGeneralPartRecord] = []
+
+    for i in range(1, count + 1):
+        part_id = f"SYN_general_two_point_{i:04d}"
+
+        for attempt in range(max_attempts_per_part):
+            spec = sample_general_two_point(rng)
+            try:
+                generated = builder.build_general_two_point(
+                    spec.point1,
+                    spec.point2,
+                    min_bearing_radius_mm=spec.min_bearing_radius_mm,
+                    half_width_mm=spec.half_width_mm,
+                    fold1_run_mm=spec.fold1_run_mm,
+                    fold2_run_mm=spec.fold2_run_mm,
+                    bend_radius_mm=spec.bend_radius_mm,
+                    out_dir=str(out_dir / "mid"),
+                    part_name=part_id,
+                )
+                break
+            except ValueError:
+                continue
+        else:
+            raise RuntimeError(
+                f"{part_id}: {max_attempts_per_part}回連続でInfeasibleだった。"
+                "サンプリング範囲自体が破綻している可能性がある。"
+            )
+
+        doc.parts[part_id] = PartEntry(
+            part_id=part_id,
+            stp_file=f"mid/{part_id}_mid.stp",
+            vtp_file="",
+            tag="sheet_metal",
+            thickness_mm=spec.thickness_mm,
+            thickness_source="synthetic_generator",
+        )
+        for joint in build_two_joint_pair(part_id, spec.point1, spec.point2, spec.hole_diameter_mm):
+            doc.add_joint(joint)
+
+        records.append(
+            GeneratedGeneralPartRecord(
+                part_id=part_id,
+                spec=spec,
                 stp_path=generated.stp_path,
                 catpart_path=generated.catpart_path,
             )
