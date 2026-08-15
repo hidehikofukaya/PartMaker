@@ -49,7 +49,13 @@ import os
 import pythoncom
 from win32com.client import Dispatch
 
-from synthetic_generator.classify import FasteningPoint, Vec3, fold_tangent_length_mm, tangent_length_for_bend_angle_rad
+from synthetic_generator.classify import (
+    MIN_NEUTRAL_PLANE_RADIUS_MM,
+    FasteningPoint,
+    Vec3,
+    fold_tangent_length_mm,
+    tangent_length_for_bend_angle_rad,
+)
 from synthetic_generator.reinforcement import ReinforcementParams
 from synthetic_generator.templates.parallel_same_offset import TwoJointSpec
 
@@ -200,6 +206,25 @@ def _end_panel_corners(origin: Vec3, u: Vec3, w: Vec3, near: float, far: float, 
         return tuple(origin[i] + run * u[i] + width * w[i] for i in range(3))
 
     return [pt(near, -half_width), pt(near, half_width), pt(far, half_width), pt(far, -half_width)]
+
+
+def _ramp_fold_angles_rad(mid_near: Vec3, mid_far: Vec3, u1: Vec3, u2: Vec3) -> tuple[float, float]:
+    """ランプ中心線(mid_near->mid_far)とflat1/flat2それぞれのローカル走行方向(u1/u2)との
+    なす角[ラジアン]を返す(fold1の折れ角, fold2の折れ角)。
+
+    tangent_length_for_bend_angle_rad(classify.py)にそのまま渡せる「外向きの曲がり角」の
+    定義に合わせている: 折れなし(flat1の延長線上にランプがある)なら0、垂直な折れなら
+    90度。n1=n2(平行ケース)のときu1=u2なので両方の角度が等しくなり、既存の
+    fold_tangent_length_mm(offset,ramp_extent,R)が返すalpha=atan2(offset,ramp_extent)と
+    厳密に一致する(テストで確認済み) — 対称なジグザグという特殊ケースを含む一般化になっている。
+    """
+
+    def _angle(a: Vec3, b: Vec3) -> float:
+        d = max(-1.0, min(1.0, _dot(a, b)))
+        return math.acos(d)
+
+    ramp_dir = _normalize(_sub(mid_far, mid_near))
+    return _angle(u1, ramp_dir), _angle(u2, ramp_dir)
 
 
 # ---------------------------------------------------------------- Phase 1.5 余肉削減(円弧トリム、純粋関数)
@@ -836,6 +861,138 @@ class SyntheticPartBuilder:
                 whole = self.edge_fillet(part, flange_edge2_ref, reinforcement.flange_bend_radius_mm)
                 body.AppendHybridShape(whole)
                 part.Update()
+
+            part.InWorkObject = whole
+            part.Update()
+        except Exception:
+            self._discard_failed_attempt(out_dir, part_name, doc)
+            raise
+
+        return self.export_stp(doc, whole, out_dir, part_name)
+
+    # ------------------------------------------------------------ 任意法線・任意位置(2026-08-10、roadmap SS6.20)
+
+    def build_general_two_point(
+        self,
+        point1: FasteningPoint,
+        point2: FasteningPoint,
+        *,
+        min_bearing_radius_mm: float,
+        half_width_mm: float,
+        fold1_run_mm: float,
+        fold2_run_mm: float,
+        bend_radius_mm: float,
+        out_dir: str,
+        part_name: str,
+    ) -> GeneratedPart:
+        """任意の法線・任意の位置の締結点2点を、flat1・ランプ・flat2の3ピースでつなぐ。
+
+        `_two_point_frame`(共通幅方向w、締結点ごとのローカル走行方向u1/u2)を使い、
+        `build_parallel_same_offset`のn1=n2専用ロジックを一般化したもの。フランジ・
+        Phase 1.5トリム(円弧)は未対応 — まずメイン形状生成の成功を優先する方針
+        (ユーザー確定、2026-08-10)。トリムは`trimmed_end_panel`の円弧掃引角が
+        axis_dir/width_dirの符号に依存するため、flat1・flat2で法線が異なる一般ケースでの
+        符号整合を別途検討してから再適用する。
+
+        `fold1_run_mm`/`fold2_run_mm`はそれぞれ締結点1/2からランプ側の折れ目までの距離
+        (旧来の対称な`jog_ramp_extent_mm`分割と異なり、独立な自由パラメータ)。
+        `bend_radius_mm`は両方の折れに共通の単一半径(旧来と同じ設計)。
+        """
+        if bend_radius_mm < MIN_NEUTRAL_PLANE_RADIUS_MM:
+            raise ValueError(
+                f"bend_radius_mm={bend_radius_mm:.1f} is below the mandatory minimum "
+                f"{MIN_NEUTRAL_PLANE_RADIUS_MM:.1f}mm. Infeasible; not attempting construction."
+            )
+        if bend_radius_mm > 0.9 * half_width_mm:
+            raise ValueError(
+                f"bend_radius_mm={bend_radius_mm:.1f} exceeds 0.9x half_width_mm={half_width_mm:.1f}. "
+                "Infeasible; not attempting construction."
+            )
+
+        frame = _two_point_frame(point1, point2)
+        margin = min_bearing_radius_mm
+
+        flat1_corners = _end_panel_corners(
+            point1.position_xyz, frame.u1, frame.w, -margin, fold1_run_mm, half_width_mm
+        )
+        flat2_corners = _end_panel_corners(
+            point2.position_xyz, frame.u2, frame.w, -fold2_run_mm, margin, half_width_mm
+        )
+        ramp_corners = [flat1_corners[3], flat1_corners[2], flat2_corners[1], flat2_corners[0]]
+
+        mid_near = tuple((flat1_corners[2][i] + flat1_corners[3][i]) / 2 for i in range(3))
+        mid_far = tuple((flat2_corners[0][i] + flat2_corners[1][i]) / 2 for i in range(3))
+        fold1_angle, fold2_angle = _ramp_fold_angles_rad(mid_near, mid_far, frame.u1, frame.u2)
+
+        tangent1 = tangent_length_for_bend_angle_rad(fold1_angle, bend_radius_mm)
+        tangent2 = tangent_length_for_bend_angle_rad(fold2_angle, bend_radius_mm)
+
+        if fold1_run_mm - tangent1 < min_bearing_radius_mm:
+            raise ValueError(
+                f"fold1 (angle={math.degrees(fold1_angle):.1f}deg, bend_radius_mm={bend_radius_mm:.1f}) "
+                f"eats {tangent1:.1f}mm into flat1, leaving less than min_bearing_radius_mm="
+                f"{min_bearing_radius_mm:.1f}mm before point1. Infeasible; not attempting construction."
+            )
+        if fold2_run_mm - tangent2 < min_bearing_radius_mm:
+            raise ValueError(
+                f"fold2 (angle={math.degrees(fold2_angle):.1f}deg, bend_radius_mm={bend_radius_mm:.1f}) "
+                f"eats {tangent2:.1f}mm into flat2, leaving less than min_bearing_radius_mm="
+                f"{min_bearing_radius_mm:.1f}mm before point2. Infeasible; not attempting construction."
+            )
+        ramp_length = math.sqrt(sum((mid_far[i] - mid_near[i]) ** 2 for i in range(3)))
+        if tangent1 + tangent2 > ramp_length:
+            raise ValueError(
+                f"fold1/fold2 tangent lengths ({tangent1:.1f}mm + {tangent2:.1f}mm) exceed the "
+                f"ramp's own length ({ramp_length:.1f}mm) -- the two fillets would overlap on the "
+                "ramp. Infeasible; not attempting construction."
+            )
+
+        doc = self.new_part_document()
+        try:
+            part = doc.Part
+            hsf = part.HybridShapeFactory
+            spa = doc.GetWorkbench("SPAWorkbench")
+            body = part.HybridBodies.Add()
+            body.Name = f"{part_name}_synthetic"
+
+            flat1 = self.rect_fill(hsf, part, body, flat1_corners)
+            riser = self.rect_fill(hsf, part, body, ramp_corners)
+            flat2 = self.rect_fill(hsf, part, body, flat2_corners)
+            whole = self.join(hsf, part, body, [flat1, riser, flat2])
+            part.Update()
+
+            fold1_mid = tuple((ramp_corners[0][i] + ramp_corners[1][i]) / 2 for i in range(3))
+            fold2_mid = tuple((ramp_corners[2][i] + ramp_corners[3][i]) / 2 for i in range(3))
+
+            # 2026-08-10発覚(roadmap SS6.20): 任意法線ケースでは、fold1/fold2の折れ角の
+            # 数値自体は事前チェック(タンジェント長・R>=4mm等)を満たしていても、2箇所目の
+            # エッジフィレットのUpdateがCATIA側の数値的な脆さで失敗することがある。実機で
+            # 72通り以上の(fold1角度, fold2角度, 幅方向オフセット, 3D回転)の組み合わせを
+            # 体系的に検証したが、系統的な角度閾値やオフセット閾値としては再現できず、
+            # 特定の3D配置に固有の現象と判断した(小さな摂動を加えても安定して再現する
+            # 一方、幾何パラメータを変えた再構成では再現しない)。Python側の事前チェックで
+            # 確実に予測するのは非現実的なため、ここでCATIA側の失敗を捕まえてInfeasible
+            # (ValueError)に変換し、batch_generate.pyの既存skip-and-retry方針(SS6.18)に
+            # 委ねる。他のステップ(join等)で例外が出た場合は本来のバグの可能性が高いため、
+            # ここでは変換せずそのまま送出する。
+            try:
+                edge1_ref = self.find_edge_near(doc, part, spa, hsf, body, whole, fold1_mid)
+                whole = self.edge_fillet(part, edge1_ref, bend_radius_mm)
+                body.AppendHybridShape(whole)
+                part.Update()
+
+                edge2_ref = self.find_edge_near(doc, part, spa, hsf, body, whole, fold2_mid)
+                whole = self.edge_fillet(part, edge2_ref, bend_radius_mm)
+                body.AppendHybridShape(whole)
+                part.Update()
+            except Exception as fillet_exc:
+                raise ValueError(
+                    f"CATIA edge fillet failed for this specific fold geometry "
+                    f"(fold1={math.degrees(fold1_angle):.1f}deg, fold2={math.degrees(fold2_angle):.1f}deg, "
+                    f"bend_radius_mm={bend_radius_mm:.1f}) -- a known numerically fragile case "
+                    f"(roadmap SS6.20), not predictable from a Python-side pre-check. "
+                    f"Infeasible; not attempting further construction. Original error: {fillet_exc}"
+                ) from fillet_exc
 
             part.InWorkObject = whole
             part.Update()

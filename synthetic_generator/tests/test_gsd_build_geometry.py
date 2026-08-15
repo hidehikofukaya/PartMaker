@@ -7,11 +7,12 @@ import math
 
 import pytest
 
-from synthetic_generator.classify import FasteningPoint
+from synthetic_generator.classify import FasteningPoint, fold_tangent_length_mm
 from synthetic_generator.gsd_build import (
     _end_panel_corners,
     _jog_frame,
     _panel_corners,
+    _ramp_fold_angles_rad,
     _tangent_arc_boundary,
     _two_point_frame,
 )
@@ -269,3 +270,49 @@ def test_general_ramp_corners_are_planar_for_orthogonal_normals() -> None:
     )
     triple_product = _dot3(v1, cross23)
     assert triple_product == pytest.approx(0.0, abs=1e-6)
+
+
+def test_ramp_fold_angles_match_parallel_case_alpha_formula() -> None:
+    """n1=n2の対称ジグザグでは、fold1・fold2の折れ角が等しく、既存のfold_tangent_length_mmが
+    内部で使うalpha=atan2(offset,ramp_extent)に一致するはず(SS6.20の一般化が既存の解析式を
+    特殊ケースとして含んでいることの確認)。"""
+    p1 = FasteningPoint(position_xyz=(0.0, 0.0, 0.0), normal_xyz=(0.0, 0.0, 1.0))
+    p2 = FasteningPoint(position_xyz=(50.0, 0.0, 20.0), normal_xyz=(0.0, 0.0, 1.0))
+    frame = _two_point_frame(p1, p2)
+    old_frame = _jog_frame(p1, p2)
+
+    x_start = 15.0
+    ramp_extent = 8.0
+    x_end2 = old_frame.run_length_mm - (x_start + ramp_extent)
+
+    mid_near = tuple(p1.position_xyz[i] + x_start * frame.u1[i] for i in range(3))
+    mid_far = tuple(p2.position_xyz[i] - x_end2 * frame.u2[i] for i in range(3))
+
+    fold1_angle, fold2_angle = _ramp_fold_angles_rad(mid_near, mid_far, frame.u1, frame.u2)
+
+    expected_alpha = math.atan2(old_frame.offset_mm, ramp_extent)
+    assert fold1_angle == pytest.approx(expected_alpha)
+    assert fold2_angle == pytest.approx(expected_alpha)
+
+    # tangent_length_for_bend_angle_rad経由でも既存のfold_tangent_length_mmと一致するはず
+    radius = 10.0
+    from synthetic_generator.classify import tangent_length_for_bend_angle_rad
+
+    assert tangent_length_for_bend_angle_rad(fold1_angle, radius) == pytest.approx(
+        fold_tangent_length_mm(old_frame.offset_mm, ramp_extent, radius)
+    )
+
+
+def test_ramp_fold_angles_sane_for_orthogonal_normals() -> None:
+    """直交ケースでも、両方の折れ角が0〜180度の範囲に収まり、退化(NaN等)しないはず。"""
+    p1 = FasteningPoint(position_xyz=(0.0, 0.0, 0.0), normal_xyz=(0.0, 0.0, 1.0))
+    p2 = FasteningPoint(position_xyz=(80.0, 20.0, 50.0), normal_xyz=(1.0, 0.0, 0.0))
+    frame = _two_point_frame(p1, p2)
+
+    mid_near = tuple(p1.position_xyz[i] + 25.0 * frame.u1[i] for i in range(3))
+    mid_far = tuple(p2.position_xyz[i] - 25.0 * frame.u2[i] for i in range(3))
+
+    fold1_angle, fold2_angle = _ramp_fold_angles_rad(mid_near, mid_far, frame.u1, frame.u2)
+
+    assert 0.0 <= fold1_angle <= math.pi
+    assert 0.0 <= fold2_angle <= math.pi
