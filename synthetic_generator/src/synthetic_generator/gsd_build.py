@@ -51,11 +51,14 @@ from win32com.client import Dispatch
 
 from synthetic_generator.classify import (
     MIN_NEUTRAL_PLANE_RADIUS_MM,
+    MIN_PANEL_CLEARANCE_MM,
     FasteningPoint,
     Vec3,
     end_panel_corners,
+    flat_panels_clearance_mm,
     fold_tangent_length_mm,
     ramp_fold_angles_rad,
+    single_fold_layout,
     tangent_length_for_bend_angle_rad,
     two_point_frame,
 )
@@ -797,7 +800,12 @@ class SyntheticPartBuilder:
         out_dir: str,
         part_name: str,
     ) -> GeneratedPart:
-        """任意の法線・任意の位置の締結点2点を、flat1・ランプ・flat2の3ピースでつなぐ。
+        """任意の法線・任意の位置の締結点2点を、単曲げまたは2曲げの面でつなぐ。
+
+        2026-08-21(roadmap SS6.24)より2経路ある: 2平面の交線で1回曲げれば足りるうえ、
+        3ピース構成での「無駄な曲げ量」が大きいケース(`classify.single_fold_layout`が
+        判定)は**パネル2枚+折れ目1本**で作る。それ以外は従来どおりflat1・ランプ・flat2の
+        3ピース(折れ目2本)で作る。後者にはflat同士の面干渉チェックが入る。
 
         `classify.two_point_frame`(共通幅方向w、締結点ごとのローカル走行方向u1/u2)を使い、
         `build_parallel_same_offset`のn1=n2専用ロジックを一般化したもの。フランジ・
@@ -836,6 +844,35 @@ class SyntheticPartBuilder:
         mid_far = tuple((flat2_corners[0][i] + flat2_corners[1][i]) / 2 for i in range(3))
         fold1_angle, fold2_angle = ramp_fold_angles_rad(mid_near, mid_far, frame.u1, frame.u2)
 
+        layout = single_fold_layout(
+            point1,
+            point2,
+            frame,
+            bend_radius_mm=bend_radius_mm,
+            min_bearing_radius_mm=margin,
+            half_width_mm=half_width_mm,
+            ramp_fold_angles=(fold1_angle, fold2_angle),
+        )
+        if layout is not None:
+            # 単曲げ(roadmap SS6.24): 2平面の交線で1回だけ曲げる。2枚のパネルが折れ目を
+            # 共有するので断面が2セグメントになり、flat同士の干渉は原理的に起きない
+            # (下の2曲げ経路のクリアランスチェックはこちらには不要)。fold1_run_mm/
+            # fold2_run_mm は使わない — 折れ目の位置は交線として幾何的に決まるため。
+            panel_corner_sets = [
+                end_panel_corners(
+                    layout.origin1, frame.u1, frame.w, -margin, layout.d1_mm, layout.half_width_mm
+                ),
+                end_panel_corners(
+                    layout.origin2, frame.u2, frame.w, -layout.d2_mm, margin, layout.half_width_mm
+                ),
+            ]
+            first = panel_corner_sets[0]
+            fold_mids = [tuple((first[2][i] + first[3][i]) / 2 for i in range(3))]
+            fold_angles_deg = [math.degrees(layout.bend_angle_rad)]
+            return self._assemble_general_two_point(
+                panel_corner_sets, fold_mids, fold_angles_deg, bend_radius_mm, out_dir, part_name
+            )
+
         tangent1 = tangent_length_for_bend_angle_rad(fold1_angle, bend_radius_mm)
         tangent2 = tangent_length_for_bend_angle_rad(fold2_angle, bend_radius_mm)
 
@@ -858,7 +895,49 @@ class SyntheticPartBuilder:
                 f"ramp's own length ({ramp_length:.1f}mm) -- the two fillets would overlap on the "
                 "ramp. Infeasible; not attempting construction."
             )
+        # 2026-08-21(roadmap SS6.24): 断面上でflat1とflat2が交差/近接するケース(実測6.2%が
+        # 実際に3Dで面同士が干渉、さらに1.6%が5mm未満のニアミス)。上の3つの事前チェックは
+        # どれも隣接する折れ目まわりしか見ておらず、非隣接のflat同士を見ていなかった。
+        clearance = flat_panels_clearance_mm(
+            point1,
+            point2,
+            frame,
+            min_bearing_radius_mm=margin,
+            fold1_run_mm=fold1_run_mm,
+            fold2_run_mm=fold2_run_mm,
+            half_width_mm=half_width_mm,
+        )
+        if clearance < MIN_PANEL_CLEARANCE_MM:
+            raise ValueError(
+                f"flat1 and flat2 come within {clearance:.1f}mm of each other in the section "
+                f"(minimum {MIN_PANEL_CLEARANCE_MM:.1f}mm) -- the folded panels would interfere. "
+                "Infeasible; not attempting construction."
+            )
 
+        fold1_mid = tuple((ramp_corners[0][i] + ramp_corners[1][i]) / 2 for i in range(3))
+        fold2_mid = tuple((ramp_corners[2][i] + ramp_corners[3][i]) / 2 for i in range(3))
+        return self._assemble_general_two_point(
+            [flat1_corners, ramp_corners, flat2_corners],
+            [fold1_mid, fold2_mid],
+            [math.degrees(fold1_angle), math.degrees(fold2_angle)],
+            bend_radius_mm,
+            out_dir,
+            part_name,
+        )
+
+    def _assemble_general_two_point(
+        self,
+        panel_corner_sets: list[list[Vec3]],
+        fold_mids: list[Vec3],
+        fold_angles_deg: list[float],
+        bend_radius_mm: float,
+        out_dir: str,
+        part_name: str,
+    ) -> GeneratedPart:
+        """平坦パネル群をjoinし、各折れ目にエッジフィレットを当ててエクスポートする。
+
+        単曲げ(パネル2枚・折れ目1本)と2曲げ(flat1+ランプ+flat2・折れ目2本)で共通。
+        """
         doc = self.new_part_document()
         try:
             part = doc.Part
@@ -867,14 +946,9 @@ class SyntheticPartBuilder:
             body = part.HybridBodies.Add()
             body.Name = f"{part_name}_synthetic"
 
-            flat1 = self.rect_fill(hsf, part, body, flat1_corners)
-            riser = self.rect_fill(hsf, part, body, ramp_corners)
-            flat2 = self.rect_fill(hsf, part, body, flat2_corners)
-            whole = self.join(hsf, part, body, [flat1, riser, flat2])
+            faces = [self.rect_fill(hsf, part, body, corners) for corners in panel_corner_sets]
+            whole = self.join(hsf, part, body, faces)
             part.Update()
-
-            fold1_mid = tuple((ramp_corners[0][i] + ramp_corners[1][i]) / 2 for i in range(3))
-            fold2_mid = tuple((ramp_corners[2][i] + ramp_corners[3][i]) / 2 for i in range(3))
 
             # 2026-08-10発覚(roadmap SS6.20): 任意法線ケースでは、fold1/fold2の折れ角の
             # 数値自体は事前チェック(タンジェント長・R>=4mm等)を満たしていても、2箇所目の
@@ -888,19 +962,16 @@ class SyntheticPartBuilder:
             # 委ねる。他のステップ(join等)で例外が出た場合は本来のバグの可能性が高いため、
             # ここでは変換せずそのまま送出する。
             try:
-                edge1_ref = self.find_edge_near(doc, part, spa, hsf, body, whole, fold1_mid)
-                whole = self.edge_fillet(part, edge1_ref, bend_radius_mm)
-                body.AppendHybridShape(whole)
-                part.Update()
-
-                edge2_ref = self.find_edge_near(doc, part, spa, hsf, body, whole, fold2_mid)
-                whole = self.edge_fillet(part, edge2_ref, bend_radius_mm)
-                body.AppendHybridShape(whole)
-                part.Update()
+                for fold_mid in fold_mids:
+                    edge_ref = self.find_edge_near(doc, part, spa, hsf, body, whole, fold_mid)
+                    whole = self.edge_fillet(part, edge_ref, bend_radius_mm)
+                    body.AppendHybridShape(whole)
+                    part.Update()
             except Exception as fillet_exc:
+                folds = ", ".join(f"{angle:.1f}deg" for angle in fold_angles_deg)
                 raise ValueError(
                     f"CATIA edge fillet failed for this specific fold geometry "
-                    f"(fold1={math.degrees(fold1_angle):.1f}deg, fold2={math.degrees(fold2_angle):.1f}deg, "
+                    f"(folds={folds}, "
                     f"bend_radius_mm={bend_radius_mm:.1f}) -- a known numerically fragile case "
                     f"(roadmap SS6.20), not predictable from a Python-side pre-check. "
                     f"Infeasible; not attempting further construction. Original error: {fillet_exc}"

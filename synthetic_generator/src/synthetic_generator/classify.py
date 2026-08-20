@@ -206,3 +206,161 @@ def ramp_fold_angles_rad(mid_near: Vec3, mid_far: Vec3, u1: Vec3, u2: Vec3) -> t
 
     ramp_dir = _normalize(_sub(mid_far, mid_near))
     return _angle(u1, ramp_dir), _angle(u2, ramp_dir)
+
+
+# ---------------------------------------------------------------- 単曲げ経路と面干渉チェック(2026-08-21)
+#
+# roadmap SS6.24参照。build_general_two_pointは元々「flat1+ランプ+flat2」の3ピース固定で、
+# 折れ目が必ず2本できる(法線が平行なジョグ由来の構成)。法線が交わる一般ケースでは
+# 2平面の交線で1回曲げれば足りるため、「無駄な曲げ量」が大きいケースだけ単曲げに置き換える。
+
+# 無駄な曲げ量 = (fold1の折れ角 + fold2の折れ角) - 正味の折れ角θ。0なら2つの折れが同方向に
+# θを分担しているだけ(妥当な2曲げ部品)、大きいほど行き過ぎて戻るS字=明らかに余計な曲げ。
+# 30度は3000サンプルの実測(単曲げ可能ケースのexcess中央値43度)から、単曲げ可能ケースの
+# 37%だけを置き換える保守的な水準として選んだ較正値(ユーザー判断、2026-08-21)。
+SINGLE_FOLD_MIN_EXCESS_RAD = math.radians(30.0)
+
+# 単曲げでは2枚のパネルが1本の折れ目を共有するため、幅方向オフセットをランプの台形で
+# 吸収できない(2曲げ経路との構造的な差)。両パネルの幅を half_width + |dw|/2 に広げて
+# 吸収するので、広げすぎないよう |dw| に上限を置く(3.0倍 = 幅の膨張は2.5倍以内)。
+SINGLE_FOLD_MAX_LATERAL_RATIO = 3.0
+
+# 断面上でflat1とflat2がこれ以下まで近づいたら干渉扱い(実測: 完全交差6.2%に加えて
+# 5mm未満のニアミスが1.6%)。板厚(最大2.5mm)の両側分を見込んだ値。
+MIN_PANEL_CLEARANCE_MM = 5.0
+
+
+@dataclasses.dataclass(frozen=True)
+class SingleFoldLayout:
+    """2平面の交線で1回だけ曲げる構成。two_point_frameのu1/u2/wと組で使う。"""
+
+    origin1: Vec3  # flat1のローカル原点(締結点1を共通の幅中心cmまでw方向にずらした点)
+    origin2: Vec3  # flat2のローカル原点(同上)
+    d1_mm: float  # 締結点1から折れ目までの距離(u1方向)
+    d2_mm: float  # 折れ目から締結点2までの距離(u2方向)
+    bend_angle_rad: float  # 折れ目での外向きの曲がり角(=u1とu2のなす角)
+    half_width_mm: float  # 幅方向オフセットを吸収するため広げた後の半幅
+
+
+def single_fold_layout(
+    point1: FasteningPoint,
+    point2: FasteningPoint,
+    frame: TwoPointFrame,
+    *,
+    bend_radius_mm: float,
+    min_bearing_radius_mm: float,
+    half_width_mm: float,
+    ramp_fold_angles: tuple[float, float],
+) -> SingleFoldLayout | None:
+    """単曲げで作るべきケースならそのレイアウトを、そうでなければNoneを返す。
+
+    Noneを返す条件: 法線が平行で交線が存在しない / 交線が締結点の後方にある /
+    折れ目のフィレットがbearing radiusを侵す / 幅方向オフセットが大きすぎる /
+    2曲げでの無駄な曲げ量がSINGLE_FOLD_MIN_EXCESS_RADに満たない(=妥当な2曲げ部品)。
+
+    交線Lは必ずwに平行なので、両パネルをw方向に共通の幅中心cmまでずらせば、flat1の
+    折れ目側の辺とflat2の折れ目側の辺は厳密に一致する(テストで確認済み)。
+    """
+    n1, n2, u1, u2, w = frame.n1, frame.n2, frame.u1, frame.u2, frame.w
+    if abs(abs(_dot(n1, n2)) - 1.0) < 1e-9:
+        return None  # 平行な2平面は交わらない(ジョグが必然)
+
+    bend_angle = math.acos(max(-1.0, min(1.0, _dot(u1, u2))))
+    excess = ramp_fold_angles[0] + ramp_fold_angles[1] - bend_angle
+    if excess < SINGLE_FOLD_MIN_EXCESS_RAD:
+        return None  # 2つの折れが素直にθを分担している = 妥当な2曲げ部品なので触らない
+
+    delta = _sub(point2.position_xyz, point1.position_xyz)
+    lateral = _dot(delta, w)
+    if abs(lateral) > SINGLE_FOLD_MAX_LATERAL_RATIO * half_width_mm:
+        return None
+
+    # 交線: 締結点1からu1方向にd1進んだ点がflat2の平面にも乗る条件を解く
+    # (flat1の平面上を動く限りn1成分は0のままなので、1次元の線形方程式になる)
+    denominator = _dot(u1, n2)
+    if abs(denominator) < 1e-9:
+        return None
+    d1 = _dot(delta, n2) / denominator
+    fold_point = tuple(point1.position_xyz[i] + d1 * u1[i] for i in range(3))
+    d2 = _dot(_sub(point2.position_xyz, fold_point), u2)
+
+    tangent = tangent_length_for_bend_angle_rad(bend_angle, bend_radius_mm)
+    if d1 - tangent < min_bearing_radius_mm or d2 - tangent < min_bearing_radius_mm:
+        return None
+
+    widened = half_width_mm + abs(lateral) / 2.0
+    shift1 = lateral / 2.0  # 締結点1から共通幅中心cmまでのw方向のずれ
+    shift2 = -lateral / 2.0
+    return SingleFoldLayout(
+        origin1=tuple(point1.position_xyz[i] + shift1 * w[i] for i in range(3)),
+        origin2=tuple(point2.position_xyz[i] + shift2 * w[i] for i in range(3)),
+        d1_mm=d1,
+        d2_mm=d2,
+        bend_angle_rad=bend_angle,
+        half_width_mm=widened,
+    )
+
+
+def _segment_distance_2d(
+    a: tuple[float, float], b: tuple[float, float], c: tuple[float, float], d: tuple[float, float]
+) -> float:
+    """2D線分ab-cd間の最小距離(交差していれば0)。"""
+
+    def cross(o, p, q) -> float:
+        return (p[0] - o[0]) * (q[1] - o[1]) - (p[1] - o[1]) * (q[0] - o[0])
+
+    d1, d2 = cross(c, d, a), cross(c, d, b)
+    d3, d4 = cross(a, b, c), cross(a, b, d)
+    if (d1 > 0) != (d2 > 0) and (d3 > 0) != (d4 > 0):
+        return 0.0
+
+    def point_to_segment(p, s, e) -> float:
+        se = (e[0] - s[0], e[1] - s[1])
+        length_sq = se[0] * se[0] + se[1] * se[1]
+        t = 0.0 if length_sq < 1e-12 else ((p[0] - s[0]) * se[0] + (p[1] - s[1]) * se[1]) / length_sq
+        t = max(0.0, min(1.0, t))
+        return math.hypot(p[0] - s[0] - t * se[0], p[1] - s[1] - t * se[1])
+
+    return min(
+        point_to_segment(a, c, d),
+        point_to_segment(b, c, d),
+        point_to_segment(c, a, b),
+        point_to_segment(d, a, b),
+    )
+
+
+def flat_panels_clearance_mm(
+    point1: FasteningPoint,
+    point2: FasteningPoint,
+    frame: TwoPointFrame,
+    *,
+    min_bearing_radius_mm: float,
+    fold1_run_mm: float,
+    fold2_run_mm: float,
+    half_width_mm: float,
+) -> float:
+    """2曲げ構成でflat1とflat2が干渉していないかを、wに垂直な断面上の距離で測る。
+
+    折れ目は全てwに平行なので、断面(u1,n1平面)ではflat1-ランプ-flat2が3本の線分になる。
+    隣接する2組は折れ目を共有しているだけだが、非隣接のflat1-flat2は交差しうる —
+    既存の事前チェック(R下限・接線長のbearing侵食・ランプ上のフィレット重なり)は
+    どれもこれを見ておらず、実測で6.2%が実際に面同士で干渉していた(roadmap SS6.24)。
+
+    幅方向にすれ違っている(|dw| >= 2*half_width)場合は断面で交差していても3Dでは
+    干渉しないため、無限大を返す(実測でこの過剰判定が全交差517件中333件を占めた)。
+    """
+    lateral = abs(_dot(_sub(point2.position_xyz, point1.position_xyz), frame.w))
+    if lateral >= 2 * half_width_mm:
+        return math.inf
+
+    def project(p: Vec3) -> tuple[float, float]:
+        rel = _sub(p, point1.position_xyz)
+        return (_dot(rel, frame.u1), _dot(rel, frame.n1))
+
+    def along(origin: Vec3, u: Vec3, run: float) -> Vec3:
+        return tuple(origin[i] + run * u[i] for i in range(3))
+
+    p1, p2 = point1.position_xyz, point2.position_xyz
+    flat1 = (project(along(p1, frame.u1, -min_bearing_radius_mm)), project(along(p1, frame.u1, fold1_run_mm)))
+    flat2 = (project(along(p2, frame.u2, -fold2_run_mm)), project(along(p2, frame.u2, min_bearing_radius_mm)))
+    return _segment_distance_2d(*flat1, *flat2)
