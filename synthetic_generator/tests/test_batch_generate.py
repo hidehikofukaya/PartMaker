@@ -107,9 +107,9 @@ class _FakeGeneralBuilder:
 
     def build_general_two_point(
         self, point1, point2, *, min_bearing_radius_mm, half_width_mm, fold1_run_mm, fold2_run_mm,
-        bend_radius_mm, out_dir, part_name,
+        bend_radius_mm, out_dir, part_name, bead=None,
     ):
-        self.calls.append((point1, point2, out_dir, part_name))
+        self.calls.append((point1, point2, out_dir, part_name, bead))
         return _FakeGeneratedPart(
             stp_path=f"{out_dir}/{part_name}_mid.stp", catpart_path=f"{out_dir}/{part_name}_mid.CATPart"
         )

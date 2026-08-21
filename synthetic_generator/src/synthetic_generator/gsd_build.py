@@ -49,6 +49,7 @@ import os
 import pythoncom
 from win32com.client import Dispatch
 
+from synthetic_generator.bead import BeadParams, bead_cells, bead_fits
 from synthetic_generator.classify import (
     MIN_NEUTRAL_PLANE_RADIUS_MM,
     MIN_PANEL_CLEARANCE_MM,
@@ -487,6 +488,24 @@ class SyntheticPartBuilder:
         iPropagMode=0(隣接エッジへの伝播なし、この1エッジのみ)で動作確認済み。"""
         return part.ShapeFactory.AddNewSurfaceEdgeFilletWithConstantRadius(edge_ref, propagation_mode, radius_mm)
 
+    def edge_fillet_group(self, part, edge_refs: list, radius_mm: float):
+        """複数エッジを1つのEdgeFilletフィーチャーにまとめて当てる(AddObjectToFillet)。
+
+        2026-08-21(roadmap SS6.25)の実機検証: ビードが曲げをまたぐと、ビードの縦フィレット列と
+        メイン折れ目のフィレット列が交差する。1エッジずつ順に当てると、**先にどちらを当てても
+        後から当てた側が交差点で必ずUpdate失敗する**(順序・半径・横方向オフセットを変えても
+        再現、SS6.15の「角の共有」の一段上の問題)。全エッジを1フィーチャーにまとめると、
+        CATIA側が交差部のコーナーブレンドを一括で解くため成功する。
+
+        エッジ1本だけを渡した場合は`edge_fillet`と完全に同じ結果になる。
+        """
+        if not edge_refs:
+            raise ValueError("edge_fillet_group requires at least 1 edge")
+        fillet = self.edge_fillet(part, edge_refs[0], radius_mm)
+        for edge_ref in edge_refs[1:]:
+            fillet.AddObjectToFillet(edge_ref)
+        return fillet
+
     # ------------------------------------------------------------ Phase 1 オーケストレーション
 
     def build_parallel_same_offset(
@@ -799,6 +818,7 @@ class SyntheticPartBuilder:
         bend_radius_mm: float,
         out_dir: str,
         part_name: str,
+        bead: BeadParams | None = None,
     ) -> GeneratedPart:
         """任意の法線・任意の位置の締結点2点を、単曲げまたは2曲げの面でつなぐ。
 
@@ -868,9 +888,15 @@ class SyntheticPartBuilder:
             ]
             first = panel_corner_sets[0]
             fold_mids = [tuple((first[2][i] + first[3][i]) / 2 for i in range(3))]
-            fold_angles_deg = [math.degrees(layout.bend_angle_rad)]
+            panel_corner_sets, fillet_groups = self._apply_bead(
+                panel_corner_sets, [fold_mids], bend_radius_mm, bead
+            )
             return self._assemble_general_two_point(
-                panel_corner_sets, fold_mids, fold_angles_deg, bend_radius_mm, out_dir, part_name
+                panel_corner_sets,
+                fillet_groups,
+                f"single fold={math.degrees(layout.bend_angle_rad):.1f}deg, R={bend_radius_mm:.1f}",
+                out_dir,
+                part_name,
             )
 
         tangent1 = tangent_length_for_bend_angle_rad(fold1_angle, bend_radius_mm)
@@ -916,27 +942,79 @@ class SyntheticPartBuilder:
 
         fold1_mid = tuple((ramp_corners[0][i] + ramp_corners[1][i]) / 2 for i in range(3))
         fold2_mid = tuple((ramp_corners[2][i] + ramp_corners[3][i]) / 2 for i in range(3))
-        return self._assemble_general_two_point(
+        panel_corner_sets, fillet_groups = self._apply_bead(
             [flat1_corners, ramp_corners, flat2_corners],
-            [fold1_mid, fold2_mid],
-            [math.degrees(fold1_angle), math.degrees(fold2_angle)],
+            [[fold1_mid], [fold2_mid]],
             bend_radius_mm,
+            bead,
+        )
+        return self._assemble_general_two_point(
+            panel_corner_sets,
+            fillet_groups,
+            f"fold1={math.degrees(fold1_angle):.1f}deg, fold2={math.degrees(fold2_angle):.1f}deg, "
+            f"R={bend_radius_mm:.1f}",
             out_dir,
             part_name,
         )
 
+    @staticmethod
+    def _apply_bead(
+        panel_corner_sets: list[list[Vec3]],
+        fold_groups: list[list[Vec3]],
+        bend_radius_mm: float,
+        bead: BeadParams | None,
+    ) -> tuple[list[list[Vec3]], list[tuple[list[Vec3], float]]]:
+        """ビードがあればパネルを5ストリップのセル群に置き換え、フィレット群を組み直す。
+
+        ビード無しの場合は、パネルもフィレット群もそのまま(折れ目1本=1フィーチャーと
+        いう従来の挙動を厳密に保つ)。ビードを指定されたのにパネル幅が足りない場合は
+        Infeasible(ValueError)にする — 黙ってビード無しで作ると、バッチの記録上は
+        ビード付きなのに実物には無い、という食い違いが生じるため。
+
+        ビード有りの場合、各折れ目は5ストリップに分断されるので、その5本を1つの
+        フィレットフィーチャーにまとめる。ビードの縦4本 x パネル数も、まとめて
+        もう1つのフィーチャーにする(交差部をCATIAに一括で解かせるため、SS6.25)。
+        """
+        if bead is None:
+            return panel_corner_sets, [(mids, bend_radius_mm) for mids in fold_groups]
+        if not bead_fits(panel_corner_sets, bead):
+            raise ValueError(
+                f"bead footprint (half={bead.half_footprint_mm:.1f}mm + margin) does not fit "
+                "within the panel width. Infeasible; not attempting construction."
+            )
+
+        cells = bead_cells(panel_corner_sets, bead)
+        panel_count = len(panel_corner_sets)
+
+        def midpoint(a: Vec3, b: Vec3) -> Vec3:
+            return tuple((a[i] + b[i]) / 2 for i in range(3))
+
+        fold_mids = [
+            midpoint(cells[fold_index * 5 + strip][2], cells[fold_index * 5 + strip][3])
+            for fold_index in range(panel_count - 1)
+            for strip in range(5)
+        ]
+        bead_mids = [
+            midpoint(cells[panel_index * 5 + strip][1], cells[panel_index * 5 + strip][2])
+            for panel_index in range(panel_count)
+            for strip in range(4)
+        ]
+        return cells, [(fold_mids, bend_radius_mm), (bead_mids, bead.bend_radius_mm)]
+
     def _assemble_general_two_point(
         self,
         panel_corner_sets: list[list[Vec3]],
-        fold_mids: list[Vec3],
-        fold_angles_deg: list[float],
-        bend_radius_mm: float,
+        fillet_groups: list[tuple[list[Vec3], float]],
+        geometry_label: str,
         out_dir: str,
         part_name: str,
     ) -> GeneratedPart:
-        """平坦パネル群をjoinし、各折れ目にエッジフィレットを当ててエクスポートする。
+        """平坦パネル群をjoinし、フィレットを当ててエクスポートする。
 
-        単曲げ(パネル2枚・折れ目1本)と2曲げ(flat1+ランプ+flat2・折れ目2本)で共通。
+        単曲げ(パネル2枚・折れ目1本)・2曲げ(flat1+ランプ+flat2・折れ目2本)・ビード付き
+        (パネルを5ストリップに分割、SS6.25)で共通。`fillet_groups`は(折れ目中点のリスト,
+        半径)の組で、1組が1つのEdgeFilletフィーチャーになる — ビードのように複数の
+        フィレット列が交差する場合、まとめないとCATIAが交差点を解けない(SS6.25)。
         """
         doc = self.new_part_document()
         try:
@@ -962,17 +1040,18 @@ class SyntheticPartBuilder:
             # 委ねる。他のステップ(join等)で例外が出た場合は本来のバグの可能性が高いため、
             # ここでは変換せずそのまま送出する。
             try:
-                for fold_mid in fold_mids:
-                    edge_ref = self.find_edge_near(doc, part, spa, hsf, body, whole, fold_mid)
-                    whole = self.edge_fillet(part, edge_ref, bend_radius_mm)
+                for fold_mids, radius_mm in fillet_groups:
+                    edge_refs = [
+                        self.find_edge_near(doc, part, spa, hsf, body, whole, fold_mid)
+                        for fold_mid in fold_mids
+                    ]
+                    whole = self.edge_fillet_group(part, edge_refs, radius_mm)
                     body.AppendHybridShape(whole)
                     part.Update()
             except Exception as fillet_exc:
-                folds = ", ".join(f"{angle:.1f}deg" for angle in fold_angles_deg)
                 raise ValueError(
                     f"CATIA edge fillet failed for this specific fold geometry "
-                    f"(folds={folds}, "
-                    f"bend_radius_mm={bend_radius_mm:.1f}) -- a known numerically fragile case "
+                    f"({geometry_label}) -- a known numerically fragile case "
                     f"(roadmap SS6.20), not predictable from a Python-side pre-check. "
                     f"Infeasible; not attempting further construction. Original error: {fillet_exc}"
                 ) from fillet_exc

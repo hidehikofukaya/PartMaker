@@ -22,6 +22,7 @@ import random
 from typing import Protocol
 
 from synthetic_generator.annotate import build_two_joint_pair
+from synthetic_generator.bead import BeadParams, sample_bead
 from synthetic_generator.annotation_schema import AnnotationDocument, PartEntry
 from synthetic_generator.reinforcement import ReinforcementParams, sample_reinforcement
 from synthetic_generator.templates.general_two_point import GeneralTwoJointSpec
@@ -56,6 +57,7 @@ class GeneralPartBuilder(Protocol):
         bend_radius_mm: float,
         out_dir: str,
         part_name: str,
+        bead: BeadParams | None = None,
     ) -> GeneratedPartLike: ...
 
 
@@ -141,6 +143,7 @@ class GeneratedGeneralPartRecord:
     spec: GeneralTwoJointSpec
     stp_path: str
     catpart_path: str
+    bead: BeadParams | None = None
 
 
 def generate_general_batch(
@@ -150,6 +153,7 @@ def generate_general_batch(
     count: int,
     seed: int,
     max_attempts_per_part: int = 50,
+    bead_probability: float = 0.0,
 ) -> list[GeneratedGeneralPartRecord]:
     """任意の法線・任意の位置の締結点ペア(roadmap SS6.20〜6.22)でcount件の成功パーツを
     生成する。`generate_batch`(parallel_same_offsetクラス専用)と同じskip-and-retry
@@ -167,6 +171,9 @@ def generate_general_batch(
 
         for attempt in range(max_attempts_per_part):
             spec = sample_general_two_point(rng)
+            # bead_probability=0(既定)ではrngを一切消費しない — 既存バッチのシード列を
+            # そのまま再現できるようにするため。
+            bead = sample_bead(rng) if bead_probability > 0.0 and rng.random() < bead_probability else None
             try:
                 generated = builder.build_general_two_point(
                     spec.point1,
@@ -178,6 +185,7 @@ def generate_general_batch(
                     bend_radius_mm=spec.bend_radius_mm,
                     out_dir=str(out_dir / "mid"),
                     part_name=part_id,
+                    bead=bead,
                 )
                 break
             except ValueError:
@@ -205,6 +213,7 @@ def generate_general_batch(
                 spec=spec,
                 stp_path=generated.stp_path,
                 catpart_path=generated.catpart_path,
+                bead=bead,
             )
         )
 
