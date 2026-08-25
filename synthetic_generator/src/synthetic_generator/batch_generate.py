@@ -27,7 +27,7 @@ from synthetic_generator.annotate import build_two_joint_pair
 from synthetic_generator.bead import BeadParams, sample_bead
 from synthetic_generator.annotation_schema import AnnotationDocument, PartEntry
 from synthetic_generator.reinforcement import ReinforcementParams, sample_reinforcement
-from synthetic_generator.flange import FlangeParams
+from synthetic_generator.flange import FlangeParams, chirality_candidates
 from synthetic_generator.general_geometry import plan_general_two_point
 from synthetic_generator.templates.general_two_point import (
     GeneralTwoJointSpec,
@@ -145,6 +145,52 @@ def generate_batch(
     return records
 
 
+def build_general_part(builder, spec, bead, flange, out_dir: str, part_name: str):
+    """1部品をビルドする。フランジの根本フィレットが落ちた場合はキラリティ
+    (側x方向)の反転候補で再試行する(SS14.6: 成立性はキラリティ依存で、失敗7件の
+    全てが反転で成立した)。戻り値は(GeneratedPart, 実際に使ったflange)。"""
+
+    def attempt(candidate_flange):
+        return builder.build_general_two_point(
+            spec.point1,
+            spec.point2,
+            min_bearing_radius_mm=spec.min_bearing_radius_mm,
+            half_width_mm=spec.half_width_mm,
+            bend_radius_mm=spec.bend_radius_mm,
+            fold1_slack_mm=spec.fold1_slack_mm,
+            fold2_slack_mm=spec.fold2_slack_mm,
+            fold1_tilt_perturbation_rad=spec.fold1_tilt_perturbation_rad,
+            out_dir=out_dir,
+            part_name=part_name,
+            bead=bead,
+            flange=candidate_flange,
+        )
+
+    if flange is None:
+        return attempt(None), None
+    plan = plan_general_two_point(
+        spec.point1,
+        spec.point2,
+        min_bearing_radius_mm=spec.min_bearing_radius_mm,
+        half_width_mm=spec.half_width_mm,
+        bend_radius_mm=spec.bend_radius_mm,
+        fold1_slack_mm=spec.fold1_slack_mm,
+        fold2_slack_mm=spec.fold2_slack_mm,
+        fold1_tilt_perturbation_rad=spec.fold1_tilt_perturbation_rad,
+    )
+    last_error: ValueError | None = None
+    for candidate in chirality_candidates(flange, plan.panel_frames, spec.bend_radius_mm):
+        try:
+            return attempt(candidate), candidate
+        except ValueError as exc:
+            if "flange" not in str(exc):
+                raise  # フランジ以外の失敗(基準面など)は反転しても直らない
+            last_error = exc
+    raise last_error if last_error is not None else ValueError(
+        "no feasible flange chirality candidate"
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class GeneratedGeneralPartRecord:
     part_id: str
@@ -163,6 +209,7 @@ def generate_general_batch(
     seed: int,
     max_attempts_per_part: int = 50,
     reinforcement_probability: float = 0.0,
+    flange_aim_share: float = 0.4,
 ) -> list[GeneratedGeneralPartRecord]:
     """任意の法線・任意の位置の締結点ペア(roadmap SS6.20〜6.22)でcount件の成功パーツを
     生成する。`generate_batch`(parallel_same_offsetクラス専用)と同じskip-and-retry
@@ -179,12 +226,17 @@ def generate_general_batch(
         part_id = f"SYN_general_two_point_{i:04d}"
 
         for attempt in range(max_attempts_per_part):
-            spec = sample_general_two_point(rng)
-            # reinforcement_probability=0(既定)ではrngを一切消費しない — 既存バッチの
+            # reinforcement_probability=0(既定)では追加のrngを消費しない — 既存バッチの
             # シード列をそのまま再現できるようにするため。
+            reinforce = reinforcement_probability > 0.0 and rng.random() < reinforcement_probability
+            # フランジ帯狙い(SS14.5、ユーザー承認②): 既定サンプラーは折れ角>=25度を
+            # 狙うため、フランジ対象(<=20度)は3.6%しか出ない。補強部品の一部を
+            # 「法線角<=35度+slack目標18度以下」の帯狙いで引く。
+            aim_flange = reinforce and rng.random() < flange_aim_share
+            spec = sample_general_two_point(rng, gentle_folds=aim_flange)
             bead: BeadParams | None = None
             flange: FlangeParams | None = None
-            if reinforcement_probability > 0.0 and rng.random() < reinforcement_probability:
+            if reinforce:
                 # 補強の種類は基準面の幾何で決まる(ユーザー指定、2026-08-25):
                 # 最大折れ角20度以下ならフランジ、それ以外(急でフランジ不成立)はビード。
                 # CATIAに触る前に純Pythonで種類選定と成立可否を解決する(SS12/SS14)。
@@ -193,19 +245,8 @@ def generate_general_batch(
                     continue
                 spec, bead, flange = resolved
             try:
-                generated = builder.build_general_two_point(
-                    spec.point1,
-                    spec.point2,
-                    min_bearing_radius_mm=spec.min_bearing_radius_mm,
-                    half_width_mm=spec.half_width_mm,
-                    bend_radius_mm=spec.bend_radius_mm,
-                    fold1_slack_mm=spec.fold1_slack_mm,
-                    fold2_slack_mm=spec.fold2_slack_mm,
-                    fold1_tilt_perturbation_rad=spec.fold1_tilt_perturbation_rad,
-                    out_dir=str(out_dir / "mid"),
-                    part_name=part_id,
-                    bead=bead,
-                    flange=flange,
+                generated, flange = build_general_part(
+                    builder, spec, bead, flange, str(out_dir / "mid"), part_id
                 )
                 break
             except ValueError:

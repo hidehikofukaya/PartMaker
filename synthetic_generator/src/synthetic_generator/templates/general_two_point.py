@@ -127,6 +127,16 @@ NORMAL_ANGLE_DIP_RESAMPLE_PROB = 0.5
 # CATIAの1ビルドが数秒かかるのに対しここは純Pythonで軽いので、先に潰す方が得。
 TILT_PERTURBATION_SEARCH_ATTEMPTS = 6
 
+# フランジ帯狙い(sample(gentle_folds=True)、SS14.5/ユーザー承認②)。
+# 折れ角はほぼ法線の相対角で決まるので、法線角も狭めないと帯に入らない
+# (両折れ<=20度には法線角<=40度前後が必要)。slack探索の目標も18度以下へ切り替える。
+GENTLE_NORMAL_ANGLE_MAX_DEG = 35.0
+GENTLE_TARGET_MAX_FOLD_ANGLE_DEG = 18.0
+# 帯狙い時のp2配置: 折れ角を支配するのは法線の相対角ではなく**p2方向の法線成分**
+# (p2が座面平面から外れるほどランプが潜る=折れが深くなる。実測: 法線角<=35度に
+# 絞っても最大折れ角の中央値は74度のままだった)。断面方向を座面平行から±この角度に絞る。
+GENTLE_DIP_MAX_DEG = 15.0
+
 
 @dataclasses.dataclass(frozen=True)
 class GeneralTwoJointSpec:
@@ -149,7 +159,8 @@ def _random_unit_vector(rng: random.Random) -> Vec3:
     return (r * math.cos(theta), r * math.sin(theta), z)
 
 
-def _place_second_point(rng: random.Random, n1: Vec3, n2: Vec3, p1: Vec3) -> Vec3:
+def _place_second_point(rng: random.Random, n1: Vec3, n2: Vec3, p1: Vec3,
+                        gentle: bool = False) -> Vec3:
     """締結点2を、共通折れ目方向 w に対して制御した位置へ置く。
 
     w = n1 x n2 は全ての折れ目に共通の方向で、**w方向の変位は中間折れ目の配置予算を
@@ -166,6 +177,15 @@ def _place_second_point(rng: random.Random, n1: Vec3, n2: Vec3, p1: Vec3) -> Vec
     if cross_len < 1e-9:
         distance = rng.uniform(*OFFSET_DISTANCE_RANGE_MM)
         direction = _random_unit_vector(rng)
+        if gentle:
+            # 座面にほぼ平行な方向へ: 法線成分を±sin(GENTLE_DIP_MAX_DEG)に制限
+            dot = sum(direction[i] * n1[i] for i in range(3))
+            planar = tuple(direction[i] - dot * n1[i] for i in range(3))
+            norm = math.sqrt(sum(c * c for c in planar)) or 1.0
+            dip = math.radians(rng.uniform(-GENTLE_DIP_MAX_DEG, GENTLE_DIP_MAX_DEG))
+            direction = tuple(
+                math.cos(dip) * planar[i] / norm + math.sin(dip) * n1[i] for i in range(3)
+            )
         return tuple(p1[i] + distance * direction[i] for i in range(3))
 
     w = tuple(c / cross_len for c in cross)
@@ -183,7 +203,24 @@ def _place_second_point(rng: random.Random, n1: Vec3, n2: Vec3, p1: Vec3) -> Vec
         w[0] * e1[1] - w[1] * e1[0],
     )
 
-    theta = rng.uniform(0.0, 2.0 * math.pi)
+    if gentle:
+        # w直交平面内で「n1に垂直な方向」を基準に、±GENTLE_DIP_MAX_DEGの帯だけを使う。
+        # thetaを全周で振るとp2が座面の上下へ大きく外れ、ランプが深く潜って折れ角が
+        # 跳ね上がる(フランジ帯に入らない)。
+        planar = (
+            n1[1] * w[2] - n1[2] * w[1],
+            n1[2] * w[0] - n1[0] * w[2],
+            n1[0] * w[1] - n1[1] * w[0],
+        )  # n1 x w: wにもn1にも垂直 = 座面平行の走行方向
+        planar_len = math.sqrt(sum(c * c for c in planar)) or 1.0
+        cos_p = sum(planar[i] / planar_len * e1[i] for i in range(3))
+        sin_p = sum(planar[i] / planar_len * e2[i] for i in range(3))
+        theta0 = math.atan2(sin_p, cos_p)
+        dip = math.radians(rng.uniform(-GENTLE_DIP_MAX_DEG, GENTLE_DIP_MAX_DEG))
+        sign = 1.0 if rng.random() < 0.5 else -1.0  # 走行方向の表裏
+        theta = theta0 + dip if sign > 0 else theta0 + math.pi - dip
+    else:
+        theta = rng.uniform(0.0, 2.0 * math.pi)
     section = rng.uniform(*SECTION_DISTANCE_RANGE_MM)
     lateral = section * rng.uniform(-MAX_LATERAL_OFFSET_RATIO, MAX_LATERAL_OFFSET_RATIO)
     return tuple(
@@ -200,8 +237,13 @@ def _choose_fold_slacks(
     *,
     bearing_radius: float,
     bend_radius: float,
+    target_max_fold_deg: float | None = None,
 ) -> tuple[float, float]:
     """折れ角の配分が偏らないslackの組を選ぶ。
+
+    `target_max_fold_deg`を渡すと目標を「両方の折れ角がそれ以下」に切り替える
+    (フランジ帯狙い。既定の「最小25度以上」はほぼ平坦な無駄折れを避ける品質判断
+    だが、フランジ対象はまさにその緩い帯なので目標が逆になる)。
 
     候補をいくつか引いて`free_fold_seed`で実際の折れ角を評価し、
     「小さい方 >= TARGET_MIN / 大きい方 <= TARGET_MAX」を満たす最初の組を採る。
@@ -226,10 +268,13 @@ def _choose_fold_slacks(
             penalty = float("inf")
         else:
             angles = (math.degrees(seed.fold1_angle_rad), math.degrees(seed.fold2_angle_rad))
-            penalty = (
-                max(0.0, TARGET_MIN_FOLD_ANGLE_DEG - min(angles))
-                + max(0.0, max(angles) - TARGET_MAX_FOLD_ANGLE_DEG)
-            )
+            if target_max_fold_deg is not None:
+                penalty = max(0.0, max(angles) - target_max_fold_deg)
+            else:
+                penalty = (
+                    max(0.0, TARGET_MIN_FOLD_ANGLE_DEG - min(angles))
+                    + max(0.0, max(angles) - TARGET_MAX_FOLD_ANGLE_DEG)
+                )
             if penalty == 0.0:
                 return candidate
         if penalty < best_penalty:
@@ -281,18 +326,26 @@ def sample(
     *,
     thickness_range_mm: tuple[float, float] = (1.0, 2.5),
     hole_diameter_range_mm: tuple[float, float] = (6.0, 14.0),
+    gentle_folds: bool = False,
 ) -> GeneralTwoJointSpec:
-    """任意の法線・任意の位置の締結点ペアを1組サンプリングする。"""
+    """任意の法線・任意の位置の締結点ペアを1組サンプリングする。
+
+    `gentle_folds=True`はフランジ帯狙い(SS14.5): 法線の相対角を35度以下に絞り、
+    slack探索の目標を「両折れ18度以下」へ切り替える。折れ角はほぼ法線角で決まるので、
+    法線角を絞らないと帯に入らない。"""
     n1 = _random_unit_vector(rng)
     rotation_axis = _random_unit_vector(rng)
-    rotation_angle = rng.uniform(0.0, math.pi)  # 0〜180度、全configuration classをカバー
-    dip_low, dip_high = (math.radians(a) for a in NORMAL_ANGLE_DIP_RANGE_DEG)
-    if dip_low <= rotation_angle <= dip_high and rng.random() < NORMAL_ANGLE_DIP_RESAMPLE_PROB:
-        rotation_angle = rng.uniform(0.0, math.pi)  # 谷の帯は重みを下げる(1回だけ引き直す)
+    if gentle_folds:
+        rotation_angle = rng.uniform(0.0, math.radians(GENTLE_NORMAL_ANGLE_MAX_DEG))
+    else:
+        rotation_angle = rng.uniform(0.0, math.pi)  # 0〜180度、全configuration classをカバー
+        dip_low, dip_high = (math.radians(a) for a in NORMAL_ANGLE_DIP_RANGE_DEG)
+        if dip_low <= rotation_angle <= dip_high and rng.random() < NORMAL_ANGLE_DIP_RESAMPLE_PROB:
+            rotation_angle = rng.uniform(0.0, math.pi)  # 谷の帯は重みを下げる(1回だけ引き直す)
     n2 = rotate_about_axis(n1, rotation_axis, rotation_angle)
 
     p1: Vec3 = (0.0, 0.0, 0.0)
-    p2 = _place_second_point(rng, n1, n2, p1)
+    p2 = _place_second_point(rng, n1, n2, p1, gentle=gentle_folds)
 
     point1 = FasteningPoint(position_xyz=p1, normal_xyz=n1)
     point2 = FasteningPoint(position_xyz=p2, normal_xyz=n2)
@@ -342,6 +395,7 @@ def sample(
         fold1_slack, fold2_slack = _choose_fold_slacks(
             rng, point1, point2, slack_budget,
             bearing_radius=bearing_radius, bend_radius=bend_radius,
+            target_max_fold_deg=GENTLE_TARGET_MAX_FOLD_ANGLE_DEG if gentle_folds else None,
         )
     fold1_tilt_perturbation = _choose_tilt_perturbation(
         rng, point1, point2,

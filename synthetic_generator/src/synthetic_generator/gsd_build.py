@@ -916,6 +916,7 @@ class SyntheticPartBuilder:
     # できない(谷折り面ではパネルごとに法線の符号が反転する)。全て「作って期待点との
     # 距離を測る」probe-and-selectで決める。
     BEAD_GUIDE_MARGIN_MM = _BEAD_GUIDE_MARGIN_MM  # 一元定義はbead.py(事前判定と共有)
+    FLANGE_WALL_PIERCE_MM = 3.0     # フランジ壁を基準面の下へ貫通させる量(SS14.6)
     # 壁を頂面・基準面へ貫通させるための(上方延長倍率, 下方延長mm)の候補。
     # 大きく延ばすほど確実に貫通するが、曲げのR領域を大きくまたぐ壁ではCATIAが
     # 掃引を解けなくなる。大きい順に試して、通った時点で採用する。
@@ -1181,6 +1182,10 @@ class SyntheticPartBuilder:
             sweep.FirstGuideSurf = surface_ref
             sweep.SetAngle(1, angle)
             sweep.SetLength(1, flange.height_mm)
+            # 基準面を下へ貫通させる。壁が面に「接している」だけだと根本BiTangentが
+            # 数値的に退化して落ちる(2026-08-25実測: 貫通3mmで失敗12件中4件が回復。
+            # ビードの壁も同じ理由で延長して作り直している、SS6.1)。
+            sweep.SetLength(2, self.FLANGE_WALL_PIERCE_MM)
             body.AppendHybridShape(sweep)
             try:
                 part.Update()

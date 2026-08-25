@@ -224,3 +224,34 @@ def plan_flange_on_surface(
         root_keep_points=root_keep,
         wall_keep_point=wall_top,
     )
+
+
+def chirality_candidates(
+    flange: FlangeParams,
+    panel_frames: list[BeadPanelFrame],
+    bend_radius_mm: float,
+) -> list[FlangeParams]:
+    """根本フィレットが落ちたときに試す(side, direction)の反転候補列(元を含む)。
+
+    根本BiTangentの成立性はキラリティ依存で、残存失敗7件の**全て**が方向反転か
+    側反転のどちらかで成立した(2026-08-25実測: 方向3/7・側5/7)。機構は未解明のまま
+    だが、probe-and-select(候補を作って実測で選ぶ)をキラリティに適用すれば足りる。
+    方向を反転すると凹側交差の相手が変わるので、高さ制約を再検査し、必要なら
+    高さを詰める(下限を割る候補は除外)。
+    """
+    out: list[FlangeParams] = []
+    for side, direction in (
+        (flange.side, flange.direction),
+        (flange.side, -flange.direction),
+        (-flange.side, flange.direction),
+        (-flange.side, -flange.direction),
+    ):
+        h_max = min(FLANGE_HEIGHT_RANGE_MM[1],
+                    max_flange_height_mm(panel_frames, direction, bend_radius_mm))
+        if h_max < FLANGE_HEIGHT_RANGE_MM[0]:
+            continue
+        out.append(dataclasses.replace(
+            flange, side=side, direction=direction,
+            height_mm=min(flange.height_mm, h_max),
+        ))
+    return out
