@@ -535,7 +535,7 @@ def resolve_reinforcement(
     if max_fold_angle_deg(plan.panel_frames) <= FLANGE_MAX_FOLD_ANGLE_DEG:
         flange = sample_flange(
             rng, plan.panel_frames, plan.fold_tilts,
-            spec.half_width_mm, spec.bend_radius_mm,
+            spec.half_width_mm, spec.bend_radius_mm, spec.point1.normal_xyz,
         )
         if flange is not None and _flange_feasible(spec, flange):
             return spec, None, flange
@@ -562,6 +562,7 @@ def resolve_reinforcement(
             flange = sample_flange(
                 rng, plan2.panel_frames, plan2.fold_tilts,
                 candidate.half_width_mm, candidate.bend_radius_mm,
+                candidate.point1.normal_xyz,
             )
             if flange is not None and _flange_feasible(candidate, flange):
                 return candidate, None, flange

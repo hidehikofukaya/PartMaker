@@ -1211,9 +1211,10 @@ class SyntheticPartBuilder:
         keep_refs = self._point_refs(
             part, hsf, body, plan.root_keep_points + [plan.wall_keep_point]
         )
+        remove_refs = self._point_refs(part, hsf, body, [plan.pierce_remove_point])
         flange_feature, _ref = self._bead_bitangent(
             doc, part, hsf, spa, body, wall_ref, surface_ref, flange.root_radius_mm,
-            keep_refs, [], "flange root",
+            keep_refs, remove_refs, "flange root",
         )
         return flange_feature
 
