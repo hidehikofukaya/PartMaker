@@ -27,10 +27,11 @@ from synthetic_generator.annotate import build_two_joint_pair
 from synthetic_generator.bead import BeadParams, sample_bead
 from synthetic_generator.annotation_schema import AnnotationDocument, PartEntry
 from synthetic_generator.reinforcement import ReinforcementParams, sample_reinforcement
+from synthetic_generator.flange import FlangeParams
 from synthetic_generator.general_geometry import plan_general_two_point
 from synthetic_generator.templates.general_two_point import (
     GeneralTwoJointSpec,
-    resolve_bead_slacks,
+    resolve_reinforcement,
 )
 from synthetic_generator.templates.general_two_point import sample as sample_general_two_point
 from synthetic_generator.templates.parallel_same_offset import TwoJointSpec
@@ -151,6 +152,7 @@ class GeneratedGeneralPartRecord:
     stp_path: str
     catpart_path: str
     bead: BeadParams | None = None
+    flange: FlangeParams | None = None
 
 
 def generate_general_batch(
@@ -160,7 +162,7 @@ def generate_general_batch(
     count: int,
     seed: int,
     max_attempts_per_part: int = 50,
-    bead_probability: float = 0.0,
+    reinforcement_probability: float = 0.0,
 ) -> list[GeneratedGeneralPartRecord]:
     """任意の法線・任意の位置の締結点ペア(roadmap SS6.20〜6.22)でcount件の成功パーツを
     生成する。`generate_batch`(parallel_same_offsetクラス専用)と同じskip-and-retry
@@ -178,22 +180,18 @@ def generate_general_batch(
 
         for attempt in range(max_attempts_per_part):
             spec = sample_general_two_point(rng)
-            # bead_probability=0(既定)ではrngを一切消費しない — 既存バッチのシード列を
-            # そのまま再現できるようにするため。
-            bead = (
-                sample_bead(rng, spec.half_width_mm)
-                if bead_probability > 0.0 and rng.random() < bead_probability
-                else None
-            )
-            if bead is not None:
-                # ビード指定時はCATIAに触る前に、この締結点で通るslack(必要ならビードも)を
-                # 純Pythonで解決する。棄却は締結点の性質(傾き上限など)にだけ適用し、
-                # 折れ目の置き方の性質はここで選び直す(SS12)。解決不能ならこのspecを捨てて
-                # 次のサンプルへ — builderへ渡る時点でCATIA非依存の失敗理由は残っていない。
-                resolved = resolve_bead_slacks(rng, spec, bead)
+            # reinforcement_probability=0(既定)ではrngを一切消費しない — 既存バッチの
+            # シード列をそのまま再現できるようにするため。
+            bead: BeadParams | None = None
+            flange: FlangeParams | None = None
+            if reinforcement_probability > 0.0 and rng.random() < reinforcement_probability:
+                # 補強の種類は基準面の幾何で決まる(ユーザー指定、2026-08-25):
+                # 最大折れ角20度以下ならフランジ、それ以外(急でフランジ不成立)はビード。
+                # CATIAに触る前に純Pythonで種類選定と成立可否を解決する(SS12/SS14)。
+                resolved = resolve_reinforcement(rng, spec)
                 if resolved is None:
                     continue
-                spec, bead = resolved
+                spec, bead, flange = resolved
             try:
                 generated = builder.build_general_two_point(
                     spec.point1,
@@ -207,6 +205,7 @@ def generate_general_batch(
                     out_dir=str(out_dir / "mid"),
                     part_name=part_id,
                     bead=bead,
+                    flange=flange,
                 )
                 break
             except ValueError:
@@ -244,6 +243,7 @@ def generate_general_batch(
                     ],
                     "spec": dataclasses.asdict(spec),
                     "bead": dataclasses.asdict(bead) if bead is not None else None,
+                    "flange": dataclasses.asdict(flange) if flange is not None else None,
                 },
                 ensure_ascii=False,
                 indent=1,
@@ -269,6 +269,7 @@ def generate_general_batch(
                 stp_path=generated.stp_path,
                 catpart_path=generated.catpart_path,
                 bead=bead,
+                flange=flange,
             )
         )
 

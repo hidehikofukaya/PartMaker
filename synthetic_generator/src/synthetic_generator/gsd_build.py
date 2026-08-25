@@ -51,6 +51,7 @@ from win32com.client import Dispatch, GetActiveObject
 
 from synthetic_generator.bead import BEAD_GUIDE_MARGIN_MM as _BEAD_GUIDE_MARGIN_MM
 from synthetic_generator.bead import BeadPanelFrame, BeadParams, plan_bead_on_surface
+from synthetic_generator.flange import FlangeParams, plan_flange_on_surface
 from synthetic_generator.general_geometry import plan_general_two_point
 from synthetic_generator.classify import (
     MIN_NEUTRAL_PLANE_RADIUS_MM,
@@ -841,6 +842,7 @@ class SyntheticPartBuilder:
         out_dir: str,
         part_name: str,
         bead: BeadParams | None = None,
+        flange: FlangeParams | None = None,
     ) -> GeneratedPart:
         """任意の法線・任意の位置の締結点2点を、単曲げまたは自由折れ目チェーン(3枚パネル)でつなぐ。
 
@@ -866,6 +868,15 @@ class SyntheticPartBuilder:
         権威あるチェックとして行う(サンプラー/バッチ側の事前解決も同じ関数を使うので
         判定は乖離しない)。
         """
+        if bead is not None and flange is not None:
+            raise ValueError("a part takes either a bead or a flange, not both")
+        # フランジは根本Rが名目幅を食わないよう、フランジ側だけ基準面を広く作る(SS14)
+        side_extension = (0.0, 0.0)
+        if flange is not None:
+            side_extension = (
+                flange.extension_mm if flange.side < 0 else 0.0,
+                flange.extension_mm if flange.side > 0 else 0.0,
+            )
         plan = plan_general_two_point(
             point1,
             point2,
@@ -875,6 +886,7 @@ class SyntheticPartBuilder:
             fold1_slack_mm=fold1_slack_mm,
             fold2_slack_mm=fold2_slack_mm,
             fold1_tilt_perturbation_rad=fold1_tilt_perturbation_rad,
+            side_extension_mm=side_extension,
         )
         return self._assemble_general_two_point(
             plan.panel_corner_sets,
@@ -883,6 +895,7 @@ class SyntheticPartBuilder:
             out_dir,
             part_name,
             bead=bead,
+            flange=flange,
             panel_frames=plan.panel_frames,
             half_width_mm=plan.half_width_mm,
             min_bearing_radius_mm=plan.min_bearing_radius_mm,
@@ -1085,6 +1098,119 @@ class SyntheticPartBuilder:
             f"(depth={bead.depth_mm:.1f}mm). {'; '.join(reasons)}. "
             "Infeasible; not attempting further construction."
         )
+
+    def _add_flange_to_surface(
+        self, doc, part, hsf, spa, body, surface, *, flange, panel_frames, half_width_mm,
+        fold_tangents,
+    ):
+        """完成した基準面の側端にフランジを立て、統合済みの形状フィーチャーを返す(SS14)。
+
+        ユーザー指定の工程(2026-08-25)の写像。spike_flange_over_bends.pyで6/6実証済み:
+          ④ 中心線(標本点->スプライン->投影) -> CurveParで側端の根本曲線
+             -> Mode=4・±90度スイープで壁
+          ⑤ 基準面 x 壁の BiTangent(トリム込み)で根本R
+        基準面はフランジ側に extension_mm 広く作られている(build_general_two_pointの
+        side_extension)ので、根本Rが食っても名目幅が残る(③の意図)。
+        """
+        surface_ref = part.CreateReferenceFromObject(surface)
+        plan = plan_flange_on_surface(
+            panel_frames, flange,
+            half_width_mm=half_width_mm, fold_tangents=fold_tangents,
+        )
+
+        # 中心線: ビードと同じ「解析標本点 -> スプライン -> 投影」(SS8.9)
+        point_objs = self._point_refs(part, hsf, body, plan.centreline_points)
+        spline = hsf.AddNewSpline()
+        spline.SetSplineType(0)
+        spline.SetClosing(0)
+        for point_ref in point_objs:
+            spline.AddPointWithConstraintExplicit(point_ref, None, -1.0, 1, None, 0.0)
+        spline.Name = "flange_centreline_spline"
+        body.AppendHybridShape(spline)
+        part.Update()
+        centre = hsf.AddNewProject(part.CreateReferenceFromObject(spline), surface_ref)
+        centre.Normal = True
+        centre.Name = "flange_centreline"
+        body.AppendHybridShape(centre)
+        try:
+            part.Update()
+        except Exception as exc:
+            raise ValueError(
+                "flange: the centreline could not be projected onto the base surface. "
+                f"Infeasible. Original error: {exc}"
+            ) from exc
+        centre_ref = part.CreateReferenceFromObject(centre)
+
+        # 根本曲線: 側端のわずか内側への測地オフセット。向きはプローブで選ぶ
+        side_probe_ref = self._point_refs(part, hsf, body, [plan.side_probe])[0]
+        root_ref = None
+        reasons: list[str] = []
+        for reverse in (False, True):
+            candidate = hsf.AddNewCurvePar(
+                centre_ref, surface_ref, plan.edge_offset_mm, reverse, True
+            )
+            body.AppendHybridShape(candidate)
+            try:
+                part.Update()
+            except Exception as exc:
+                reasons.append(f"reverse={reverse}: update failed ({str(exc)[:40]})")
+                self._delete_feature(doc, part, candidate)
+                continue
+            ref = part.CreateReferenceFromObject(candidate)
+            distance = spa.GetMeasurable(ref).GetMinimumDistance(side_probe_ref)
+            if distance < 0.5:
+                candidate.Name = "flange_root"
+                root_ref = ref
+                break
+            reasons.append(f"reverse={reverse}: {distance:.2f}mm from the flange side")
+            self._delete_feature(doc, part, candidate)
+        if root_ref is None:
+            raise ValueError(
+                f"flange: no parallel-curve direction reached the flange-side edge "
+                f"(offset={plan.edge_offset_mm:.1f}mm) [{'; '.join(reasons)}]. "
+                "Infeasible; not attempting further construction."
+            )
+
+        # 壁: ±90度のドラフトスイープ。期待する上端位置に来る向きを選ぶ
+        top_ref = self._point_refs(part, hsf, body, [plan.wall_top_probe])[0]
+        wall_ref = None
+        reasons = []
+        for angle in (90.0, -90.0):
+            sweep = hsf.AddNewSweepLine(root_ref)
+            sweep.Mode = 4
+            sweep.FirstGuideSurf = surface_ref
+            sweep.SetAngle(1, angle)
+            sweep.SetLength(1, flange.height_mm)
+            body.AppendHybridShape(sweep)
+            try:
+                part.Update()
+            except Exception as exc:
+                reasons.append(f"{angle:+.0f}deg: sweep failed ({str(exc)[:40]})")
+                self._delete_feature(doc, part, sweep)
+                continue
+            ref = part.CreateReferenceFromObject(sweep)
+            distance = spa.GetMeasurable(ref).GetMinimumDistance(top_ref)
+            if distance < self.BEAD_PROBE_TOLERANCE_MM:
+                sweep.Name = "flange_wall"
+                wall_ref = ref
+                break
+            reasons.append(f"{angle:+.0f}deg: {distance:.2f}mm")
+            self._delete_feature(doc, part, sweep)
+        if wall_ref is None:
+            raise ValueError(
+                f"flange wall: no 90deg sweep put the top edge at the expected position "
+                f"[{', '.join(reasons)}]. Infeasible; not attempting further construction."
+            )
+
+        # 根本R: 基準面 x 壁のBiTangent(トリム込み)。keep=各パネル中央+壁の上端
+        keep_refs = self._point_refs(
+            part, hsf, body, plan.root_keep_points + [plan.wall_keep_point]
+        )
+        flange_feature, _ref = self._bead_bitangent(
+            doc, part, hsf, spa, body, wall_ref, surface_ref, flange.root_radius_mm,
+            keep_refs, [], "flange root",
+        )
+        return flange_feature
 
     def _add_bead_to_surface(
         self, doc, part, hsf, spa, body, surface, *, bead, panel_frames, half_width_mm,
@@ -1346,6 +1472,7 @@ class SyntheticPartBuilder:
         part_name: str,
         *,
         bead: BeadParams | None = None,
+        flange: FlangeParams | None = None,
         panel_frames: list[BeadPanelFrame] | None = None,
         half_width_mm: float = 0.0,
         min_bearing_radius_mm: float = 0.0,
@@ -1430,6 +1557,31 @@ class SyntheticPartBuilder:
                         f"({geometry_label}). Infeasible; not attempting further "
                         f"construction. Original error: {bead_exc}"
                     ) from bead_exc
+
+            # フランジも同じく「完成した基準面の上に載せる後処理」(SS14)。
+            if flange is not None:
+                assert panel_frames is not None, "flange requires panel_frames"
+                try:
+                    whole = self._add_flange_to_surface(
+                        doc,
+                        part,
+                        hsf,
+                        spa,
+                        body,
+                        whole,
+                        flange=flange,
+                        panel_frames=panel_frames,
+                        half_width_mm=half_width_mm,
+                        fold_tangents=fold_tangents or [(0.0, 0.0)] * len(panel_corner_sets),
+                    )
+                except ValueError:
+                    raise
+                except Exception as flange_exc:
+                    raise ValueError(
+                        f"CATIA failed while building the flange on this base surface "
+                        f"({geometry_label}). Infeasible; not attempting further "
+                        f"construction. Original error: {flange_exc}"
+                    ) from flange_exc
 
             part.InWorkObject = whole
             part.Update()

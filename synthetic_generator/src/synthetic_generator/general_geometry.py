@@ -70,12 +70,21 @@ def plan_general_two_point(
     fold1_slack_mm: float,
     fold2_slack_mm: float,
     fold1_tilt_perturbation_rad: float,
+    side_extension_mm: tuple[float, float] = (0.0, 0.0),
 ) -> GeneralTwoPointPlan:
     """単曲げ or 自由折れ目チェーンのパネル構成を決め、全ての幾何チェックを行う。
 
     通らない場合はValueError(Infeasible)。gsd_buildから抽出したロジックそのもので、
     チェックの内容・順序・メッセージは抽出前と同一。
+
+    `side_extension_mm`は(v負側, v正側)の幅拡張[mm](SS14、フランジ用)。フランジの
+    根本Rが名目幅を食わないよう、フランジ側だけパネルを広く作る(外挿コマンドの
+    代替 — 面生成を自前で握っているので、後から外挿するより最初から広く作る方が確実)。
+    パネル座標系(BeadPanelFrame)と各種チェックの半幅は名目値のまま。
     """
+    ext_neg, ext_pos = side_extension_mm
+    width_pos = half_width_mm + ext_pos
+    width_neg = half_width_mm + ext_neg
     if bend_radius_mm < MIN_NEUTRAL_PLANE_RADIUS_MM:
         raise ValueError(
             f"bend_radius_mm={bend_radius_mm:.1f} is below the mandatory minimum "
@@ -121,10 +130,12 @@ def plan_general_two_point(
         # SS8の自由折れ目チェーンとは無関係(w平行のまま、旧来ロジックを再利用)。
         panel_corner_sets = [
             end_panel_corners(
-                layout.origin1, frame.u1, frame.w, -margin, layout.d1_mm, layout.half_width_mm
+                layout.origin1, frame.u1, frame.w, -margin, layout.d1_mm,
+                layout.half_width_mm + ext_pos, layout.half_width_mm + ext_neg,
             ),
             end_panel_corners(
-                layout.origin2, frame.u2, frame.w, -layout.d2_mm, margin, layout.half_width_mm
+                layout.origin2, frame.u2, frame.w, -layout.d2_mm, margin,
+                layout.half_width_mm + ext_pos, layout.half_width_mm + ext_neg,
             ),
         ]
         first = panel_corner_sets[0]
@@ -204,15 +215,18 @@ def plan_general_two_point(
 
     panel1_corners = sheared_panel_corners(
         chain.panel1.origin, chain.panel1.u, chain.panel1.v,
-        -margin, chain.L1_mm, half_width_mm, near_tilt_rad=0.0, far_tilt_rad=chain.a1_rad,
+        -margin, chain.L1_mm, width_pos, near_tilt_rad=0.0, far_tilt_rad=chain.a1_rad,
+        half_width_neg_mm=width_neg,
     )
     panel_mid_corners = sheared_panel_corners(
         chain.panel_mid.origin, chain.panel_mid.u, chain.panel_mid.v,
-        0.0, chain.L2_mm, half_width_mm, near_tilt_rad=chain.a1_rad, far_tilt_rad=chain.a2_rad,
+        0.0, chain.L2_mm, width_pos, near_tilt_rad=chain.a1_rad, far_tilt_rad=chain.a2_rad,
+        half_width_neg_mm=width_neg,
     )
     panel3_corners = sheared_panel_corners(
         chain.panel3.origin, chain.panel3.u, chain.panel3.v,
-        0.0, chain.L3_mm + margin, half_width_mm, near_tilt_rad=chain.a2_rad, far_tilt_rad=0.0,
+        0.0, chain.L3_mm + margin, width_pos, near_tilt_rad=chain.a2_rad, far_tilt_rad=0.0,
+        half_width_neg_mm=width_neg,
     )
 
     # panel1とpanel3は隣接しない(panel_midを挟む)ため、折れ角が大きいと3Dで
@@ -238,7 +252,7 @@ def plan_general_two_point(
         ("panel3", 0.0, chain.L3_mm + margin, chain.a2_rad, 0.0),
     ):
         nominal = far_run - near_run
-        shear = half_width_mm * abs(math.tan(far_tilt) - math.tan(near_tilt))
+        shear = max(width_pos, width_neg) * abs(math.tan(far_tilt) - math.tan(near_tilt))
         span = nominal - shear
         if span < MIN_SHEARED_PANEL_SPAN_MM or span < MIN_SHEARED_PANEL_SPAN_RATIO * nominal:
             raise ValueError(

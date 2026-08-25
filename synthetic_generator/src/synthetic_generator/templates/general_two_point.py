@@ -38,6 +38,13 @@ from synthetic_generator.classify import (
     two_point_frame,
 )
 from synthetic_generator.bead import BeadParams, sample_bead
+from synthetic_generator.flange import (
+    FLANGE_MAX_FOLD_ANGLE_DEG,
+    FlangeParams,
+    max_fold_angle_deg,
+    plan_flange_on_surface,
+    sample_flange,
+)
 from synthetic_generator.general_geometry import check_bead_feasible, plan_general_two_point
 
 # ユーザー確定(2026-08-24): 締結点1つに必要な最小平面は**直径25mm**(=半径12.5mm)。
@@ -413,3 +420,102 @@ def resolve_bead_slacks(
         if feasible(slack1, slack2, candidate):
             return dataclasses.replace(spec, fold1_slack_mm=slack1, fold2_slack_mm=slack2), candidate
     return None
+
+
+def _flange_feasible(spec: GeneralTwoJointSpec, flange: FlangeParams) -> bool:
+    """このspec+フランジで、拡張幅込みの基準面計画とフランジ計画の両方が通るか。"""
+    try:
+        plan = plan_general_two_point(
+            spec.point1,
+            spec.point2,
+            min_bearing_radius_mm=spec.min_bearing_radius_mm,
+            half_width_mm=spec.half_width_mm,
+            bend_radius_mm=spec.bend_radius_mm,
+            fold1_slack_mm=spec.fold1_slack_mm,
+            fold2_slack_mm=spec.fold2_slack_mm,
+            fold1_tilt_perturbation_rad=spec.fold1_tilt_perturbation_rad,
+            side_extension_mm=(
+                flange.extension_mm if flange.side < 0 else 0.0,
+                flange.extension_mm if flange.side > 0 else 0.0,
+            ),
+        )
+        plan_flange_on_surface(
+            plan.panel_frames, flange,
+            half_width_mm=spec.half_width_mm, fold_tangents=plan.fold_tangents,
+        )
+    except ValueError:
+        return False
+    return True
+
+
+def resolve_reinforcement(
+    rng: random.Random,
+    spec: GeneralTwoJointSpec,
+    *,
+    slack_attempts: int = 20,
+) -> tuple[GeneralTwoJointSpec, BeadParams | None, FlangeParams | None] | None:
+    """補強の種類を選び、成立するspec(slack差し替え済み)と補強パラメータを返す。
+
+    使い分けはユーザー指定(2026-08-25): **最大折れ角20度以下ならフランジ、
+    それ以外(急でフランジ不成立)はビード**。種類が基準面の幾何の決定的な関数なので、
+    学習器は「締結点 -> 補強の種類」も学べる。
+
+    フランジがそのslackで成立しない場合はslackを選び直し(種類の判定は最初の成立plan
+    での折れ角を保つ)、それでも駄目ならビードへフォールバックする。
+    戻り値Noneは基準面自体が不成立(呼び出し側は次のspecへ)。
+    """
+    try:
+        plan = plan_general_two_point(
+            spec.point1,
+            spec.point2,
+            min_bearing_radius_mm=spec.min_bearing_radius_mm,
+            half_width_mm=spec.half_width_mm,
+            bend_radius_mm=spec.bend_radius_mm,
+            fold1_slack_mm=spec.fold1_slack_mm,
+            fold2_slack_mm=spec.fold2_slack_mm,
+            fold1_tilt_perturbation_rad=spec.fold1_tilt_perturbation_rad,
+        )
+    except ValueError:
+        return None
+
+    if max_fold_angle_deg(plan.panel_frames) <= FLANGE_MAX_FOLD_ANGLE_DEG:
+        flange = sample_flange(
+            rng, plan.panel_frames, plan.fold_tilts,
+            spec.half_width_mm, spec.bend_radius_mm,
+        )
+        if flange is not None and _flange_feasible(spec, flange):
+            return spec, None, flange
+        # slackを選び直して再試行(平坦区間不足などはslackの性質、SS12と同じ理屈)
+        for _ in range(slack_attempts):
+            slack1 = rng.uniform(*FOLD_SLACK_RANGE_MM)
+            slack2 = rng.uniform(*FOLD_SLACK_RANGE_MM)
+            candidate = dataclasses.replace(spec, fold1_slack_mm=slack1, fold2_slack_mm=slack2)
+            try:
+                plan2 = plan_general_two_point(
+                    candidate.point1,
+                    candidate.point2,
+                    min_bearing_radius_mm=candidate.min_bearing_radius_mm,
+                    half_width_mm=candidate.half_width_mm,
+                    bend_radius_mm=candidate.bend_radius_mm,
+                    fold1_slack_mm=slack1,
+                    fold2_slack_mm=slack2,
+                    fold1_tilt_perturbation_rad=candidate.fold1_tilt_perturbation_rad,
+                )
+            except ValueError:
+                continue
+            if max_fold_angle_deg(plan2.panel_frames) > FLANGE_MAX_FOLD_ANGLE_DEG:
+                continue  # 種類の判定を跨ぐslackは採らない(フランジ条件の部品はフランジのまま)
+            flange = sample_flange(
+                rng, plan2.panel_frames, plan2.fold_tilts,
+                candidate.half_width_mm, candidate.bend_radius_mm,
+            )
+            if flange is not None and _flange_feasible(candidate, flange):
+                return candidate, None, flange
+        # フランジ不成立 -> ビードへフォールバック(ユーザー指定の使い分け)
+
+    bead = sample_bead(rng, spec.half_width_mm)
+    resolved = resolve_bead_slacks(rng, spec, bead)
+    if resolved is None:
+        return None
+    new_spec, new_bead = resolved
+    return new_spec, new_bead, None

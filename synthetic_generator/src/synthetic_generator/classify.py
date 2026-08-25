@@ -190,7 +190,8 @@ def two_point_frame(point1: FasteningPoint, point2: FasteningPoint) -> TwoPointF
     return TwoPointFrame(w=w, u1=u1, u2=u2, n1=n1, n2=n2)
 
 
-def end_panel_corners(origin: Vec3, u: Vec3, w: Vec3, near: float, far: float, half_width: float) -> list[Vec3]:
+def end_panel_corners(origin: Vec3, u: Vec3, w: Vec3, near: float, far: float, half_width: float,
+                      half_width_neg: float | None = None) -> list[Vec3]:
     """origin中心のローカル(u,w)フレームで、走行方向near〜far・幅方向±half_widthの
     平坦矩形の4隅を返す(_panel_cornersのheight0=height1=0特殊形に相当、n方向成分は
     常に0=originが乗る平面上)。順序は[near,-hw],[near,hw],[far,hw],[far,-hw]
@@ -200,7 +201,8 @@ def end_panel_corners(origin: Vec3, u: Vec3, w: Vec3, near: float, far: float, h
     def pt(run: float, width: float) -> Vec3:
         return tuple(origin[i] + run * u[i] + width * w[i] for i in range(3))
 
-    return [pt(near, -half_width), pt(near, half_width), pt(far, half_width), pt(far, -half_width)]
+    neg = half_width_neg if half_width_neg is not None else half_width
+    return [pt(near, -neg), pt(near, half_width), pt(far, half_width), pt(far, -neg)]
 
 
 def ramp_fold_angles_rad(mid_near: Vec3, mid_far: Vec3, u1: Vec3, u2: Vec3) -> tuple[float, float]:
@@ -524,6 +526,7 @@ def sheared_panel_corners(
     *,
     near_tilt_rad: float = 0.0,
     far_tilt_rad: float = 0.0,
+    half_width_neg_mm: float | None = None,
 ) -> list[Vec3]:
     """自由折れ目パネルの4隅を返す(end_panel_cornersの一般化)。
 
@@ -535,17 +538,20 @@ def sheared_panel_corners(
     (境界の自由端— 締結点まわりのbearing margin — は常にtilt=0)。
 
     順序は[near,-hw],[near,hw],[far,hw],[far,-hw](end_panel_cornersと同じ規約)。
+    `half_width_neg_mm`を渡すとv負側だけ幅を変えられる(フランジ側の拡張、SS14。
+    省略時は従来どおり左右対称)。
     """
+    neg = half_width_neg_mm if half_width_neg_mm is not None else half_width_mm
 
     def pt(run: float, width: float, tilt: float) -> Vec3:
         shifted_run = run + width * math.tan(tilt)
         return tuple(origin[i] + shifted_run * u[i] + width * v[i] for i in range(3))
 
     return [
-        pt(near_run_mm, -half_width_mm, near_tilt_rad),
+        pt(near_run_mm, -neg, near_tilt_rad),
         pt(near_run_mm, half_width_mm, near_tilt_rad),
         pt(far_run_mm, half_width_mm, far_tilt_rad),
-        pt(far_run_mm, -half_width_mm, far_tilt_rad),
+        pt(far_run_mm, -neg, far_tilt_rad),
     ]
 
 

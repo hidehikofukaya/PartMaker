@@ -107,7 +107,8 @@ class _FakeGeneralBuilder:
 
     def build_general_two_point(
         self, point1, point2, *, min_bearing_radius_mm, half_width_mm, bend_radius_mm,
-        fold1_slack_mm, fold2_slack_mm, fold1_tilt_perturbation_rad, out_dir, part_name, bead=None,
+        fold1_slack_mm, fold2_slack_mm, fold1_tilt_perturbation_rad, out_dir, part_name,
+        bead=None, flange=None,
     ):
         self.calls.append((point1, point2, out_dir, part_name, bead))
         return _FakeGeneratedPart(
@@ -173,7 +174,7 @@ def test_generate_general_batch_writes_params_json_per_part(tmp_path: pathlib.Pa
         assert params_path.exists()
         data = json.loads(params_path.read_text(encoding="utf-8"))
         assert data["part_id"] == record.part_id
-        assert data["bead"] is None  # bead_probability=0(既定)
+        assert data["bead"] is None and data["flange"] is None  # 補強確率0(既定)
         assert "fold_tilts_deg" in data and "geometry_label" in data
         # specはそのまま形状を再構築できる完全な記録であること
         assert data["spec"]["half_width_mm"] == record.spec.half_width_mm

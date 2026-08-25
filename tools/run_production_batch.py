@@ -4,8 +4,9 @@
 バッチごとに独立したサブディレクトリへ出力する — AnnotationDocumentのjoints.jsonは
 出力先ごとに1つで、同じディレクトリへ再実行すると上書きされるため。
 
-使い方: python tools/run_production_batch.py <batch名> <部品数> <seed> [bead確率]
-例:     python tools/run_production_batch.py batch01 100 20260826 0.5
+使い方: python tools/run_production_batch.py <batch名> <部品数> <seed> [補強確率]
+例:     python tools/run_production_batch.py batch02 100 20260827 0.5
+補強の種類(フランジ/ビード)は基準面の幾何で自動選択(最大折れ角20度以下ならフランジ)。
 """
 import pathlib
 import sys
@@ -21,7 +22,7 @@ def main() -> None:
     batch_name = sys.argv[1]
     count = int(sys.argv[2])
     seed = int(sys.argv[3])
-    bead_probability = float(sys.argv[4]) if len(sys.argv) > 4 else 0.5
+    reinforcement_probability = float(sys.argv[4]) if len(sys.argv) > 4 else 0.5
     out_dir = DEFAULT_OUTPUT_ROOT / batch_name
     if (out_dir / "annotations" / "joints.json").exists():
         raise SystemExit(f"{out_dir} には既にバッチが存在する。別のbatch名を使うこと。")
@@ -37,12 +38,15 @@ def main() -> None:
 
     t0 = time.time()
     records = generate_general_batch(
-        builder, out_dir, count=count, seed=seed, bead_probability=bead_probability
+        builder, out_dir, count=count, seed=seed,
+        reinforcement_probability=reinforcement_probability
     )
     dt = time.time() - t0
     with_bead = sum(1 for r in records if r.bead is not None)
+    with_flange = sum(1 for r in records if r.flange is not None)
     print(f"BATCH DONE: {len(records)}部品 / {dt / 60:.1f}分 "
-          f"(1部品 {dt / len(records):.1f}秒)  ビード付き {with_bead}/{len(records)}", flush=True)
+          f"(1部品 {dt / len(records):.1f}秒)  ビード {with_bead} / フランジ {with_flange} "
+          f"/ 補強なし {len(records) - with_bead - with_flange}", flush=True)
     print(f"出力: {out_dir}", flush=True)
 
 
