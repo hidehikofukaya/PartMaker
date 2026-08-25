@@ -1257,10 +1257,17 @@ class SyntheticPartBuilder:
         # (ユーザー指定の工程順)。実機12件中11件で全ドラフト角のスイープが成立
         # (Join方式は3/8、旧・単段オフセットは四隅が尖ったまま)。
         # 各段の向き(内側/外側)は形状依存なので、実測プローブで選ぶ。
-        def _parallel_curve(source_ref, offset_mm, probe_refs, tolerance_mm, label):
+        def _parallel_curve(source_ref, offset_mm, probe_refs, tolerance_mm, label,
+                            corner_type=0):
             reasons = []
             for reverse in (False, True):
                 candidate = hsf.AddNewCurvePar(source_ref, surface_ref, offset_mm, reverse, True)
+                if corner_type:
+                    # CurveParType: 0=Sharp(既定、接線延長で角を尖らせる) / 1=Round。
+                    # **既定のままだと外向きオフセットでも四隅は尖ったまま延長される**
+                    # (2026-08-25にユーザーが完成品で発見、実測で確認: 尖り角位置→バンド
+                    # 0.00mm。Roundにすると3.95mm≒理論値3.62mmになり円弧中点に乗る)。
+                    candidate.CurveParType = corner_type
                 body.AppendHybridShape(candidate)
                 try:
                     part.Update()
@@ -1300,6 +1307,7 @@ class SyntheticPartBuilder:
             outline_probe_refs,
             self.BEAD_PROBE_TOLERANCE_MM,
             "rounded footprint outline",
+            corner_type=1,
         )
         outline.Name = "bead_footprint"
 

@@ -184,13 +184,14 @@ def sample_bead(rng: random.Random, half_width_mm: float) -> BeadParams:
     # 4. 平面視の四隅R: 壁同士の縦エッジの丸め(2026-08-25、ユーザー指摘で復活)。
     #    外形曲線の構成(内側に縮めた尖りループを外向きに測地オフセット、SS13)から、
     #    内側ループのキャップ幅 2*(hf - cR) が残る条件 cR <= hf - 1.5 が上限。
-    #    下限は中立面R最小。上限が下限を割る組み合わせはあえて下限を返し、
-    #    plan_bead_on_surfaceのキャップ幅チェックでInfeasibleとして弾かせる。
+    #    下限は「**頂部の**四隅R >= 中立面R最小」。壁は内側へwall_runだけ倒れるので、
+    #    頂部のコーナー半径は cR - wall_run に縮む — 根本だけ見て下限5にすると
+    #    頂部が実質尖る(cR=5, wall_run≈5)。上限が下限を割る組み合わせはあえて
+    #    下限を返し、plan_bead_on_surfaceのチェックでInfeasibleとして弾かせる。
     half_footprint = top_width / 2.0 + wall_run
+    min_corner = MIN_NEUTRAL_PLANE_RADIUS_MM + wall_run
     max_corner = min(0.8 * half_footprint, half_footprint - 1.5)
-    corner_radius = rng.uniform(
-        MIN_NEUTRAL_PLANE_RADIUS_MM, max(MIN_NEUTRAL_PLANE_RADIUS_MM, max_corner)
-    )
+    corner_radius = rng.uniform(min_corner, max(min_corner, max_corner))
 
     return BeadParams(
         depth_mm=depth,
@@ -489,6 +490,12 @@ def plan_bead_on_surface(
         raise ValueError(
             f"bead corner radius ({bead.corner_radius_mm:.1f}mm) leaves no cap width on the "
             f"footprint half-width ({bead.half_footprint_mm:.1f}mm). Infeasible."
+        )
+    if bead.corner_radius_mm - bead.wall_run_mm < MIN_NEUTRAL_PLANE_RADIUS_MM - 1e-9:
+        raise ValueError(
+            f"bead corner radius ({bead.corner_radius_mm:.1f}mm) minus the wall run "
+            f"({bead.wall_run_mm:.1f}mm) leaves a top-side corner radius below the minimum "
+            f"{MIN_NEUTRAL_PLANE_RADIUS_MM:.1f}mm. Infeasible."
         )
     # 切断位置は逃げ位置よりさらにd手前なので、逃げが平坦区間にあっても切断が曲げの
     # フィレット上に落ちうる。フィレットを斜めに切ると境界の隅が接線的に潰れ、内側へ

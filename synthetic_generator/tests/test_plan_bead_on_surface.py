@@ -24,7 +24,7 @@ from synthetic_generator.classify import (
 
 BEAD = BeadParams(
     depth_mm=4.0, top_width_mm=14.0, wall_angle_deg=45.0,
-    ridge_radius_mm=5.0, corner_radius_mm=5.0,
+    ridge_radius_mm=5.0, corner_radius_mm=9.5,
 )
 
 def _sample_chain_panel_frames(half_width_mm: float = 20.0):
