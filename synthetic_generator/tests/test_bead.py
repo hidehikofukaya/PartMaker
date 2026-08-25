@@ -21,7 +21,7 @@ from synthetic_generator.classify import (
 
 BEAD = BeadParams(
     depth_mm=6.0, top_width_mm=30.0, wall_angle_deg=45.0,
-    ridge_radius_mm=5.0,
+    ridge_radius_mm=5.0, corner_radius_mm=5.0,
 )
 
 

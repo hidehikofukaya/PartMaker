@@ -77,6 +77,7 @@ class BeadParams:
     top_width_mm: float
     wall_angle_deg: float
     ridge_radius_mm: float   # 断面の稜線R(頂稜線=手順⑥・足元=手順⑦に共通)
+    corner_radius_mm: float  # 平面視の四隅R(壁同士の縦エッジ。外形曲線に織り込む、SS13)
 
     @property
     def wall_run_mm(self) -> float:
@@ -180,11 +181,23 @@ def sample_bead(rng: random.Random, half_width_mm: float) -> BeadParams:
     max_top_half = min(max_top_half, BEAD_TOP_WIDTH_RANGE_MM[1] / 2.0)
     top_width = 2.0 * rng.uniform(min_top_half, max(min_top_half, max_top_half))
 
+    # 4. 平面視の四隅R: 壁同士の縦エッジの丸め(2026-08-25、ユーザー指摘で復活)。
+    #    外形曲線の構成(内側に縮めた尖りループを外向きに測地オフセット、SS13)から、
+    #    内側ループのキャップ幅 2*(hf - cR) が残る条件 cR <= hf - 1.5 が上限。
+    #    下限は中立面R最小。上限が下限を割る組み合わせはあえて下限を返し、
+    #    plan_bead_on_surfaceのキャップ幅チェックでInfeasibleとして弾かせる。
+    half_footprint = top_width / 2.0 + wall_run
+    max_corner = min(0.8 * half_footprint, half_footprint - 1.5)
+    corner_radius = rng.uniform(
+        MIN_NEUTRAL_PLANE_RADIUS_MM, max(MIN_NEUTRAL_PLANE_RADIUS_MM, max_corner)
+    )
+
     return BeadParams(
         depth_mm=depth,
         top_width_mm=top_width,
         wall_angle_deg=wall_angle,
         ridge_radius_mm=ridge_radius,
+        corner_radius_mm=corner_radius,
     )
 
 
@@ -247,6 +260,7 @@ class BeadSurfacePlan:
     trim_sections: list[tuple[Vec3, Vec3, Vec3]]
     trim_keep_probe: Vec3
     trim_remove_probes: list[Vec3]
+    inner_loop_probe: Vec3
     outline_probes: list[Vec3]
 
 
@@ -468,6 +482,14 @@ def plan_bead_on_surface(
             f"bead footprint half-width ({bead.half_footprint_mm:.1f}mm) leaves no room to "
             f"offset inward from the plate edge ({half_width_mm:.1f}mm). Infeasible."
         )
+    # 四隅R(SS13): 外形は「内側に縮めた尖りループを外向きにcRオフセット」で作る。
+    # 凸角の外向き測地オフセットが四隅を自動的に半径cRの円弧にする。内側ループの
+    # キャップ幅 2*(hf - cR) が潰れる組み合わせは成立しない。
+    if bead.half_footprint_mm - bead.corner_radius_mm < 1.0:
+        raise ValueError(
+            f"bead corner radius ({bead.corner_radius_mm:.1f}mm) leaves no cap width on the "
+            f"footprint half-width ({bead.half_footprint_mm:.1f}mm). Infeasible."
+        )
     # 切断位置は逃げ位置よりさらにd手前なので、逃げが平坦区間にあっても切断が曲げの
     # フィレット上に落ちうる。フィレットを斜めに切ると境界の隅が接線的に潰れ、内側へ
     # オフセットした曲線が掃引の入力として不正になる。逃げ位置と同じ判定を掛ける。
@@ -545,6 +567,11 @@ def plan_bead_on_surface(
     # (板の両端すぐ内側)が実際に消えたことも要求する
     # (`_bead_bitangent`が同じ失敗で学んだのと同じパターン)。
     trim_keep_probe = at(last_index // 2, (start_run + end_run) / 2.0, 0.0)
+    # 内側の尖りループ(±(hf-cR))の向き選定プローブ。中央パネルの平坦区間に置く。
+    inner_loop_probe = at(
+        last_index // 2, (start_run + end_run) / 2.0,
+        bead.half_footprint_mm - bead.corner_radius_mm,
+    )
     trim_remove_probes = [
         at(0, panel_frames[0].near_run_mm + FLAT_CLEARANCE_MM, 0.0),
         at(last_index, panel_frames[last_index].far_run_mm - FLAT_CLEARANCE_MM, 0.0),
@@ -568,6 +595,7 @@ def plan_bead_on_surface(
         outline_offset_mm=outline_offset_mm,
         trim_sections=trim_sections,
         trim_keep_probe=trim_keep_probe,
+        inner_loop_probe=inner_loop_probe,
         trim_remove_probes=trim_remove_probes,
         outline_probes=outline_probes,
     )

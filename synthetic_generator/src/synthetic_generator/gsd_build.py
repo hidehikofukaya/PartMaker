@@ -1248,41 +1248,60 @@ class SyntheticPartBuilder:
             ) from exc
         boundary_ref = part.CreateReferenceFromObject(boundary)
 
-        # 平行曲線の向き(内側/外側)は形状依存。得られた閉曲線が長辺と両端キャップの
-        # 中点を通ることを実測して選ぶ。四隅は使わない — コーナーの丸め方はCATIAの
-        # オフセット処理次第で、通る保証が無いため。
-        outline_probe_refs = self._point_refs(part, hsf, body, plan.outline_probes)
-        outline_ref = None
-        reasons = []
-        for reverse in (False, True):
-            outline = hsf.AddNewCurvePar(
-                boundary_ref, surface_ref, plan.outline_offset_mm, reverse, True
-            )
-            outline.Name = "bead_footprint"
-            body.AppendHybridShape(outline)
-            try:
-                part.Update()
-            except Exception as exc:
-                reasons.append(f"reverse={reverse}: update failed ({str(exc)[:40]})")
-                self._delete_feature(doc, part, outline)
-                continue
-            candidate_ref = part.CreateReferenceFromObject(outline)
-            measurable = spa.GetMeasurable(candidate_ref)
-            distances = [measurable.GetMinimumDistance(ref) for ref in outline_probe_refs]
-            if max(distances) < self.BEAD_PROBE_TOLERANCE_MM:
-                outline_ref = candidate_ref
-                break
-            reasons.append(
-                f"reverse={reverse}: {sum(1 for d in distances if d >= self.BEAD_PROBE_TOLERANCE_MM)}"
-                f"/{len(distances)}点が外れ 最悪{max(distances):.2f}mm"
-            )
-            self._delete_feature(doc, part, outline)
-        if outline_ref is None:
+        # 外形は2段の平行曲線で作る(SS13、ユーザー指摘による四隅R対応):
+        #   ①境界を (d + cR) 内側へ -> 長辺±(hf-cR)・キャップstart_run+cRの**尖った**ループ
+        #   ②それを cR **外向き**へ -> 長辺±hf・キャップstart_run・四隅R=cRの閉曲線
+        # 凸角の外向き測地オフセットが四隅を自動的に半径cRの円弧にするので、Joinも
+        # スプラインも端点合わせも不要。掃引後のエッジフィレット(BRep参照、自動化不可
+        # SS4)を避け、コーナー処理が根本・頂稜線フィレットより必ず先行する
+        # (ユーザー指定の工程順)。実機12件中11件で全ドラフト角のスイープが成立
+        # (Join方式は3/8、旧・単段オフセットは四隅が尖ったまま)。
+        # 各段の向き(内側/外側)は形状依存なので、実測プローブで選ぶ。
+        def _parallel_curve(source_ref, offset_mm, probe_refs, tolerance_mm, label):
+            reasons = []
+            for reverse in (False, True):
+                candidate = hsf.AddNewCurvePar(source_ref, surface_ref, offset_mm, reverse, True)
+                body.AppendHybridShape(candidate)
+                try:
+                    part.Update()
+                except Exception as exc:
+                    reasons.append(f"reverse={reverse}: update failed ({str(exc)[:40]})")
+                    self._delete_feature(doc, part, candidate)
+                    continue
+                candidate_ref = part.CreateReferenceFromObject(candidate)
+                measurable = spa.GetMeasurable(candidate_ref)
+                distances = [measurable.GetMinimumDistance(ref) for ref in probe_refs]
+                if max(distances) < tolerance_mm:
+                    return candidate, candidate_ref
+                reasons.append(
+                    f"reverse={reverse}: {sum(1 for d in distances if d >= tolerance_mm)}"
+                    f"/{len(distances)}点が外れ 最悪{max(distances):.2f}mm"
+                )
+                self._delete_feature(doc, part, candidate)
             raise ValueError(
-                f"bead: no parallel-curve direction put the footprint outline at the planned "
-                f"position (offset={plan.outline_offset_mm:.1f}mm) [{'; '.join(reasons)}]. "
+                f"bead: no parallel-curve direction put the {label} at the planned position "
+                f"(offset={offset_mm:.1f}mm) [{'; '.join(reasons)}]. "
                 "Infeasible; not attempting further construction."
             )
+
+        inner_probe_ref = self._point_refs(part, hsf, body, [plan.inner_loop_probe])[0]
+        inner_loop, inner_ref = _parallel_curve(
+            boundary_ref,
+            plan.outline_offset_mm + bead.corner_radius_mm,
+            [inner_probe_ref],
+            1.0,  # 内側ループは向きの判別ができれば十分(最終位置は②が保証する)
+            "inner sharp loop",
+        )
+        inner_loop.Name = "bead_inner_loop"
+        outline_probe_refs = self._point_refs(part, hsf, body, plan.outline_probes)
+        outline, outline_ref = _parallel_curve(
+            inner_ref,
+            bead.corner_radius_mm,
+            outline_probe_refs,
+            self.BEAD_PROBE_TOLERANCE_MM,
+            "rounded footprint outline",
+        )
+        outline.Name = "bead_footprint"
 
         # 閉曲線を一括で掃引するので壁4枚は同じ向きに倒れる。長辺の左右2点で
         # 「内側に倒れている」ことを確認して角度を選ぶ。

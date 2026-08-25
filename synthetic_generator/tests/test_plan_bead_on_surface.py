@@ -24,7 +24,7 @@ from synthetic_generator.classify import (
 
 BEAD = BeadParams(
     depth_mm=4.0, top_width_mm=14.0, wall_angle_deg=45.0,
-    ridge_radius_mm=5.0,
+    ridge_radius_mm=5.0, corner_radius_mm=5.0,
 )
 
 def _sample_chain_panel_frames(half_width_mm: float = 20.0):
@@ -170,6 +170,7 @@ def test_plan_bead_on_surface_rejects_bead_too_wide_for_the_panel() -> None:
     panel_frames, margin = _sample_chain_panel_frames()
     wide_bead = BeadParams(
         depth_mm=6.0, top_width_mm=100.0, wall_angle_deg=45.0, ridge_radius_mm=5.0,
+        corner_radius_mm=5.0,
     )
     with pytest.raises(ValueError, match="does not fit"):
         plan_bead_on_surface(

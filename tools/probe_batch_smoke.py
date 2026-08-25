@@ -8,7 +8,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "synthet
 from synthetic_generator.batch_generate import generate_general_batch  # noqa: E402
 from synthetic_generator.gsd_build import SyntheticPartBuilder  # noqa: E402
 
-OUT = pathlib.Path(__file__).resolve().parent / "probe_output" / "smoke_ss12"
+OUT = pathlib.Path(__file__).resolve().parent / "probe_output" / "smoke_ss13"
 
 
 def main() -> None:
