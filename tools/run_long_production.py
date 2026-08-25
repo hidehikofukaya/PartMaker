@@ -11,9 +11,15 @@
 - 進捗は逐次flushして書き出す(長時間実行なので途中経過が見えることが重要)
 
 使い方:
-  python tools/run_long_production.py <ルート名> <時間[h]> <チャンク部品数> <seed> [補強確率]
+  python tools/run_long_production.py <ルート名> <時間[h]> <チャンク部品数> <seed>
+                                      [補強確率] [最大チャンク数] [クォータJSON]
 例:
   python tools/run_long_production.py prod01 7 220 20260902 1.0
+  python tools/run_long_production.py prod02 6 250 20260903 1.0 4 quota.json
+
+クォータJSONは配置クラスごとの**チャンクあたり**の目標件数
+(例 {"orthogonal": 75, "parallel_opposite": 62})。カバレッジの穴を狙って埋めるため
+(SS16)。計上は実際に生成できたクラスで行うので、到達不能な目標でも止まらない。
 """
 import pathlib
 import sys
@@ -34,6 +40,11 @@ def main() -> None:
     chunk_count = int(sys.argv[3])
     base_seed = int(sys.argv[4])
     reinforcement_probability = float(sys.argv[5]) if len(sys.argv) > 5 else 1.0
+    max_chunks = int(sys.argv[6]) if len(sys.argv) > 6 else 0   # 0 = 時間予算まで
+    class_quota = None
+    if len(sys.argv) > 7:
+        import json
+        class_quota = json.loads(pathlib.Path(sys.argv[7]).read_text(encoding="utf-8"))
 
     root = DEFAULT_OUTPUT_ROOT / root_name
     if root.exists() and any(root.iterdir()):
@@ -50,7 +61,9 @@ def main() -> None:
 
     deadline = time.time() + budget_hours * 3600.0
     print(f"予算 {budget_hours}h / チャンク {chunk_count}部品 / 補強確率 "
-          f"{reinforcement_probability}", flush=True)
+          f"{reinforcement_probability}"
+          + (f" / 最大{max_chunks}チャンク" if max_chunks else "")
+          + (f" / クォータ {class_quota}" if class_quota else ""), flush=True)
 
     chunk = 0
     total_parts = 0
@@ -63,6 +76,9 @@ def main() -> None:
             print(f"\n残り {remaining / 60:.0f}分 < 1チャンク所要 {needed / 60:.0f}分 のため終了",
                   flush=True)
             break
+        if max_chunks and chunk >= max_chunks:
+            print(f"\n最大チャンク数 {max_chunks} に到達したため終了", flush=True)
+            break
         chunk += 1
         out_dir = root / f"chunk_{chunk:02d}"
         seed = base_seed + chunk * 1000
@@ -73,6 +89,7 @@ def main() -> None:
             records = generate_general_batch(
                 builder, out_dir, count=chunk_count, seed=seed,
                 reinforcement_probability=reinforcement_probability,
+                class_quota=class_quota,
             )
         except Exception as exc:
             text = f"{exc}"
