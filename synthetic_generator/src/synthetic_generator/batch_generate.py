@@ -17,6 +17,8 @@ joints.json書き出しまでのオーケストレーションだけをCATIA無�
 from __future__ import annotations
 
 import dataclasses
+import json
+import math
 import pathlib
 import random
 from typing import Protocol
@@ -25,7 +27,11 @@ from synthetic_generator.annotate import build_two_joint_pair
 from synthetic_generator.bead import BeadParams, sample_bead
 from synthetic_generator.annotation_schema import AnnotationDocument, PartEntry
 from synthetic_generator.reinforcement import ReinforcementParams, sample_reinforcement
-from synthetic_generator.templates.general_two_point import GeneralTwoJointSpec
+from synthetic_generator.general_geometry import plan_general_two_point
+from synthetic_generator.templates.general_two_point import (
+    GeneralTwoJointSpec,
+    resolve_bead_slacks,
+)
 from synthetic_generator.templates.general_two_point import sample as sample_general_two_point
 from synthetic_generator.templates.parallel_same_offset import TwoJointSpec
 from synthetic_generator.templates.parallel_same_offset import sample as sample_two_joint_spec
@@ -179,6 +185,15 @@ def generate_general_batch(
                 if bead_probability > 0.0 and rng.random() < bead_probability
                 else None
             )
+            if bead is not None:
+                # ビード指定時はCATIAに触る前に、この締結点で通るslack(必要ならビードも)を
+                # 純Pythonで解決する。棄却は締結点の性質(傾き上限など)にだけ適用し、
+                # 折れ目の置き方の性質はここで選び直す(SS12)。解決不能ならこのspecを捨てて
+                # 次のサンプルへ — builderへ渡る時点でCATIA非依存の失敗理由は残っていない。
+                resolved = resolve_bead_slacks(rng, spec, bead)
+                if resolved is None:
+                    continue
+                spec, bead = resolved
             try:
                 generated = builder.build_general_two_point(
                     spec.point1,
@@ -201,6 +216,40 @@ def generate_general_batch(
                 f"{part_id}: {max_attempts_per_part}回連続でInfeasibleだった。"
                 "サンプリング範囲自体が破綻している可能性がある。"
             )
+
+        # 部品ごとの生成パラメータを保存する(2026-08-25)。joints.jsonは締結点と板厚しか
+        # 持たないため、再現やビード有無の条件付き学習に必要な情報(slack・ビード寸法・
+        # 折れ目の傾き実績値)がどこにも残らなかった。specはビルダー成功時の値
+        # (リゾルバがslackを差し替えた後)なので、これだけで形状を再構築できる。
+        plan = plan_general_two_point(
+            spec.point1,
+            spec.point2,
+            min_bearing_radius_mm=spec.min_bearing_radius_mm,
+            half_width_mm=spec.half_width_mm,
+            bend_radius_mm=spec.bend_radius_mm,
+            fold1_slack_mm=spec.fold1_slack_mm,
+            fold2_slack_mm=spec.fold2_slack_mm,
+            fold1_tilt_perturbation_rad=spec.fold1_tilt_perturbation_rad,
+        )
+        params_dir = out_dir / "params"
+        params_dir.mkdir(parents=True, exist_ok=True)
+        (params_dir / f"{part_id}.json").write_text(
+            json.dumps(
+                {
+                    "part_id": part_id,
+                    "attempts_used": attempt + 1,
+                    "geometry_label": plan.geometry_label,
+                    "fold_tilts_deg": [
+                        [math.degrees(a), math.degrees(b)] for a, b in plan.fold_tilts
+                    ],
+                    "spec": dataclasses.asdict(spec),
+                    "bead": dataclasses.asdict(bead) if bead is not None else None,
+                },
+                ensure_ascii=False,
+                indent=1,
+            ),
+            encoding="utf-8",
+        )
 
         doc.parts[part_id] = PartEntry(
             part_id=part_id,

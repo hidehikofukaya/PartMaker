@@ -51,6 +51,11 @@ BEAD_TOP_WIDTH_RANGE_MM = (10.0, 40.0)
 # フットプリント外側に要る余白は「足元フィレットの後退量 + これ」= BeadParams.side_margin_mm。
 BEAD_SIDE_CLEARANCE_MM = 2.0
 
+# 端の幅ガイドをフットプリントより外へ出す量。gsd_buildと事前判定(general_geometry.
+# check_bead_feasible)が同じ値を使うよう、ここで一元定義する(2026-08-25に
+# gsd_buildのクラス属性から移動)。
+BEAD_GUIDE_MARGIN_MM = 20.0
+
 # 足元Rと頂稜線Rが壁の斜辺を食ってよい割合の上限 2*R*tan(θ/2) <= K*slant。
 # 幾何としてはK=1で「2つのフィレットが重ならない」を満たすが、実測ではそれでは全く
 # 足りなかった(2026-08-25、6つの基準面 x 消費率10段階=60ビルドの直交実験):
@@ -120,8 +125,8 @@ def sample_bead(rng: random.Random, half_width_mm: float) -> BeadParams:
     する」方針を、互いに依存する3つの寸法へ順に適用する。依存の向きが一方通行なので、
     リトライ無しで(ほぼ)実行可能な組み合わせが得られる:
 
-      1. `wall_angle` — 独立にサンプリング。`depth`はそこから下限が決まる
-         (稜線Rが中立面R最小を下回れないので、壁が立つほど深さの下限が上がる)
+      1. `(wall_angle, depth)` — 実行可能領域上で同時に一様(リジェクションサンプリング。
+         稜線Rが中立面R最小を下回れない条件が、壁が立つほど深さの下限を押し上げる)
       2. `ridge_radius` — 壁の斜辺を2つのフィレットが食う割合の上限
          `2*R*tan(θ/2) <= K*depth/sin(θ)` から上限が決まる
       3. `top_width` — 2で決まる`side_margin_mm`を引いた残り幅に収まる条件から上限が決まる
@@ -136,27 +141,29 @@ def sample_bead(rng: random.Random, half_width_mm: float) -> BeadParams:
     Infeasibleとして弾かれる(templates/*.pyと同じ「成立しない値をあえて返して下流で
     弾く」設計)。
     """
-    wall_angle = rng.uniform(*BEAD_WALL_ANGLE_RANGE_DEG)
-    theta = math.radians(wall_angle)
-    half_angle_tangent = math.tan(theta / 2.0)
-
-    # 1. 深さ: 稜線Rの最小値(中立面R最小)と消費率上限から下限が決まる。
+    # 1. (壁角度, 深さ): 実行可能領域の上で**同時に一様**にサンプリングする。
+    #    実行可能条件は、稜線Rの最小値(中立面R最小)と消費率上限から来る深さ下限
     #    2*R0*tan(θ/2) <= K*slant = K*depth/sin(θ)  ->  depth >= 2*R0*tan(θ/2)*sin(θ)/K
-    #    壁が立つほど下限が上がる(70度では9.0mm)。深さを先に振ると壁角度が縛られて
-    #    しまうので、角度を先に振って深さの下限を逆算する。
-    min_depth = (
-        2.0 * MIN_NEUTRAL_PLANE_RADIUS_MM * half_angle_tangent * math.sin(theta)
-        / BEAD_RIDGE_WALL_CONSUMPTION_MAX
-    )
-    low_depth = max(BEAD_DEPTH_RANGE_MM[0], min_depth)
-    if low_depth > BEAD_DEPTH_RANGE_MM[1]:
-        raise ValueError(
-            f"no bead depth satisfies the minimum neutral-plane radius "
-            f"({MIN_NEUTRAL_PLANE_RADIUS_MM:.1f}mm) at wall angle {wall_angle:.1f}deg: "
-            f"needs >= {min_depth:.1f}mm but the range tops out at "
-            f"{BEAD_DEPTH_RANGE_MM[1]:.1f}mm."
+    #    (壁が立つほど下限が上がり、70度では9.0mm)。
+    #    以前は「角度を振ってから深さを下限つき一様で振る」逐次方式だったが、下限が
+    #    角度の関数なので**物理が要求する以上に強い相関 r=+0.81 がデータに入り**、
+    #    「急な壁 ⇒ 必ず深い」という板金設計には存在しない規則を学習させる恐れがあった
+    #    (2026-08-25の多様性検査で発覚)。矩形からのリジェクションサンプリングなら
+    #    領域上で正確に一様になり、残る相関は実行可能領域の形が強制する分だけになる。
+    #    実行可能率は約60%なので平均1.7回で当たる。
+    for _ in range(1000):
+        wall_angle = rng.uniform(*BEAD_WALL_ANGLE_RANGE_DEG)
+        depth = rng.uniform(*BEAD_DEPTH_RANGE_MM)
+        theta = math.radians(wall_angle)
+        half_angle_tangent = math.tan(theta / 2.0)
+        min_depth = (
+            2.0 * MIN_NEUTRAL_PLANE_RADIUS_MM * half_angle_tangent * math.sin(theta)
+            / BEAD_RIDGE_WALL_CONSUMPTION_MAX
         )
-    depth = rng.uniform(low_depth, BEAD_DEPTH_RANGE_MM[1])
+        if depth >= min_depth:
+            break
+    else:  # 全角度で下限<=上限(70度でも9.0<10.0)なので実際には到達しない
+        raise RuntimeError("bead (angle, depth) rejection sampling did not terminate")
 
     # 2. 稜線R: 2*R*tan(θ/2) <= K*slant を R について解く。1で下限を効かせてあるので
     #    上限は必ず中立面R最小以上になる。

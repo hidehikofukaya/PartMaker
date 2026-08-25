@@ -37,6 +37,8 @@ from synthetic_generator.classify import (
     solve_free_fold,
     two_point_frame,
 )
+from synthetic_generator.bead import BeadParams, sample_bead
+from synthetic_generator.general_geometry import check_bead_feasible, plan_general_two_point
 
 # ユーザー確定(2026-08-24): 締結点1つに必要な最小平面は**直径25mm**(=半径12.5mm)。
 # それ以上大きくしても利点は乏しいので、板金の幅は25〜50mmに抑える。
@@ -60,7 +62,9 @@ FOLD_SLACK_RANGE_MM = (0.0, 60.0)
 # seed自身の傾きa1(中央値約5度)と同程度なので、多様性は十分残る。
 # 実測の通過率: ±20度 68% / ±8度 78.7% / ±6度 82.1% / ±4度 85.5%。
 # ユーザー目標80%を満たす範囲で多様性を最大化する±6度を採る。
-FOLD_TILT_PERTURBATION_RANGE_DEG = (-6.0, 6.0)
+# 傾き摂動の幅。上限5度に対して±6度では探索候補の大半が上限側でクランプされて
+# 無駄になるため、上限内に収まる±3度とする(2026-08-25、傾き上限30->5度の変更に追随)。
+FOLD_TILT_PERTURBATION_RANGE_DEG = (-3.0, 3.0)
 
 # 締結点2の配置(2026-08-25、層別分析にもとづく)。
 #
@@ -77,7 +81,13 @@ FOLD_TILT_PERTURBATION_RANGE_DEG = (-6.0, 6.0)
 # そこで p2 は **w直交平面内の距離(断面距離)と、wに沿ったズレ比** で指定する。
 # 法線が平行で w が定まらない場合だけ、従来の3D一様方向へフォールバックする。
 SECTION_DISTANCE_RANGE_MM = (120.0, 220.0)  # w直交平面内で測った締結点間距離
-MAX_LATERAL_OFFSET_RATIO = 0.40             # |dw| / 断面距離 の上限
+# 横ズレ比の上限。傾きの上限MAX_FOLD_TILT_DEG=5度(tan5deg=0.087)が実質的に許すのは
+# 比0.1前後まで — 実測(2026-08-25、300試行): 比0.15-0.45の帯は84%が傾き棄却で
+# OK率4%、比<0.09なら傾き棄却11%・OK率36%。0.40のままでは試行の65%が最初から
+# 通らない帯に置かれる(feasible-by-construction違反)。出力分布は変わらない
+# (上限が既に排除している領域なので)。入力カバレッジを広げたくなったら、傾き上限と
+# セットで再検討すること。
+MAX_LATERAL_OFFSET_RATIO = 0.10             # |dw| / 断面距離 の上限
 OFFSET_DISTANCE_RANGE_MM = (120.0, 220.0)   # 法線平行時のフォールバック用
 
 # 中間折れ目の間に最低限残すランプの長さ。slack予算の計算に使う。
@@ -344,3 +354,62 @@ def sample(
         fold2_slack_mm=fold2_slack,
         fold1_tilt_perturbation_rad=fold1_tilt_perturbation,
     )
+
+
+def resolve_bead_slacks(
+    rng: random.Random,
+    spec: GeneralTwoJointSpec,
+    bead: BeadParams,
+    *,
+    slack_attempts: int = 20,
+    bead_resample_attempts: int = 20,
+) -> tuple[GeneralTwoJointSpec, BeadParams] | None:
+    """この締結点ペアで**ビードまで成立する**slack(必要ならビードも)を探して返す。
+
+    棄却は締結点自体の性質(折れ目の傾き)にだけ適用すべきで、折れ目の置き方の性質
+    (パネルの平坦区間・逃げ位置・フットプリント)は棄却ではなくslackの選び直しで
+    解決できる — 実測(2026-08-25、300試行): 平坦区間不足の棄却42件のうち64%、
+    その他のビード計画棄却18件のうち50%が、同じ締結点のまま回収できた
+    (必要なslack候補数の中央値は1)。棄却のままだと「短い中間パネルを強いる締結点
+    配置にはビード付き学習データが存在しない」という分布の穴が空く。
+
+    判定は`plan_general_two_point`+`check_bead_feasible` — gsd_buildが実機構築前に
+    行う権威チェックと同一の関数なので、ここを通ればCATIA非依存の理由では落ちない。
+
+    戻り値はslackを差し替えたspec(とビード)。どうしても成立しなければNone
+    (傾き上限など締結点の性質で落ちるケース)。純Python(1判定あたり数ms)。
+    """
+
+    def feasible(slack1: float, slack2: float, candidate: BeadParams) -> bool:
+        try:
+            plan = plan_general_two_point(
+                spec.point1,
+                spec.point2,
+                min_bearing_radius_mm=spec.min_bearing_radius_mm,
+                half_width_mm=spec.half_width_mm,
+                bend_radius_mm=spec.bend_radius_mm,
+                fold1_slack_mm=slack1,
+                fold2_slack_mm=slack2,
+                fold1_tilt_perturbation_rad=spec.fold1_tilt_perturbation_rad,
+            )
+            check_bead_feasible(plan, candidate)
+        except ValueError:
+            return False
+        return True
+
+    if feasible(spec.fold1_slack_mm, spec.fold2_slack_mm, bead):
+        return spec, bead
+    for _ in range(slack_attempts):
+        slack1 = rng.uniform(*FOLD_SLACK_RANGE_MM)
+        slack2 = rng.uniform(*FOLD_SLACK_RANGE_MM)
+        if feasible(slack1, slack2, bead):
+            return dataclasses.replace(spec, fold1_slack_mm=slack1, fold2_slack_mm=slack2), bead
+    # slackだけで駄目なら、ビード側も引き直す(フットプリントが板幅に対して大きすぎる等、
+    # ビードの性質で落ちているケースはこちらで救う)
+    for _ in range(bead_resample_attempts):
+        slack1 = rng.uniform(*FOLD_SLACK_RANGE_MM)
+        slack2 = rng.uniform(*FOLD_SLACK_RANGE_MM)
+        candidate = sample_bead(rng, spec.half_width_mm)
+        if feasible(slack1, slack2, candidate):
+            return dataclasses.replace(spec, fold1_slack_mm=slack1, fold2_slack_mm=slack2), candidate
+    return None

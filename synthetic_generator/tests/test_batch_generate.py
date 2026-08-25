@@ -161,3 +161,57 @@ def test_generate_general_batch_skips_infeasible_and_still_reaches_count(tmp_pat
 
     assert len(records) == 2
     assert builder.call_count == 5
+
+
+def test_generate_general_batch_writes_params_json_per_part(tmp_path: pathlib.Path) -> None:
+    """部品ごとの生成パラメータ(spec・ビード・傾き実績値)がparams/に保存される(SS12)。"""
+    builder = _FakeGeneralBuilder()
+    records = generate_general_batch(builder, tmp_path, count=2, seed=123)
+
+    for record in records:
+        params_path = tmp_path / "params" / f"{record.part_id}.json"
+        assert params_path.exists()
+        data = json.loads(params_path.read_text(encoding="utf-8"))
+        assert data["part_id"] == record.part_id
+        assert data["bead"] is None  # bead_probability=0(既定)
+        assert "fold_tilts_deg" in data and "geometry_label" in data
+        # specはそのまま形状を再構築できる完全な記録であること
+        assert data["spec"]["half_width_mm"] == record.spec.half_width_mm
+        assert data["spec"]["point1"]["position_xyz"] == list(record.spec.point1.position_xyz)
+
+
+def test_resolve_bead_slacks_returns_feasible_combination() -> None:
+    """リゾルバの返すslack/ビードは、builderが使うのと同一の権威チェックを通る(SS12)。"""
+    import random
+
+    from synthetic_generator.bead import sample_bead
+    from synthetic_generator.general_geometry import check_bead_feasible, plan_general_two_point
+    from synthetic_generator.templates.general_two_point import (
+        resolve_bead_slacks,
+        sample as sample_general,
+    )
+
+    rng = random.Random(20260825)
+    resolved_count = 0
+    for _ in range(40):
+        spec = sample_general(rng)
+        bead = sample_bead(rng, spec.half_width_mm)
+        result = resolve_bead_slacks(rng, spec, bead)
+        if result is None:
+            continue
+        resolved_count += 1
+        new_spec, new_bead = result
+        # 締結点は不変(slackとビードだけが差し替わる)
+        assert new_spec.point1 == spec.point1 and new_spec.point2 == spec.point2
+        plan = plan_general_two_point(
+            new_spec.point1,
+            new_spec.point2,
+            min_bearing_radius_mm=new_spec.min_bearing_radius_mm,
+            half_width_mm=new_spec.half_width_mm,
+            bend_radius_mm=new_spec.bend_radius_mm,
+            fold1_slack_mm=new_spec.fold1_slack_mm,
+            fold2_slack_mm=new_spec.fold2_slack_mm,
+            fold1_tilt_perturbation_rad=new_spec.fold1_tilt_perturbation_rad,
+        )
+        check_bead_feasible(plan, new_bead)  # 通らなければValueErrorで落ちる
+    assert resolved_count > 0, "40試行で1件も解決できないのはサンプラーが破綻している"
