@@ -27,6 +27,7 @@ from synthetic_generator.annotate import build_two_joint_pair
 from synthetic_generator.bead import BeadParams, sample_bead
 from synthetic_generator.annotation_schema import AnnotationDocument, PartEntry
 from synthetic_generator.reinforcement import ReinforcementParams, sample_reinforcement
+from synthetic_generator.classify import classify
 from synthetic_generator.flange import FlangeParams, chirality_candidates
 from synthetic_generator.general_geometry import plan_general_two_point
 from synthetic_generator.templates.general_two_point import (
@@ -38,6 +39,13 @@ from synthetic_generator.templates.parallel_same_offset import TwoJointSpec
 from synthetic_generator.templates.parallel_same_offset import sample as sample_two_joint_spec
 
 DEFAULT_OUTPUT_ROOT = pathlib.Path(r"C:\Users\hide2\IdeaBox\PartMaker\synthetic_parts")
+
+# 通常モードでは実用的な頻度で出ないクラス(2026-08-26実測: 通常1500件中
+# coplanar_flatは0件、gentleでは2.5%)。クォータ狙い時はgentleモードで引く。
+GENTLE_ONLY_CLASSES = frozenset({"coplanar_flat", "parallel_same_offset"})
+# クォータ狙い時のgentle slack目標[deg]。既定18だと折れ角20〜30度の帯が薄くなる
+# (prod01実測3.5%)ため、少し上げてこの帯も埋める。
+mid_fold_target = 26.0
 
 
 class GeneratedPartLike(Protocol):
@@ -210,6 +218,7 @@ def generate_general_batch(
     max_attempts_per_part: int = 50,
     reinforcement_probability: float = 0.0,
     flange_aim_share: float = 0.4,
+    class_quota: dict[str, int] | None = None,
 ) -> list[GeneratedGeneralPartRecord]:
     """任意の法線・任意の位置の締結点ペア(roadmap SS6.20〜6.22)でcount件の成功パーツを
     生成する。`generate_batch`(parallel_same_offsetクラス専用)と同じskip-and-retry
@@ -221,6 +230,8 @@ def generate_general_batch(
 
     doc = AnnotationDocument(assembly_dir=out_dir, full_assembly_stp="synthetic")
     records: list[GeneratedGeneralPartRecord] = []
+    # クォータの計上は**実際に生成できたクラス**で行う(狙いが外れても止まらない)
+    produced_classes: dict[str, int] = {c: 0 for c in (class_quota or {})}
 
     for i in range(1, count + 1):
         part_id = f"SYN_general_two_point_{i:04d}"
@@ -233,7 +244,23 @@ def generate_general_batch(
             # 狙うため、フランジ対象(<=20度)は3.6%しか出ない。補強部品の一部を
             # 「法線角<=35度+slack目標18度以下」の帯狙いで引く。
             aim_flange = reinforce and rng.random() < flange_aim_share
-            spec = sample_general_two_point(rng, gentle_folds=aim_flange)
+            target = None
+            if class_quota:
+                # 不足の一番大きいクラスを狙う。クラスは法線と位置だけで決まるので、
+                # サンプラー側で重い探索の前に足切りできる(SS16)。
+                deficits = {c: n - produced_classes[c] for c, n in class_quota.items()}
+                target = max(deficits, key=deficits.get) if max(deficits.values()) > 0 else None
+            if target is not None:
+                # 事前測定(2026-08-26)にもとづくモード選択: coplanar_flatと
+                # parallel_same_offsetはgentleモードでしか実用的な頻度で出ない
+                # (通常モードのcoplanar_flatは1500件中0件)。
+                aim_flange = target in GENTLE_ONLY_CLASSES
+                spec = sample_general_two_point(
+                    rng, gentle_folds=aim_flange, target_classes={target},
+                    gentle_target_max_fold_deg=mid_fold_target,
+                )
+            else:
+                spec = sample_general_two_point(rng, gentle_folds=aim_flange)
             bead: BeadParams | None = None
             flange: FlangeParams | None = None
             if reinforce:
@@ -302,6 +329,11 @@ def generate_general_batch(
         )
         for joint in build_two_joint_pair(part_id, spec.point1, spec.point2, spec.hole_diameter_mm):
             doc.add_joint(joint)
+
+        if class_quota:
+            actual = str(classify(spec.point1, spec.point2))
+            if actual in produced_classes:
+                produced_classes[actual] += 1
 
         records.append(
             GeneratedGeneralPartRecord(

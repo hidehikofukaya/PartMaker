@@ -27,6 +27,7 @@ import math
 import random
 
 from synthetic_generator.classify import (
+    classify,
     MAX_FOLD_ANGLE_DEG,
     MIN_BASE_BEND_RADIUS_MM,
     FasteningPoint,
@@ -321,18 +322,18 @@ def _choose_tilt_perturbation(
     return first if first is not None else 0.0
 
 
-def sample(
-    rng: random.Random,
-    *,
-    thickness_range_mm: tuple[float, float] = (1.0, 2.5),
-    hole_diameter_range_mm: tuple[float, float] = (6.0, 14.0),
-    gentle_folds: bool = False,
-) -> GeneralTwoJointSpec:
-    """任意の法線・任意の位置の締結点ペアを1組サンプリングする。
+# 配置クラス狙いの点対探索の上限。到達不能なクラスでも必ず有限時間で抜ける
+# (抜けた場合は素の点対をそのまま使い、呼び出し側は**実際のクラス**で計上する)。
+CLASS_SEARCH_ATTEMPTS = 400
 
-    `gentle_folds=True`はフランジ帯狙い(SS14.5): 法線の相対角を35度以下に絞り、
-    slack探索の目標を「両折れ18度以下」へ切り替える。折れ角はほぼ法線角で決まるので、
-    法線角を絞らないと帯に入らない。"""
+
+def _sample_point_pair(rng: random.Random, gentle_folds: bool):
+    """締結点ペア(法線と位置)だけをサンプリングする。
+
+    sample()の重い部分(slack探索・傾き摂動探索)の**前**に配置クラスで足切りできるよう、
+    点対の生成だけを切り出したもの(2026-08-26)。クラスは法線と位置だけで決まるので、
+    ここで judged できれば無駄な探索を避けられる。
+    """
     n1 = _random_unit_vector(rng)
     rotation_axis = _random_unit_vector(rng)
     if gentle_folds:
@@ -343,12 +344,46 @@ def sample(
         if dip_low <= rotation_angle <= dip_high and rng.random() < NORMAL_ANGLE_DIP_RESAMPLE_PROB:
             rotation_angle = rng.uniform(0.0, math.pi)  # 谷の帯は重みを下げる(1回だけ引き直す)
     n2 = rotate_about_axis(n1, rotation_axis, rotation_angle)
-
     p1: Vec3 = (0.0, 0.0, 0.0)
     p2 = _place_second_point(rng, n1, n2, p1, gentle=gentle_folds)
+    return (
+        FasteningPoint(position_xyz=p1, normal_xyz=n1),
+        FasteningPoint(position_xyz=p2, normal_xyz=n2),
+    )
 
-    point1 = FasteningPoint(position_xyz=p1, normal_xyz=n1)
-    point2 = FasteningPoint(position_xyz=p2, normal_xyz=n2)
+
+def sample(
+    rng: random.Random,
+    *,
+    thickness_range_mm: tuple[float, float] = (1.0, 2.5),
+    hole_diameter_range_mm: tuple[float, float] = (6.0, 14.0),
+    gentle_folds: bool = False,
+    target_classes: frozenset[str] | set[str] | None = None,
+    gentle_target_max_fold_deg: float | None = None,
+) -> GeneralTwoJointSpec:
+    """任意の法線・任意の位置の締結点ペアを1組サンプリングする。
+
+    `gentle_folds=True`はフランジ帯狙い(SS14.5): 法線の相対角を35度以下に絞り、
+    slack探索の目標を「両折れ18度以下」へ切り替える。折れ角はほぼ法線角で決まるので、
+    法線角を絞らないと帯に入らない。
+
+    `target_classes`を渡すと、そのクラスの点対が出るまで**点対だけを**引き直す
+    (2026-08-26、カバレッジ補正用)。配置クラスは法線と位置だけで決まるので、
+    重いslack/傾き探索の前に足切りできる。上限回数で抜けた場合は最後の点対を使う
+    (呼び出し側は実際のクラスで計上すること — 到達不能なクォータで止まらないため)。
+
+    `gentle_target_max_fold_deg`はgentle時のslack目標の上書き。既定18度だと折れ角が
+    18度以下に集中し、20〜30度の帯が薄くなる(prod01実測で3.5%)。この帯を埋めたい
+    ときに25〜28度を渡す。
+    """
+    point1, point2 = _sample_point_pair(rng, gentle_folds)
+    if target_classes:
+        for _ in range(CLASS_SEARCH_ATTEMPTS):
+            if classify(point1, point2) in target_classes:
+                break
+            point1, point2 = _sample_point_pair(rng, gentle_folds)
+    p1, p2 = point1.position_xyz, point2.position_xyz
+    n1, n2 = point1.normal_xyz, point2.normal_xyz
 
     thickness = rng.uniform(*thickness_range_mm)
     hole_diameter = rng.uniform(*hole_diameter_range_mm)
@@ -395,7 +430,10 @@ def sample(
         fold1_slack, fold2_slack = _choose_fold_slacks(
             rng, point1, point2, slack_budget,
             bearing_radius=bearing_radius, bend_radius=bend_radius,
-            target_max_fold_deg=GENTLE_TARGET_MAX_FOLD_ANGLE_DEG if gentle_folds else None,
+            target_max_fold_deg=(
+                (gentle_target_max_fold_deg or GENTLE_TARGET_MAX_FOLD_ANGLE_DEG)
+                if gentle_folds else None
+            ),
         )
     fold1_tilt_perturbation = _choose_tilt_perturbation(
         rng, point1, point2,
