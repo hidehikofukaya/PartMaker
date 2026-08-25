@@ -51,6 +51,7 @@ from win32com.client import Dispatch, GetActiveObject
 
 from synthetic_generator.bead import BEAD_GUIDE_MARGIN_MM as _BEAD_GUIDE_MARGIN_MM
 from synthetic_generator.bead import BeadPanelFrame, BeadParams, plan_bead_on_surface
+from synthetic_generator.corner_relief import plan_corner_relief
 from synthetic_generator.flange import FlangeParams, plan_flange_on_surface
 from synthetic_generator.general_geometry import plan_general_two_point
 from synthetic_generator.classify import (
@@ -1100,6 +1101,73 @@ class SyntheticPartBuilder:
             "Infeasible; not attempting further construction."
         )
 
+    def _apply_corner_relief(
+        self, doc, part, hsf, spa, body, whole, *, panel_frames, half_width_mm,
+        min_bearing_radius_mm, fold_tangents, exclude_side=None,
+    ):
+        """基準面の隅を R=必要最小半径 で丸めて落とす(余肉カット、SS15)。
+
+        カット円弧は端パネルのベアリング平坦区間に解析的に置く(厳密に面上)ので、
+        スプライン->Splitの実証済みプリミティブだけで構成できる。Splitの残す側は
+        probe-and-select(部品中央が残り、元の隅が消えること)。
+        """
+        cuts = plan_corner_relief(
+            panel_frames,
+            half_width_mm=half_width_mm,
+            radius_mm=min_bearing_radius_mm,
+            fold_tangents=fold_tangents,
+            exclude_side=exclude_side,
+        )
+        # keepは締結点1の座面中心(run=0, v=0)。中央パネルの中心はビード部品では
+        # 基準面が除去されてビード頂面になっているため使えない(2026-08-25に実測:
+        # 全ビード部品が余肉カットで棄却されbatchがフランジだけになった)。
+        # 座面中心はビードの逃げ・フランジの根本R・余肉カットのいずれからも守られている。
+        first = panel_frames[0]
+        keep_point = tuple(first.origin[i] for i in range(3))
+        keep_ref = self._point_refs(part, hsf, body, [keep_point])[0]
+        whole_ref = part.CreateReferenceFromObject(whole)
+        for cut in cuts:
+            point_refs = self._point_refs(part, hsf, body, cut.arc_points)
+            arc = hsf.AddNewSpline()
+            arc.SetSplineType(0)
+            arc.SetClosing(0)
+            for ref in point_refs:
+                arc.AddPointWithConstraintExplicit(ref, None, -1.0, 1, None, 0.0)
+            arc.Name = f"corner_relief_{cut.label}"
+            body.AppendHybridShape(arc)
+            part.Update()
+            arc_ref = part.CreateReferenceFromObject(arc)
+            remove_ref = self._point_refs(part, hsf, body, [cut.remove_probe])[0]
+            reasons: list[str] = []
+            done = None
+            for orientation in (1, -1):
+                split = hsf.AddNewHybridSplit(whole_ref, arc_ref, orientation)
+                body.AppendHybridShape(split)
+                try:
+                    part.Update()
+                except Exception as exc:
+                    reasons.append(f"o={orientation:+d}: update failed ({str(exc)[:40]})")
+                    self._delete_feature(doc, part, split)
+                    continue
+                split_ref = part.CreateReferenceFromObject(split)
+                measurable = spa.GetMeasurable(split_ref)
+                kept = measurable.GetMinimumDistance(keep_ref)
+                removed = measurable.GetMinimumDistance(remove_ref)
+                if kept < self.BEAD_PROBE_TOLERANCE_MM and removed > self.BEAD_PROBE_REMOVED_MM:
+                    done = (split, split_ref)
+                    break
+                reasons.append(
+                    f"o={orientation:+d}: keep {kept:.2f}mm, corner still {removed:.2f}mm"
+                )
+                self._delete_feature(doc, part, split)
+            if done is None:
+                raise ValueError(
+                    f"corner relief at {cut.label}: neither split side removed the corner "
+                    f"while keeping the part [{'; '.join(reasons)}]. Infeasible."
+                )
+            whole, whole_ref = done
+        return whole
+
     def _add_flange_to_surface(
         self, doc, part, hsf, spa, body, surface, *, flange, panel_frames, half_width_mm,
         fold_tangents,
@@ -1588,6 +1656,29 @@ class SyntheticPartBuilder:
                         f"({geometry_label}). Infeasible; not attempting further "
                         f"construction. Original error: {flange_exc}"
                     ) from flange_exc
+
+            # 余肉カット(SS15、ユーザー指定): 補強付き部品は基準面の隅を
+            # R=必要最小半径で丸めて落とす。フランジ部品は反フランジ側の2隅のみ、
+            # ビード部品は四隅すべて。
+            if bead is not None or flange is not None:
+                assert panel_frames is not None
+                try:
+                    whole = self._apply_corner_relief(
+                        doc, part, hsf, spa, body, whole,
+                        panel_frames=panel_frames,
+                        half_width_mm=half_width_mm,
+                        min_bearing_radius_mm=min_bearing_radius_mm,
+                        fold_tangents=fold_tangents or [(0.0, 0.0)] * len(panel_corner_sets),
+                        exclude_side=flange.side if flange is not None else None,
+                    )
+                except ValueError:
+                    raise
+                except Exception as relief_exc:
+                    raise ValueError(
+                        f"CATIA failed while cutting the corner relief ({geometry_label}). "
+                        f"Infeasible; not attempting further construction. "
+                        f"Original error: {relief_exc}"
+                    ) from relief_exc
 
             part.InWorkObject = whole
             part.Update()

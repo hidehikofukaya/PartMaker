@@ -216,3 +216,30 @@ def test_resolve_bead_slacks_returns_feasible_combination() -> None:
         )
         check_bead_feasible(plan, new_bead)  # 通らなければValueErrorで落ちる
     assert resolved_count > 0, "40試行で1件も解決できないのはサンプラーが破綻している"
+
+
+def test_corner_relief_plan_arcs_lie_on_edges_and_respect_flange_side() -> None:
+    """余肉カット(SS15): 円弧の両端は側辺(v=±hw)と端辺(run=端)に載り、
+    フランジ側は除外される。"""
+    from synthetic_generator.bead import BeadPanelFrame
+    from synthetic_generator.corner_relief import plan_corner_relief
+
+    frames = [
+        BeadPanelFrame((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), -15.0, 80.0),
+        BeadPanelFrame((100.0, 0.0, 5.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), 0.0, 60.0),
+    ]
+    cuts = plan_corner_relief(
+        frames, half_width_mm=20.0, radius_mm=15.0,
+        fold_tangents=[(0.0, 5.0), (5.0, 0.0)],
+    )
+    assert len(cuts) == 4  # ビード部品: 四隅
+    first = cuts[0]
+    start, end = first.arc_points[0], first.arc_points[-1]
+    assert abs(abs(start[1]) - 20.0) < 1e-9      # 始点は側辺 v=±hw
+    assert abs(end[0] - (-15.0)) < 1e-9          # 終点は端辺 run=near
+    flange_cuts = plan_corner_relief(
+        frames, half_width_mm=20.0, radius_mm=15.0,
+        fold_tangents=[(0.0, 5.0), (5.0, 0.0)], exclude_side=1,
+    )
+    assert len(flange_cuts) == 2                 # フランジ部品: 反フランジ側のみ
+    assert all(c.remove_probe[1] < 0 for c in flange_cuts)
