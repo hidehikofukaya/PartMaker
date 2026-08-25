@@ -52,9 +52,10 @@ class GeneralPartBuilder(Protocol):
         *,
         min_bearing_radius_mm: float,
         half_width_mm: float,
-        fold1_run_mm: float,
-        fold2_run_mm: float,
         bend_radius_mm: float,
+        fold1_slack_mm: float,
+        fold2_slack_mm: float,
+        fold1_tilt_perturbation_rad: float,
         out_dir: str,
         part_name: str,
         bead: BeadParams | None = None,
@@ -173,16 +174,21 @@ def generate_general_batch(
             spec = sample_general_two_point(rng)
             # bead_probability=0(既定)ではrngを一切消費しない — 既存バッチのシード列を
             # そのまま再現できるようにするため。
-            bead = sample_bead(rng) if bead_probability > 0.0 and rng.random() < bead_probability else None
+            bead = (
+                sample_bead(rng, spec.half_width_mm)
+                if bead_probability > 0.0 and rng.random() < bead_probability
+                else None
+            )
             try:
                 generated = builder.build_general_two_point(
                     spec.point1,
                     spec.point2,
                     min_bearing_radius_mm=spec.min_bearing_radius_mm,
                     half_width_mm=spec.half_width_mm,
-                    fold1_run_mm=spec.fold1_run_mm,
-                    fold2_run_mm=spec.fold2_run_mm,
                     bend_radius_mm=spec.bend_radius_mm,
+                    fold1_slack_mm=spec.fold1_slack_mm,
+                    fold2_slack_mm=spec.fold2_slack_mm,
+                    fold1_tilt_perturbation_rad=spec.fold1_tilt_perturbation_rad,
                     out_dir=str(out_dir / "mid"),
                     part_name=part_id,
                     bead=bead,

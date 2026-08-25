@@ -1,0 +1,261 @@
+"""Selection.Searchで得たエッジ参照のDisplayName(=BRepName文字列)を取得し、
+マクロと同じ修飾子(WithTemporaryBody等)を付けてCreateReferenceFromBRepNameで
+参照を「作り直し」、その参照でフィレットが通るかを検証する。
+
+前提(§3.4確定): 手動クリック由来のBRepName参照ではフィレットが成功する。
+Selection.Search由来のReferenceでは24/24失敗する。
+仮説: 差は参照の修飾子(WithTemporaryBody;WithoutBuildError;
+WithSelectingFeatureSupport;MFBRepVersion_CXR29)の有無のみ。
+"""
+import sys
+import math
+sys.path.insert(0, r"C:\Users\hide2\IdeaBox\PartMaker\synthetic_generator\src")
+from synthetic_generator.gsd_build import SyntheticPartBuilder
+
+LOG_PATH = r"C:\Users\hide2\AppData\Local\Temp\claude\C--Users-hide2-IdeaBox-PartMaker\7974b216-26f6-44d9-aae1-a7fcf52753e0\scratchpad\test_brepname_rebuild.log"
+log = open(LOG_PATH, "w", encoding="utf-8", buffering=1)
+
+
+def p(*args):
+    msg = " ".join(str(a) for a in args)
+    log.write(msg + "\n")
+    log.flush()
+
+
+def corner_point(hsf, part, body, a_ref, b_ref):
+    pt = hsf.AddNewIntersection(a_ref, b_ref)
+    body.AppendHybridShape(pt)
+    part.Update()
+    return part.CreateReferenceFromObject(pt)
+
+
+def trim_to_middle(hsf, part, body, spa, curve_ref, cut_a, cut_b, expected_length):
+    candidates = [(-1, 1), (-1, 2), (1, 1), (1, 2), (-1, -1), (-1, -2), (1, -1), (1, -2)]
+    best = None
+    for o1, o2 in candidates:
+        try:
+            split = hsf.AddNewHybridSplit(curve_ref, cut_a, o1)
+            split.AddCuttingElem(cut_b, o2)
+            body.AppendHybridShape(split)
+            part.Update()
+            L = spa.GetMeasurable(part.CreateReferenceFromObject(split)).Length
+            if abs(L - expected_length) < 0.5:
+                part.InWorkObject = split
+                part.Update()
+                return split
+            if best is None or abs(L - expected_length) < abs(best[1] - expected_length):
+                best = (split, L)
+        except Exception:
+            continue
+    if best is None:
+        raise RuntimeError("trim_to_middle: no valid split combination found")
+    return best[0]
+
+
+def cleanup_failed(doc, part, feature_obj):
+    try:
+        sel2 = doc.Selection
+        sel2.Clear()
+        sel2.Add(feature_obj)
+        sel2.Delete()
+        part.Update()
+    except Exception as exc:
+        p(f"    [cleanup warning] {str(exc)[:100]}")
+
+
+builder = SyntheticPartBuilder()
+doc = builder.new_part_document()
+part = doc.Part
+hsf = part.HybridShapeFactory
+spa = doc.GetWorkbench("SPAWorkbench")
+sf = part.ShapeFactory
+body = part.HybridBodies.Add()
+body.Name = "BREPNAME_REBUILD"
+
+half_width, run, bend_deg, bend_radius = 60.0, 80.0, 70.0, 30.0
+half_angle = math.radians(bend_deg) / 2.0
+u1 = (math.cos(half_angle), 0.0, -math.sin(half_angle))
+u2 = (math.cos(half_angle), 0.0, math.sin(half_angle))
+w = (0.0, 1.0, 0.0)
+
+
+def corners(u, run0, run1, hw):
+    def pt(r, ww):
+        return (r * u[0] + ww * w[0], r * u[1] + ww * w[1], r * u[2] + ww * w[2])
+    return [pt(run0, -hw), pt(run0, hw), pt(run1, hw), pt(run1, -hw)]
+
+
+face1 = builder.rect_fill(hsf, part, body, corners(u1, run, 0.0, half_width))
+face2 = builder.rect_fill(hsf, part, body, corners(u2, 0.0, run, half_width))
+sharp = builder.join(hsf, part, body, [face1, face2])
+part.Update()
+edge_ref0 = builder.find_edge_near(doc, part, spa, hsf, body, sharp, (0.0, 0.0, 0.0))
+base_filleted = builder.edge_fillet(part, edge_ref0, bend_radius)
+body.AppendHybridShape(base_filleted)
+part.Update()
+surface_ref = part.CreateReferenceFromObject(base_filleted)
+p("step1: reference OK")
+
+depth_mm, wall_angle_deg, top_width_mm = 7.0, 50.0, 30.0
+wall_slant_mm = depth_mm / math.sin(math.radians(wall_angle_deg))
+wall_run_mm = depth_mm / math.tan(math.radians(wall_angle_deg))
+half_footprint = top_width_mm / 2.0 + wall_run_mm
+run_out_pos = run - 15.0
+
+origin_pt = builder.point(hsf, body, 0.0, 0.0, 0.0)
+axis_pt = builder.point(hsf, body, *w)
+axis_line = builder.line_pt_pt(hsf, part, body, origin_pt, axis_pt)
+plane = hsf.AddNewPlaneNormal(part.CreateReferenceFromObject(axis_line), part.CreateReferenceFromObject(origin_pt))
+body.AppendHybridShape(plane)
+part.Update()
+centerline = hsf.AddNewIntersection(part.CreateReferenceFromObject(plane), surface_ref)
+body.AppendHybridShape(centerline)
+part.Update()
+centerline_ref = part.CreateReferenceFromObject(centerline)
+
+root_left = hsf.AddNewCurvePar(centerline_ref, surface_ref, half_footprint, False, True)
+body.AppendHybridShape(root_left)
+part.Update()
+root_left_ref = part.CreateReferenceFromObject(root_left)
+
+root_right = hsf.AddNewCurvePar(centerline_ref, surface_ref, half_footprint, True, True)
+body.AppendHybridShape(root_right)
+part.Update()
+root_right_ref = part.CreateReferenceFromObject(root_right)
+
+
+def width_guide(u, run_pos):
+    left_pt = tuple(run_pos * u[i] - half_footprint * w[i] for i in range(3))
+    right_pt = tuple(run_pos * u[i] + half_footprint * w[i] for i in range(3))
+    p_l = builder.point(hsf, body, *left_pt)
+    p_r = builder.point(hsf, body, *right_pt)
+    guide = builder.line_pt_pt(hsf, part, body, p_r, p_l)
+    part.Update()
+    return guide, part.CreateReferenceFromObject(guide)
+
+
+guide_near, guide_near_ref = width_guide(u1, run_out_pos)
+guide_far, guide_far_ref = width_guide(u2, run_out_pos)
+
+c_ln = corner_point(hsf, part, body, root_left_ref, guide_near_ref)
+c_lf = corner_point(hsf, part, body, root_left_ref, guide_far_ref)
+c_rn = corner_point(hsf, part, body, root_right_ref, guide_near_ref)
+c_rf = corner_point(hsf, part, body, root_right_ref, guide_far_ref)
+
+centerline_length = spa.GetMeasurable(centerline_ref).Length
+run_out_margin = run - run_out_pos
+expected_run_mid = centerline_length - 2.0 * run_out_margin
+left_mid = trim_to_middle(hsf, part, body, spa, root_left_ref, c_ln, c_lf, expected_run_mid)
+right_mid = trim_to_middle(hsf, part, body, spa, root_right_ref, c_rn, c_rf, expected_run_mid)
+
+loop = builder.join(hsf, part, body, [left_mid, guide_near, right_mid, guide_far])
+part.Update()
+loop_ref = part.CreateReferenceFromObject(loop)
+p("step2: loop OK, length=", spa.GetMeasurable(loop_ref).Length)
+
+sweep = hsf.AddNewSweepLine(loop_ref)
+sweep.Mode = 4
+sweep.FirstGuideSurf = surface_ref
+sweep.SetAngle(1, wall_angle_deg)
+sweep.SetLength(1, wall_slant_mm)
+body.AppendHybridShape(sweep)
+part.Update()
+sweep_ref = part.CreateReferenceFromObject(sweep)
+p("wall sweep OK, area=", spa.GetMeasurable(sweep_ref).Area * 1e6)
+
+# ==== Phase 1: dump DisplayName of every edge Selection.Search returns ====
+sel = doc.Selection
+sel.Clear()
+sel.Add(sweep)
+sel.Search("Topology.CGMEdge,sel")
+n_edges = sel.Count2
+p(f"raw sweep has {n_edges} edges, wall_slant_mm={wall_slant_mm:.3f}")
+
+corner_probes = [c_ln, c_lf, c_rn, c_rf]
+edge_info = []  # (index, length, dmin, display_name)
+for i in range(1, n_edges + 1):
+    item = sel.Item2(i)
+    ref = item.Reference
+    meas_i = spa.GetMeasurable(ref)
+    L = meas_i.Length
+    dmin = min(meas_i.GetMinimumDistance(cp) for cp in corner_probes)
+    try:
+        dn = ref.DisplayName
+    except Exception as exc:
+        dn = f"<DisplayName FAILED: {str(exc)[:80]}>"
+    edge_info.append((i, L, dmin, dn))
+    p(f"  edge[{i}] length={L:.3f} dist_to_corner={dmin:.3f}")
+    p(f"    DisplayName: {dn}")
+
+# ==== Phase 2: rebuild references via CreateReferenceFromBRepName and fillet ====
+MODS = "WithTemporaryBody;WithoutBuildError;WithSelectingFeatureSupport;MFBRepVersion_CXR29"
+
+
+def brep_candidates(display_name):
+    """DisplayNameから、CreateReferenceFromBRepNameへ渡す文字列候補を生成する。
+
+    実測形式:   Selection_REdge:(Edge:(...);Cf14:());GSMSweep.1;Z0;G10454)
+    マクロ形式:           REdge:(Edge:(...);Cf14:());WithTemporaryBody;...;MFBRepVersion_CXR29)
+    → 先頭のSelection_を除去し、末尾の「;フィーチャー名;Z0;G10454」を修飾子群に置換する。"""
+    name = display_name
+    if name.startswith("Selection_"):
+        name = name[len("Selection_"):]
+    cands = []
+    marker = "Cf14:())"
+    pos = name.rfind(marker)
+    if pos >= 0:
+        core = name[:pos + len(marker)]
+        cands.append(("replace-tail-with-modifiers", core + ";" + MODS + ")"))
+        cands.append(("replace-tail-no-modifiers", core + ")"))
+    return cands
+
+
+RADIUS = 2.0
+success = []
+for i, L, dmin, dn in edge_info:
+    if dn.startswith("<"):
+        continue
+    # 縦シーム = 2つの壁面の交線 = REdge形式(境界エッジのBorderREdgeは対象外)
+    if not dn.startswith("Selection_REdge:"):
+        continue
+    for tag, brep in brep_candidates(dn):
+        try:
+            new_ref = part.CreateReferenceFromBRepName(brep, sweep)
+        except Exception as exc:
+            p(f"  edge[{i}] [{tag}]: CreateReferenceFromBRepName FAILED {str(exc)[:100]}")
+            continue
+        fx = sf.AddNewSurfaceEdgeFilletWithConstantRadius(None, 1, RADIUS)
+        try:
+            fx.AddObjectToFillet(new_ref)
+        except Exception as exc:
+            p(f"  edge[{i}] [{tag}]: AddObjectToFillet FAILED {str(exc)[:100]}")
+            cleanup_failed(doc, part, fx)
+            continue
+        try:
+            fx.FilletBoundaryRelimitation = 2
+            fx.FilletTrimSupport = 0
+            body.AppendHybridShape(fx)
+            part.Update()
+            p(f"  edge[{i}] [{tag}]: FILLET OK !!! (length={L:.3f}, radius={RADIUS})")
+            success.append((i, tag, fx))
+            break  # このエッジは成功、次のエッジへ
+        except Exception as exc:
+            p(f"  edge[{i}] [{tag}]: Update FAILED {str(exc)[:100]}")
+            cleanup_failed(doc, part, fx)
+
+p(f"RESULT: {len(success)} edges filleted via rebuilt BRepName references")
+for i, tag, _ in success:
+    p(f"  -> edge[{i}] via [{tag}]")
+
+if success:
+    viewer0 = doc.Application.ActiveWindow.ActiveViewer
+    viewer0.Reframe()
+    shot_path = r"C:\Users\hide2\AppData\Local\Temp\claude\C--Users-hide2-IdeaBox-PartMaker\7974b216-26f6-44d9-aae1-a7fcf52753e0\scratchpad\brepname_rebuild_success.png"
+    viewer0.CaptureToFile(2, shot_path)
+    p("screenshot saved:", shot_path)
+    out_path = r"C:\Users\hide2\IdeaBox\PartMaker\tools\probe_output\brepname_rebuild_success.CATPart"
+    doc.SaveAs(out_path)
+    p("saved to:", out_path)
+
+doc.Close()
+p("DONE")
