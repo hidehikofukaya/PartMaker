@@ -5,3 +5,4 @@ __pycache__/
 *.egg-info/
 .claude/
 tools/probe_output/
+synthetic_parts/
