@@ -219,6 +219,7 @@ def generate_general_batch(
     reinforcement_probability: float = 0.0,
     flange_aim_share: float = 0.4,
     class_quota: dict[str, int] | None = None,
+    accept_filter=None,
 ) -> list[GeneratedGeneralPartRecord]:
     """任意の法線・任意の位置の締結点ペア(roadmap SS6.20〜6.22)でcount件の成功パーツを
     生成する。`generate_batch`(parallel_same_offsetクラス専用)と同じskip-and-retry
@@ -271,6 +272,10 @@ def generate_general_batch(
                 if resolved is None:
                     continue
                 spec, bead, flange = resolved
+                # カバレッジ補正用のフィルタ(SS18)。CATIAに触る前の純Python判定なので
+                # 棄却は実質無料。クォータを満たす組だけをビルドへ送る。
+                if accept_filter is not None and not accept_filter(spec, bead, flange):
+                    continue
             try:
                 generated, flange = build_general_part(
                     builder, spec, bead, flange, str(out_dir / "mid"), part_id
