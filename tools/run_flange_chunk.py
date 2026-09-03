@@ -57,22 +57,35 @@ def main() -> None:
     if out_dir.exists() and any(out_dir.iterdir()):
         raise SystemExit(f"{out_dir} は既に存在する。")
 
-    quota = build_quota(count)
+    # 第5引数にJSONを渡すとクォータを上書きできる(不足分の穴埋め用)。
+    # キーは "帯|グループ" 形式(例 "h10-12|pso")。
+    if len(sys.argv) > 5:
+        raw = json.loads(pathlib.Path(sys.argv[5]).read_text(encoding="utf-8"))
+        quota = {tuple(k.split("|")): v for k, v in raw.items()}
+    else:
+        quota = build_quota(count)
     produced: Counter = Counter()
     stats = {"seen": 0, "bead": 0, "rejected": 0}
 
+    def key_of(spec, flange):
+        cls = str(classify(spec.point1, spec.point2))
+        return (band_of(flange.height_mm), "pso" if cls == PSO else "other")
+
     def accept(spec, bead, flange) -> bool:
+        """判定のみ。**カウントはしない** — CATIAビルドが失敗した候補で枠を
+        食い潰さないため(SS18で実測した不具合)。"""
         stats["seen"] += 1
         if flange is None:            # フランジ専用チャンクなのでビードは採らない
             stats["bead"] += 1
             return False
-        cls = str(classify(spec.point1, spec.point2))
-        key = (band_of(flange.height_mm), "pso" if cls == PSO else "other")
-        if produced[key] >= quota.get(key, 0):
+        if produced[key_of(spec, flange)] >= quota.get(key_of(spec, flange), 0):
             stats["rejected"] += 1
             return False
-        produced[key] += 1
         return True
+
+    def built(spec, bead, flange) -> None:
+        if flange is not None:
+            produced[key_of(spec, flange)] += 1
 
     builder = SyntheticPartBuilder()
     builder.catia.DisplayFileAlerts = False
@@ -91,6 +104,7 @@ def main() -> None:
         flange_aim_share=1.0,          # 常にフランジ帯狙い
         max_attempts_per_part=8000,    # 希少セルは純Pythonで数千回引く(1回~20ms)
         accept_filter=accept,
+        on_part_built=built,
     )
     dt = time.time() - t0
     got = Counter()

@@ -9,6 +9,7 @@ CATIAセッションは時間とともに重くなる(SS5.1: 15.6->27.5秒/部�
 
 使い方:
   python tools/run_flange_series.py <ルート名> <チャンク数> <1チャンクの部品数> <基準seed>
+                                    [開始チャンク番号] [クォータJSON]
 例:
   python tools/run_flange_series.py flange01 5 100 20260840
 """
@@ -60,9 +61,11 @@ def main() -> None:
     n_chunks = int(sys.argv[2])
     per_chunk = int(sys.argv[3])
     base_seed = int(sys.argv[4])
+    start_chunk = int(sys.argv[5]) if len(sys.argv) > 5 else 1
+    quota_json = sys.argv[6] if len(sys.argv) > 6 else None
 
     done = 0
-    for chunk in range(1, n_chunks + 1):
+    for chunk in range(start_chunk, start_chunk + n_chunks):
         print(f"\n{'=' * 60}\n=== chunk_{chunk:02d} / {n_chunks}  DELMIA再起動中 ===",
               flush=True)
         t0 = time.time()
@@ -71,10 +74,11 @@ def main() -> None:
             break
         print(f"    起動完了 ({time.time() - t0:.0f}秒)", flush=True)
         seed = base_seed + chunk * 1000
-        proc = subprocess.run(
-            [sys.executable, str(TOOLS / "run_flange_chunk.py"),
-             root_name, str(chunk), str(per_chunk), str(seed)],
-            capture_output=True, text=True, check=False)
+        cmd = [sys.executable, str(TOOLS / "run_flange_chunk.py"),
+               root_name, str(chunk), str(per_chunk), str(seed)]
+        if quota_json:
+            cmd.append(quota_json)
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
         sys.stdout.write(proc.stdout)
         if proc.returncode != 0:
             sys.stdout.write(proc.stderr[-2000:])

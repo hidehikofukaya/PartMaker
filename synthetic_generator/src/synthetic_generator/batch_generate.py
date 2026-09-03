@@ -220,6 +220,7 @@ def generate_general_batch(
     flange_aim_share: float = 0.4,
     class_quota: dict[str, int] | None = None,
     accept_filter=None,
+    on_part_built=None,
 ) -> list[GeneratedGeneralPartRecord]:
     """任意の法線・任意の位置の締結点ペア(roadmap SS6.20〜6.22)でcount件の成功パーツを
     生成する。`generate_batch`(parallel_same_offsetクラス専用)と同じskip-and-retry
@@ -339,6 +340,13 @@ def generate_general_batch(
             actual = str(classify(spec.point1, spec.point2))
             if actual in produced_classes:
                 produced_classes[actual] += 1
+
+        # クォータの計上は**ビルド成功後**に行うこと。採択時に数えると、CATIA側の
+        # 失敗(フランジで約1/3)が枠を食い潰し、最後の数十部品で「どのセルも満杯」に
+        # なって8000回連続Infeasibleで落ちる(2026-08-26に実測: 100部品の指定に対し
+        # 74-80部品で停止した)。
+        if on_part_built is not None:
+            on_part_built(spec, bead, flange)
 
         records.append(
             GeneratedGeneralPartRecord(
