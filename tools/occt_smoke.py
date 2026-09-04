@@ -43,6 +43,7 @@ from synthetic_generator.classify import classify  # noqa: E402
 from synthetic_generator.general_geometry import plan_for  # noqa: E402
 from synthetic_generator.occt_build import (  # noqa: E402
     OcctPartBuilder, _Frame, _Straight, _add, _dot, _scale, _build_path,
+    boundary_loop_count, worst_dihedral_deg,
 )
 from synthetic_generator.templates.general_two_point import (  # noqa: E402
     draw_fold_count,
@@ -179,6 +180,8 @@ def audit(shape) -> dict:
         "tiny_edges": tiny_edges,
         "degenerate_edges": degenerate_edges,
         "valid": bool(BRepCheck_Analyzer(shape).IsValid()),
+        "boundary_loops": boundary_loop_count(shape),
+        "dihedral_deg": worst_dihedral_deg(shape),
     }
 
 
@@ -250,6 +253,10 @@ def main() -> None:
             problems.append(f"edge deviates {info['deviation']:.3f}mm from a single primitive")
         if info["tiny_edges"]:
             problems.append(f"{info['tiny_edges']} edges shorter than 0.05mm")
+        if info["boundary_loops"] != 1:
+            problems.append(f"outline is {info['boundary_loops']} loops (collapsed)")
+        if info["dihedral_deg"] > 150.0:
+            problems.append(f"faces turn {info['dihedral_deg']:.0f}deg (folded back)")
         for label, point in (("p1", spec.point1.position_xyz), ("p2", spec.point2.position_xyz)):
             d = distance_to(shape, point)
             if d > 0.05:

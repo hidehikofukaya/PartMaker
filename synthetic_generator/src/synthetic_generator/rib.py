@@ -57,10 +57,13 @@ RIB_TAPER_MM = 1.5
 # リブの角 V1/V2 と同じ点に来るため、フィレットの walking がそこで破綻する
 # (2026-09-04実測: StripeStatus=2 WalkingFailure。最小構成の平板2枚+四面体では
 #  同じ四面体がR2〜R5すべて通るので、原因は四面体ではなく周囲のトポロジー)。
-RIB_SHARP_MARGIN_MM = 2.5
-# 稜線フィレット(中立面R最小)を入れても形が残る最小サイズ。
-MIN_RIB_HALF_WIDTH_MM = 7.0
-MIN_RIB_LEG_MM = 9.0
+RIB_SHARP_MARGIN_MM = 4.0
+# 稜線フィレット(中立面R最小=5mm)を入れても形が残る最小サイズ。
+# 小さいリブほどフィレットの条件が悪く、失敗するか OCCT が長時間止まる
+# (2026-09-04実測: シャープ帯2.5mm・小リブで222試行中111がフィレット失敗)。
+# ユーザー了承のもと数mm大きめに寄せる。
+MIN_RIB_HALF_WIDTH_MM = 10.0
+MIN_RIB_LEG_MM = 12.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -91,9 +94,10 @@ def sample_rib(
     侵さない範囲、中間パネル側は隣の曲げのタンジェント線まで。
     """
     c_hi = min(RIB_HALF_WIDTH_RATIO_RANGE[1] * half_width_mm,
-               half_width_mm - RIB_TAPER_MM - RIB_SHARP_MARGIN_MM - 2.0,
+               half_width_mm - RIB_TAPER_MM - RIB_SHARP_MARGIN_MM - 1.0,
                min(leg_room_mm) / RIB_LEG_RATIO_RANGE[0])
     c_lo = max(MIN_RIB_HALF_WIDTH_MM, RIB_HALF_WIDTH_RATIO_RANGE[0] * half_width_mm)
+    c_lo = min(c_lo, c_hi)          # 幅が足りない板ではとにかく最大まで使う
     if c_hi < c_lo:
         return None
     c = rng.uniform(c_lo, c_hi)

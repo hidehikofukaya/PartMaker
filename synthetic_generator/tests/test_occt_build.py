@@ -76,6 +76,10 @@ def test_occt_part_is_geometrically_sound(tmp_path, want):
         f"(gate A allows {0.25 * spec.thickness_mm:.4f}mm)")
     assert info["tiny_edges"] == 0, f"{info['tiny_edges']} junk edges under 0.05mm"
     assert info["free_edges"] > 0, "an open shell must have an outline"
+    assert info["boundary_loops"] == 1, (
+        f"the outline is {info['boundary_loops']} closed loops, not 1 -- the shape collapsed")
+    assert info["dihedral_deg"] <= 150.0, (
+        f"two adjacent faces turn {info['dihedral_deg']:.0f}deg -- the surface folds back")
 
     for label, point in (("point1", spec.point1.position_xyz),
                          ("point2", spec.point2.position_xyz)):

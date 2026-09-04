@@ -54,6 +54,7 @@ from OCC.Core.BRep import BRep_Tool
 from OCC.Core.BRepAdaptor import BRepAdaptor_Curve, BRepAdaptor_Surface
 from OCC.Core.BRepAlgoAPI import BRepAlgoAPI_Cut
 from OCC.Core.BRepCheck import BRepCheck_Analyzer
+from OCC.Core.BRepLProp import BRepLProp_SLProps
 from OCC.Core.BRepFilletAPI import BRepFilletAPI_MakeFillet
 from OCC.Core.BRepGProp import brepgprop
 from OCC.Core.BRepBuilderAPI import (
@@ -71,10 +72,11 @@ from OCC.Core.ShapeUpgrade import ShapeUpgrade_UnifySameDomain
 from OCC.Core.GC import GC_MakeArcOfCircle, GC_MakeCircle
 from OCC.Core.Interface import Interface_Static
 from OCC.Core.STEPCAFControl import STEPCAFControl_Writer
+from OCC.Core.STEPControl import STEPControl_Reader
 from OCC.Core.TDataStd import TDataStd_Name
 from OCC.Core.TDocStd import TDocStd_Document
 from OCC.Core.GCPnts import GCPnts_AbscissaPoint
-from OCC.Core.TopAbs import TopAbs_EDGE, TopAbs_FACE
+from OCC.Core.TopAbs import TopAbs_EDGE, TopAbs_FACE, TopAbs_REVERSED, TopAbs_VERTEX
 from OCC.Core.TopExp import TopExp_Explorer, topexp
 from OCC.Core.TopTools import TopTools_IndexedDataMapOfShapeListOfShape
 from OCC.Core.TopoDS import topods
@@ -106,6 +108,10 @@ MIN_EDGE_LENGTH_MM = 0.05
 # 最も厳しい側 t=1.0mm に合わせる)。リブの稜線フィレットは頂点ブレンドの境界が
 # 解析曲線にならないことがあり、実測で最大0.797mm外れた(2026-09-04)。
 MAX_PRIMITIVE_DEVIATION_MM = 0.25
+# 隣接する2面の法線がなす角の上限[度]。板金の中立面は自分の上に折り返らないので、
+# これを超えるエッジがあれば掃引の破綻(ねじれ・面の裏返り)を意味する。
+# 実測(健全な300部品): 最大 112度。崩壊部品では 180度近くになる。
+MAX_DIHEDRAL_TURN_DEG = 150.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -456,7 +462,7 @@ def face_centroid(face) -> Vec3:
     return (centre.X(), centre.Y(), centre.Z())
 
 
-def primitive_deviation(edge, samples: int = 12) -> float:
+def primitive_deviation(edge, samples: int = 24) -> float:
     """エッジを1本の直線/円弧に当てたときの最大ずれ[mm](引継ぎ書 §3.4 ゲートA)。
 
     OCCTの曲線**型**では判定しない — 直線織り面の稜線は幾何的に厳密な直線なのに
@@ -490,6 +496,129 @@ def primitive_deviation(edge, samples: int = 12) -> float:
     except Exception:
         pass
     return min(line, arc)
+
+
+def boundary_loop_count(shape) -> int:
+    """外形(自由エッジ)が作る閉ループの本数。閉じていなければ -1。
+
+    開いたシェル1枚の板金部品の外形は**必ず1本の閉ループ**になる(穴は開けない
+    方針なので内側ループも無い)。縫合が失敗して面がばらけると、面ごとに開いた
+    辺が残ってループ数が跳ね上がる — 崩壊の最も確実な兆候。
+    実測: 健全な部品は 1、崩壊した SYN_general_two_point_0048 は 自由エッジ60本。
+    """
+    edge_faces = TopTools_IndexedDataMapOfShapeListOfShape()
+    topexp.MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, edge_faces)
+    adjacency: dict = {}
+    edges = []
+    for i in range(1, edge_faces.Size() + 1):
+        edge = topods.Edge(edge_faces.FindKey(i))
+        if BRep_Tool.Degenerated(edge) or edge_faces.FindFromIndex(i).Size() != 1:
+            continue
+        ends = []
+        explorer = TopExp_Explorer(edge, TopAbs_VERTEX)
+        while explorer.More():
+            ends.append(topods.Vertex(explorer.Current()))
+            explorer.Next()
+        if len(ends) != 2:
+            return -1
+        index = len(edges)
+        edges.append(ends)
+        for vertex in ends:
+            key = _vertex_key(vertex)
+            adjacency.setdefault(key, []).append(index)
+    if not edges:
+        return 0
+    if any(len(v) != 2 for v in adjacency.values()):
+        return -1          # 端が開いている / 3本以上が集まる = 閉じていない
+    seen: set = set()
+    loops = 0
+    for start in range(len(edges)):
+        if start in seen:
+            continue
+        loops += 1
+        stack = [start]
+        while stack:
+            current = stack.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            for vertex in edges[current]:
+                stack.extend(adjacency[_vertex_key(vertex)])
+    return loops
+
+
+def _vertex_key(vertex, grid: float = 1e-4):
+    point = BRep_Tool.Pnt(vertex)
+    return (round(point.X() / grid), round(point.Y() / grid), round(point.Z() / grid))
+
+
+def worst_dihedral_deg(shape) -> float:
+    """隣接する2面の法線がなす角の最大値[度]。
+
+    中立面は自分の上に折り返らないので、180度に近い値は掃引の破綻(ねじれ・
+    面の裏返り)を意味する。ユーザー提案の「勾配が異常な形状は怪しい」の実装。
+    """
+    edge_faces = TopTools_IndexedDataMapOfShapeListOfShape()
+    topexp.MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, edge_faces)
+    worst = 0.0
+    for i in range(1, edge_faces.Size() + 1):
+        edge = topods.Edge(edge_faces.FindKey(i))
+        if BRep_Tool.Degenerated(edge) or edge_faces.FindFromIndex(i).Size() != 2:
+            continue
+        normals = []
+        for shape_face in edge_faces.FindFromIndex(i):
+            face = topods.Face(shape_face)
+            curve, first, last = BRep_Tool.CurveOnSurface(edge, face)
+            if curve is None:
+                normals = []
+                break
+            uv = curve.Value(0.5 * (first + last))
+            props = BRepLProp_SLProps(BRepAdaptor_Surface(face), uv.X(), uv.Y(), 1, 1e-6)
+            if not props.IsNormalDefined():
+                normals = []
+                break
+            direction = props.Normal()
+            if face.Orientation() == TopAbs_REVERSED:
+                direction.Reverse()
+            normals.append((direction.X(), direction.Y(), direction.Z()))
+        if len(normals) == 2:
+            cosine = max(-1.0, min(1.0, _dot(normals[0], normals[1])))
+            worst = max(worst, math.degrees(math.acos(cosine)))
+    return worst
+
+
+def _read_step(path: str):
+    reader = STEPControl_Reader()
+    if reader.ReadFile(path) != 1:
+        raise ValueError(f"cannot read back {path}")
+    reader.TransferRoots()
+    return reader.OneShape()
+
+
+def check_shape(shape) -> None:
+    """出来上がった形の合格判定(通らなければValueErrorで棄却)。
+
+    * 0.05mm未満のゴミエッジが無い(引継ぎ書 §4.3)
+    * 全エッジが1本の直線/円弧に載る(ゲートA)
+    * シェルが有効
+    * **外形が閉じた1本のループ**(崩壊検知。縫合漏れを全部拾う)
+    * **隣接面が折り返らない**(崩壊検知。ねじれ・面の裏返りを拾う)
+    """
+    _reject_junk_edges(shape)
+    if not BRepCheck_Analyzer(shape).IsValid():
+        raise ValueError("the shell is not valid. Infeasible; resample.")
+    loops = boundary_loop_count(shape)
+    if loops != 1:
+        raise ValueError(
+            f"the outline is {loops} closed loops, not 1 -- faces did not sew "
+            "(shape collapsed). Infeasible; resample."
+        )
+    turn = worst_dihedral_deg(shape)
+    if turn > MAX_DIHEDRAL_TURN_DEG:
+        raise ValueError(
+            f"two adjacent faces turn {turn:.0f}deg (limit {MAX_DIHEDRAL_TURN_DEG:.0f}) "
+            "-- the surface folds back on itself. Infeasible; resample."
+        )
 
 
 def _reject_junk_edges(shape, minimum_mm: float = MIN_EDGE_LENGTH_MM) -> None:
@@ -621,15 +750,17 @@ class OcctPartBuilder:
             exclude_side=(flange.side if flange is not None else None),
         )
         shape, faces = self._unify(shape, faces)
-        _reject_junk_edges(shape)
-        # リブの稜線フィレットは、通っても無効なシェルを返すことがある
-        # (2026-09-04実測: 300部品中5件)。ここで捨てて引き直す。
-        if not BRepCheck_Analyzer(shape).IsValid():
-            raise ValueError("the sewn shell is not valid. Infeasible; resample.")
-
         os.makedirs(out_dir, exist_ok=True)
         stp_path = os.path.abspath(os.path.join(out_dir, part_name + "_mid.stp"))
         _export_step(shape, faces, stp_path)
+        # **検査は書き出したSTEPに対して行う。**下流が読むのはこのファイルであり、
+        # STEPの往復で曲線が再近似される(2026-09-04実測: メモリ上0.25mm以内だった
+        # フィレット稜線が、読み戻すと0.839mmずれていた)。
+        try:
+            check_shape(_read_step(stp_path))
+        except ValueError:
+            os.remove(stp_path)
+            raise
         return GeneratedPart(stp_path=stp_path, catpart_path="",
                              face_labels=tuple(describe_faces(faces)))
 
@@ -696,8 +827,17 @@ class OcctPartBuilder:
         for step in path:
             tag = f"panel_{step.panel}" if isinstance(step, _Straight) else f"bend_{step.fold}"
             if isinstance(step, _Bend):
-                frame = self._sweep_segment(step, frame, w, bead_section, faces, tag)
-                cursor += abs(step.angle) * step.radius
+                span = abs(step.angle) * step.radius
+                # **曲げがビード区間の外にあることがある**(開始位置を探索式にしたため)。
+                # 無条件にビード断面で掃引すると前後の平地断面と噛み合わず、縫合が
+                # 全面的に失敗して部品が崩壊する(2026-09-04に実測: 自由エッジ88本)。
+                # ランアウトは必ず直線区間の中にあるので、曲げは区間の内か外の
+                # どちらかに完全に入る。
+                inside = s1 - 1e-6 <= cursor + span / 2.0 <= s2 + 1e-6
+                frame = self._sweep_segment(
+                    step, frame, w, bead_section if inside else flat_section,
+                    faces, f"bend_{step.fold}")
+                cursor += span
                 continue
             # 直線区間は断面が変わる位置で分割する。
             cuts = [c for c in (s0, s1, s2, s3) if cursor + 1e-9 < c < cursor + step.length - 1e-9]
