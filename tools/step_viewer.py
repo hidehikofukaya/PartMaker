@@ -950,7 +950,8 @@ def main():
     print(f"\n=======================================================", flush=True)
     print(f"PartMaker STEP Quality Viewer is launching!", flush=True)
     print(f"Please open your browser and navigate to:", flush=True)
-    print(f"    👉  http://localhost:{port}/  👈", flush=True)
+    # 絵文字は使わない: 日本語WindowsのコンソールはCP932なのでUnicodeEncodeErrorで落ちる
+    print(f"    ->  http://localhost:{port}/  <-", flush=True)
     print(f"=======================================================\n", flush=True)
     
     app.run(host="localhost", port=port, debug=False)
