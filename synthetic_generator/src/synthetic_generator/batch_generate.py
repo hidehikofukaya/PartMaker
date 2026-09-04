@@ -163,6 +163,13 @@ def build_general_part(builder, spec, bead, flange, out_dir: str, part_name: str
     (側x方向)の反転候補で再試行する(SS14.6: 成立性はキラリティ依存で、失敗7件の
     全てが反転で成立した)。戻り値は(GeneratedPart, 実際に使ったflange)。"""
 
+    # 平板は掃引ではなく外形ワイヤから作る(実車031/1285-20)。
+    if getattr(spec, "plate_margin_mm", None) is not None:
+        return builder.build_flat_plate(
+            spec.annotated_points, margin_mm=spec.plate_margin_mm,
+            corner_radius_mm=spec.plate_corner_radius_mm,
+            out_dir=out_dir, part_name=part_name), None
+
     def attempt(candidate_flange):
         return builder.build_general_two_point(
             spec.point1,
@@ -427,7 +434,8 @@ def generate_recipe_batch(
                 )
             made += 1
 
-            plan = plan_for(spec)
+            plate = getattr(spec, "plate_margin_mm", None) is not None
+            plan = None if plate else plan_for(spec)
             params_dir = out_dir / "params"
             params_dir.mkdir(parents=True, exist_ok=True)
             (params_dir / f"{part_id}.json").write_text(
@@ -437,9 +445,11 @@ def generate_recipe_batch(
                         "kind": kind,
                         "feature": kind_of(bead, flange, rib),
                         "attempts_used": attempt + 1,
-                        "geometry_label": plan.geometry_label,
-                        "folds": len(plan.panel_frames) - 1,
-                        "fold_tilts_deg": [
+                        "geometry_label": (
+                            f"flat plate, {len(spec.annotated_points)} joints"
+                            if plate else plan.geometry_label),
+                        "folds": 0 if plate else len(plan.panel_frames) - 1,
+                        "fold_tilts_deg": [] if plate else [
                             [math.degrees(a), math.degrees(b)] for a, b in plan.fold_tilts
                         ],
                         "spec": dataclasses.asdict(spec),

@@ -207,6 +207,10 @@ class GeneralTwoJointSpec:
     # 孤立点に向けて帯幅を絞りきる先の半幅[mm]。Noneなら一定幅(従来どおり)。
     # 実車014は対の側 50.1mm から孤立点の必要平面幅 27.4mm まで細くなる。
     taper_half_width_mm: float | None = None
+    # 平板×多点締結(実車031/1285-20)。締結点の凸包を外へオフセットする量[mm]。
+    # これが入っている spec は掃引ではなく `build_flat_plate` で作る。
+    plate_margin_mm: float | None = None
+    plate_corner_radius_mm: float | None = None   # 外形の隅R(実車は4.5〜8mm)
 
 
 def _random_unit_vector(rng: random.Random) -> Vec3:
