@@ -200,6 +200,13 @@ class GeneralTwoJointSpec:
     # 3点目以降の締結点(2026-09-04、実車007/011の再現)。空なら従来どおりの2点部品。
     # 骨格(中心線・曲げ)は point1/point2 だけで決まり、追加点は既存パネルに載るだけ。
     extra_points: tuple[FasteningPoint, ...] = ()
+    # joints.json に書く締結点。None なら (point1, point2, *extra_points)。
+    # 011型は掃引アンカー(point1 か point2)を対の**中点**として使うので、
+    # アンカー自身は締結点ではない。それをここで外す。
+    annotated_points: tuple[FasteningPoint, ...] | None = None
+    # 孤立点に向けて帯幅を絞りきる先の半幅[mm]。Noneなら一定幅(従来どおり)。
+    # 実車014は対の側 50.1mm から孤立点の必要平面幅 27.4mm まで細くなる。
+    taper_half_width_mm: float | None = None
 
 
 def _random_unit_vector(rng: random.Random) -> Vec3:
@@ -452,7 +459,8 @@ def _orthonormal_pair(rng: random.Random) -> tuple[Vec3, Vec3]:
 def _sample_single_fold_spec(rng, thickness_range_mm, hole_diameter_range_mm,
                              bearing_radius_mm=None, turn_range_deg=None,
                              half_width_ratio_range=None, max_half_width_mm=None,
-                             bend_radius_range_mm=None) -> GeneralTwoJointSpec:
+                             bend_radius_range_mm=None,
+                             leg_slack_mm=None) -> GeneralTwoJointSpec:
     """曲げ1本の部品を**形状から**引き、締結点を導出する(2026-09-04、D1)。
 
     点対を引いてから単曲げを解こうとすると、交線が締結点の後方に来る配置ばかり引いて
@@ -472,8 +480,9 @@ def _sample_single_fold_spec(rng, thickness_range_mm, hole_diameter_range_mm,
     if rng.random() < 0.5:
         turn = -turn                        # 山折り/谷折りの両方を出す
     tangent = tangent_length_for_bend_angle_rad(abs(turn), bend_radius)
-    leg1 = bearing + tangent + rng.uniform(*SINGLE_FOLD_LEG_SLACK_RANGE_MM)
-    leg2 = bearing + tangent + rng.uniform(*SINGLE_FOLD_LEG_SLACK_RANGE_MM)
+    slack_range = leg_slack_mm or SINGLE_FOLD_LEG_SLACK_RANGE_MM
+    leg1 = bearing + tangent + rng.uniform(*slack_range)
+    leg2 = bearing + tangent + rng.uniform(*slack_range)
     u2 = rotate_about_axis(u1, w, turn)
     n2 = rotate_about_axis(n1, w, turn)
     p1: Vec3 = (0.0, 0.0, 0.0)
@@ -537,6 +546,7 @@ def sample(
     half_width_ratio_range: tuple[float, float] | None = None,
     max_half_width_mm: float | None = None,
     bend_radius_range_mm: tuple[float, float] | None = None,
+    leg_slack_mm: tuple[float, float] | None = None,
 ) -> GeneralTwoJointSpec:
     """任意の法線・任意の位置の締結点ペアを1組サンプリングする。
 
@@ -557,7 +567,7 @@ def sample(
         return _sample_single_fold_spec(rng, thickness_range_mm, hole_diameter_range_mm,
                                         bearing_radius_mm, turn_range_deg,
                                         half_width_ratio_range, max_half_width_mm,
-                                        bend_radius_range_mm)
+                                        bend_radius_range_mm, leg_slack_mm)
     if target_folds == 0:
         return _sample_flat_spec(rng, thickness_range_mm, hole_diameter_range_mm,
                                  bearing_radius_mm, section_distance_mm,

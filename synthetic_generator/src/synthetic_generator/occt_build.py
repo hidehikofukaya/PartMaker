@@ -115,6 +115,9 @@ MAX_PRIMITIVE_DEVIATION_MM = 0.25
 MAX_DIHEDRAL_TURN_DEG = 150.0
 # 締結点が面から外れてよい上限[mm]。部品が自分の座面に届かなくなる崩壊を拾う
 # (2026-09-04実測: 300部品中1件のリブ部品で23.9mm外れていた)。
+# 絞りに使う区間の割合(孤立点の座面手前 2*bearing のうち)。残りは一定幅で残す
+# — 実車014も絞りきったあと孤立点まで27.4mm一定。
+TAPER_SHARE = 0.6
 MAX_FASTENING_OFFSET_MM = 0.1
 
 
@@ -266,6 +269,35 @@ def _bead_section(bead, lift: int, half_width_mm: float, *, role: str = "bead") 
     return section, y_breaks
 
 
+def _flange_walls(flange: FlangeParams, half_width_mm: float):
+    """基準面の端に継ぐ「根本R + 壁」を (左側の要素列, 右側の要素列) で返す。
+
+    左の壁は上端から根本へ、右の壁は根本から上端へ向ける — 要素列は左から右へ
+    連続していないと `_edges_of` が繋がらないため。
+    """
+    r, h, e = flange.root_radius_mm, flange.height_mm, flange.direction
+    if h <= r + 1.0:
+        raise ValueError(
+            f"flange height ({h:.1f}mm) leaves no straight wall above the root radius "
+            f"({r:.1f}mm). Infeasible; not attempting construction."
+        )
+    hw = half_width_mm
+    q = math.sqrt(0.5)                       # 45度方向(円弧の中点)
+    left_mid = (-(hw + r * q), e * r * (1.0 - q))
+    right_mid = (hw + r * q, e * r * (1.0 - q))
+    left = [("line", (-(hw + r), e * h), (-(hw + r), e * r), "flange_wall_l"),
+            ("arc", (-(hw + r), e * r), left_mid, (-hw, 0.0), "flange_root_l")]
+    right = [("arc", (hw, 0.0), right_mid, (hw + r, e * r), "flange_root_r"),
+             ("line", (hw + r, e * r), (hw + r, e * h), "flange_wall_r")]
+    return left, right
+
+
+def _with_flange(section: list[Elem], flange: FlangeParams, half_width_mm: float) -> list[Elem]:
+    """基準面の断面(平地でもビードでも)の両端に壁を継ぐ。実車014型で使う。"""
+    left, right = _flange_walls(flange, half_width_mm)
+    return [*left, *section, *right]
+
+
 def _flange_section(flange: FlangeParams, half_width_mm: float) -> list[Elem]:
     """基準面 + 根本R(90度) + フランジ壁。根本Rは名目幅の**外側**に置くので、
     基準面の半幅は名目のまま保たれる(CATIA版のside_extensionは不要)。"""
@@ -276,6 +308,10 @@ def _flange_section(flange: FlangeParams, half_width_mm: float) -> list[Elem]:
             f"flange height ({h:.1f}mm) leaves no straight wall above the root radius "
             f"({r:.1f}mm). Infeasible; not attempting construction."
         )
+    if flange.both_sides:    # 実車014型: 左右どちらにも壁を立てる
+        return _with_flange(
+            [("line", (-half_width_mm, 0.0), (half_width_mm, 0.0), "base")],
+            flange, half_width_mm)
     s = flange.side          # +1 = ey正側
     e = flange.direction     # +1 = 面法線側へ立てる
     w_edge = s * half_width_mm
@@ -716,14 +752,20 @@ class OcctPartBuilder:
         fold1_tilt_perturbation_rad: float = 0.0,
         target_folds: int | None = None,
         extra_points: tuple = (),
+        # 面上検査に掛ける締結点。省略時は point1/point2 + extra_points。011型・014型は
+        # 掃引アンカー(point1/point2)が締結点ではないので、実在の点だけを渡す。
+        check_points: tuple | None = None,
+        taper_half_width_mm: float | None = None,
         out_dir: str,
         part_name: str,
         bead: BeadParams | None = None,
         flange: FlangeParams | None = None,
         rib: RibParams | None = None,
     ) -> GeneratedPart:
-        if sum(x is not None for x in (bead, flange, rib)) > 1:
-            raise ValueError("a part takes at most one reinforcement (bead, flange or rib)")
+        # 1部品1特徴が原則。例外はビード + フランジだけ(実車014型で「両側フランジ +
+        # 中央ビード」が1点と2点の間の剛性を担っている。ユーザー決定 2026-09-04)。
+        if rib is not None and (bead is not None or flange is not None):
+            raise ValueError("a rib cannot be combined with a bead or a flange")
         if abs(fold1_tilt_perturbation_rad) > 1e-9:
             # 折れ目軸が共通でなくなる(実測: 摂動ありで軸間角 最大7.3度)ため、
             # 断面掃引の前提が崩れる。サンプラー側で0に固定してある。
@@ -749,10 +791,27 @@ class OcctPartBuilder:
         frame = _Frame(start, ey, normal0)
 
         faces: dict = {}          # face -> name
-        if bead is not None:
+        if bead is not None and taper_half_width_mm is not None:
+            # 実車014型。ビードは対の側の板端から通し、孤立点の手前でだけ平地に
+            # 戻す。帯幅も孤立点の必要平面幅まで絞る。
+            self._check_flange_radii(path, flange, bend_radius_mm) if flange else None
+            self._sweep_tapered_bead(
+                path, frame, w, bead, flange,
+                half_width_mm=half_width_mm,
+                narrow_half_width_mm=taper_half_width_mm,
+                min_bearing_radius_mm=min_bearing_radius_mm,
+                lift=self._bead_lift(path, bead, bend_radius_mm), faces=faces)
+        elif bead is not None:
             lift = self._bead_lift(path, bead, bend_radius_mm)
             section, y_breaks = _bead_section(bead, lift, half_width_mm)
-            self._sweep_with_bead(path, frame, w, section, _flat_section(y_breaks),
+            flat = _flat_section(y_breaks)
+            if flange is not None:
+                # ランアウトの loft は断面どうしの要素が1対1で対応する必要があるので、
+                # ビード側と平地側の**両方**に同じ壁を継ぐ。
+                self._check_flange_radii(path, flange, bend_radius_mm)
+                section = _with_flange(section, flange, half_width_mm)
+                flat = _with_flange(flat, flange, half_width_mm)
+            self._sweep_with_bead(path, frame, w, section, flat,
                                   bead, min_bearing_radius_mm, faces)
         elif rib is not None:
             self._build_rib_part(plan, w, ey, rib, half_width_mm, bend_radius_mm, faces)
@@ -768,7 +827,9 @@ class OcctPartBuilder:
             shape, faces, path, start, ey, normal0, w,
             half_width_mm=half_width_mm,
             radius_mm=min_bearing_radius_mm,
-            exclude_side=(flange.side if flange is not None else None),
+            # 両側フランジは隅を落とす余地が無い(side=0で左右とも除外)。
+            exclude_side=(None if flange is None else
+                          (0 if flange.both_sides else flange.side)),
         )
         shape, faces = self._unify(shape, faces)
         os.makedirs(out_dir, exist_ok=True)
@@ -778,9 +839,9 @@ class OcctPartBuilder:
         # STEPの往復で曲線が再近似される(2026-09-04実測: メモリ上0.25mm以内だった
         # フィレット稜線が、読み戻すと0.839mmずれていた)。
         try:
-            check_shape(_read_step(stp_path),
-                        (point1.position_xyz, point2.position_xyz,
-                         *(p.position_xyz for p in extra_points)))
+            wanted = check_points if check_points is not None else (
+                point1, point2, *extra_points)
+            check_shape(_read_step(stp_path), tuple(p.position_xyz for p in wanted))
         except ValueError:
             os.remove(stp_path)
             raise
@@ -871,6 +932,91 @@ class OcctPartBuilder:
                 else:
                     sec = bead_section if s1 - 1e-6 <= mid <= s2 + 1e-6 else flat_section
                     frame = self._sweep_segment(piece, frame, w, sec, faces, tag)
+            cursor += step.length
+
+    def _sweep_tapered_bead(self, path, frame: _Frame, w: Vec3, bead: BeadParams,
+                            flange, *, half_width_mm: float, narrow_half_width_mm: float,
+                            min_bearing_radius_mm: float, lift: int, faces) -> None:
+        """実車014型の掃引。
+
+        掃引は必ず「対の側 -> 孤立点」の向きで来る(族が host_index=0 で固定する)。
+
+        * ビードは s=0(対の側の板端)から通し、**逃げは孤立点の側だけ**に取る。
+          対の2点は帯の中心線をまたいでいるのでビードはその間を通り、座面を避ける
+          必要がない(実車014実測: 対のパネルは板端までビード深さ3.5mmが一定)。
+        * 帯幅は孤立点の座面の手前で `narrow_half_width_mm` まで絞る
+          (実車014実測: 50.1 -> 27.4mm、絞ったあとは孤立点まで一定)。
+        """
+        wide_bead, y_breaks = _bead_section(bead, lift, half_width_mm)
+        footprint = -y_breaks[1]                       # ビードが幅方向に占める半分
+        if narrow_half_width_mm < footprint + 1.0:
+            raise ValueError(
+                f"the narrow end ({narrow_half_width_mm:.1f}mm half width) cannot hold the "
+                f"bead footprint ({footprint:.1f}mm). Infeasible; not attempting construction."
+            )
+        narrow_breaks = [-narrow_half_width_mm, *y_breaks[1:-1], narrow_half_width_mm]
+
+        def wrap(section, hw):
+            return _with_flange(section, flange, hw) if flange is not None else section
+
+        sec_bead = wrap(wide_bead, half_width_mm)
+        sec_flat = wrap(_flat_section(y_breaks), half_width_mm)
+        sec_narrow = wrap(_flat_section(narrow_breaks), narrow_half_width_mm)
+
+        spans = []
+        cursor = 0.0
+        for step in path:
+            span = step.length if isinstance(step, _Straight) else abs(step.angle) * step.radius
+            spans.append((cursor, cursor + span, isinstance(step, _Straight)))
+            cursor += span
+        total = cursor
+        inset = 2.0 * min_bearing_radius_mm
+        runout = max(BEAD_MIN_RUNOUT_MM, RUNOUT_DEPTH_RATIO * bead.depth_mm)
+        s3 = total - inset                 # ビードが平地に戻りきる位置
+        s2 = s3 - runout                   # 逃げの始まり
+        s4 = s3 + TAPER_SHARE * inset      # 絞りきる位置
+        if s2 <= 0.0:
+            raise ValueError(
+                f"a bead with a {runout:.1f}mm run-out does not fit before the lone bearing "
+                f"area (inset {inset:.1f}mm of {total:.1f}mm). Infeasible."
+            )
+        # 逃げも絞りも直線区間の中に収まっていること(曲げは剛体断面でしか掃引できない)。
+        for a, b in ((s2, s3), (s3, s4)):
+            if not any(straight and lo - 1e-6 <= a and b <= hi + 1e-6
+                       for lo, hi, straight in spans):
+                raise ValueError(
+                    f"the run-out/taper stretch ({a:.1f}..{b:.1f}mm) straddles a bend. "
+                    "Infeasible; not attempting construction."
+                )
+
+        cursor = 0.0
+        for step in path:
+            if isinstance(step, _Bend):
+                span = abs(step.angle) * step.radius
+                if cursor + span > s2 + 1e-6:
+                    raise ValueError("a bend falls inside the run-out or taper stretch")
+                frame = self._sweep_segment(step, frame, w, sec_bead, faces,
+                                            f"bend_{step.fold}")
+                cursor += span
+                continue
+            tag = f"panel_{step.panel}"
+            cuts = [c for c in (s2, s3, s4)
+                    if cursor + 1e-9 < c < cursor + step.length - 1e-9]
+            marks = [cursor] + cuts + [cursor + step.length]
+            for i in range(len(marks) - 1):
+                a, b = marks[i], marks[i + 1]
+                piece = step.scaled(b - a)
+                mid = 0.5 * (a + b)
+                if mid <= s2:
+                    frame = self._sweep_segment(piece, frame, w, sec_bead, faces, tag)
+                elif mid <= s3:      # ビード -> 平地
+                    frame = self._loft_runout(piece, frame, sec_bead, sec_flat,
+                                              rising=False, faces=faces, tag="runout_1")
+                elif mid <= s4:      # 広い平地 -> 絞った平地
+                    frame = self._loft_runout(piece, frame, sec_flat, sec_narrow,
+                                              rising=False, faces=faces, tag="taper")
+                else:
+                    frame = self._sweep_segment(piece, frame, w, sec_narrow, faces, tag)
             cursor += step.length
 
     # -------------------------------------------------------- リブ(可変半径のコーナーブレンド)
@@ -1173,6 +1319,8 @@ class OcctPartBuilder:
                              *, half_width_mm: float, radius_mm: float, exclude_side):
         """両端の隅を R=締結点の必要最小半径 で丸めて落とす(実務の余肉カット)。
         フランジ部品はフランジ側の2隅を残す。"""
+        excluded = () if exclude_side is None else (
+            (-1, 1) if exclude_side == 0 else (exclude_side,))
         first, last = path[0], path[-1]
         # 端辺に 2*(hw - R) の残りが出る。half_width は bearing半径の1.0〜1.3倍なので
         # ほぼ0になり得て、0.04mmのゴミエッジが生まれる(2026-09-04実測)。少し弱める。
@@ -1201,7 +1349,7 @@ class OcctPartBuilder:
             (frame, _scale(last.direction, -1.0), "p2"),
         ):
             for side in (-1, 1):
-                if exclude_side is not None and side == exclude_side:
+                if side in excluded:
                     continue
                 tools.append(self._relief_tool(frm, inward, side, half_width_mm, radius_mm))
         for tool in tools:

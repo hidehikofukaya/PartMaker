@@ -175,6 +175,8 @@ def build_general_part(builder, spec, bead, flange, out_dir: str, part_name: str
             fold1_tilt_perturbation_rad=spec.fold1_tilt_perturbation_rad,
             target_folds=spec.target_folds,
             extra_points=getattr(spec, "extra_points", ()),
+            check_points=getattr(spec, "annotated_points", None),
+            taper_half_width_mm=getattr(spec, "taper_half_width_mm", None),
             out_dir=out_dir,
             part_name=part_name,
             bead=bead,
@@ -458,7 +460,9 @@ def generate_recipe_batch(
                 thickness_mm=spec.thickness_mm,
                 thickness_source="synthetic_generator",
             )
-            points = (spec.point1, spec.point2, *getattr(spec, "extra_points", ()))
+            # 011型は掃引アンカーが締結点ではないので annotated_points が優先する。
+            points = (getattr(spec, "annotated_points", None)
+                      or (spec.point1, spec.point2, *getattr(spec, "extra_points", ())))
             for joint in build_joints(part_id, points, spec.hole_diameter_mm):
                 doc.add_joint(joint)
             if len(records) % 25 == 0:
