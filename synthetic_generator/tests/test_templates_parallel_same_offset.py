@@ -1,7 +1,12 @@
 import math
 import random
 
-from synthetic_generator.classify import MIN_NEUTRAL_PLANE_RADIUS_MM, classify, fold_tangent_length_mm
+from synthetic_generator.classify import (
+    MIN_BASE_BEND_RADIUS_MM,
+    MIN_NEUTRAL_PLANE_RADIUS_MM,
+    classify,
+    fold_tangent_length_mm,
+)
 from synthetic_generator.templates.parallel_same_offset import (
     BEND_RADIUS_CAP_MM,
     FLANGE_WIDTH_SAFETY_MARGIN_MM,
@@ -52,26 +57,26 @@ def test_sample_always_classifies_as_parallel_same_offset() -> None:
         assert 0.0 <= spec.jog_ramp_extent_mm <= max(0.0, lateral - 2.0 * spec.min_bearing_radius_mm) + 1e-6
         ramp_extents.append(spec.jog_ramp_extent_mm)
 
-        # bend_radius_mmは中立面R最小4mm(ユーザー製造制約、2026-08-06)を常に満たす。
-        # 幾何的に本来の実行可能上限が4mm未満の場合はあえて4mm(=実行可能上限を超える値)を
+        # bend_radius_mmはメイン曲げの下限R10(ユーザー確定、2026-08-24)を常に満たす。
+        # 幾何的に本来の実行可能上限がR10未満の場合はあえてR10(=実行可能上限を超える値)を
         # 返し、gsd_build.py側の事前チェックで明示的にInfeasibleとして弾かれる設計。
         # そうでない場合は締結点のmin_bearing_radius_mmを侵さない範囲に収まっているはず。
-        assert MIN_NEUTRAL_PLANE_RADIUS_MM <= spec.bend_radius_mm <= BEND_RADIUS_CAP_MM
+        assert MIN_BASE_BEND_RADIUS_MM <= spec.bend_radius_mm <= BEND_RADIUS_CAP_MM
         x_start = (lateral - spec.jog_ramp_extent_mm) / 2.0
         offset = _offset_mm(spec)
         tangent_length = fold_tangent_length_mm(offset, spec.jog_ramp_extent_mm, spec.bend_radius_mm)
         clear = x_start - tangent_length
         if clear < spec.min_bearing_radius_mm - 1e-6:
             # 実行可能上限が4mm未満だったケース: あえて最小値ちょうどを返しているはず
-            assert abs(spec.bend_radius_mm - MIN_NEUTRAL_PLANE_RADIUS_MM) < 1e-9
+            assert abs(spec.bend_radius_mm - MIN_BASE_BEND_RADIUS_MM) < 1e-9
         bend_radii.append(spec.bend_radius_mm)
 
     # 300件も引けば、鋭い直角に近いケースも緩やかなランプに近いケースも両方出るはず
     assert min(ramp_extents) < 1.0
     assert max(ramp_extents) > 10.0
     # bend_radius_mmもランダム性が保たれているはず(下限付近から上限付近まで幅がある)
-    assert min(bend_radii) < MIN_NEUTRAL_PLANE_RADIUS_MM + 1.0
-    assert max(bend_radii) > 10.0
+    assert min(bend_radii) < MIN_BASE_BEND_RADIUS_MM + 1.0
+    assert max(bend_radii) > MIN_BASE_BEND_RADIUS_MM + 5.0
 
 
 def test_sample_is_deterministic_given_seeded_rng() -> None:

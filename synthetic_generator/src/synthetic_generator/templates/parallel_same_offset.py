@@ -18,6 +18,7 @@ import math
 import random
 
 from synthetic_generator.classify import (
+    MIN_BASE_BEND_RADIUS_MM,
     MIN_NEUTRAL_PLANE_RADIUS_MM,
     FasteningPoint,
     Vec3,
@@ -188,7 +189,9 @@ def sample(
     # 4mm未満(=この組み合わせではR4以上のフィレットが物理的に成立しない)の場合は
     # あえて4mmを引いておき、gsd_build.py側の事前チェック(締結点必要最小半径/幅方向)で
     # 明示的にInfeasibleとして弾かれるようにする(「失敗したらアボートでいい」方針のまま)。
-    bend_radius = rng.uniform(MIN_NEUTRAL_PLANE_RADIUS_MM, max(MIN_NEUTRAL_PLANE_RADIUS_MM, max_bend_radius))
+    # メイン曲げは慣例のR10以上を狙う(成立しない組み合わせはあえてR10を返し、
+    # builder側の事前チェックで明示的にInfeasibleとして弾かれるようにする)。
+    bend_radius = rng.uniform(MIN_BASE_BEND_RADIUS_MM, max(MIN_BASE_BEND_RADIUS_MM, max_bend_radius))
 
     return TwoJointSpec(
         point1=point1,

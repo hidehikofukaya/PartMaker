@@ -106,10 +106,11 @@ class _FakeGeneralBuilder:
         self.calls: list[tuple] = []
 
     def build_general_two_point(
-        self, point1, point2, *, min_bearing_radius_mm, half_width_mm, fold1_run_mm, fold2_run_mm,
-        bend_radius_mm, out_dir, part_name,
+        self, point1, point2, *, min_bearing_radius_mm, half_width_mm, bend_radius_mm,
+        fold1_slack_mm, fold2_slack_mm, fold1_tilt_perturbation_rad, out_dir, part_name,
+        bead=None, flange=None, rib=None, target_folds=None,
     ):
-        self.calls.append((point1, point2, out_dir, part_name))
+        self.calls.append((point1, point2, out_dir, part_name, bead))
         return _FakeGeneratedPart(
             stp_path=f"{out_dir}/{part_name}_mid.stp", catpart_path=f"{out_dir}/{part_name}_mid.CATPart"
         )
@@ -161,3 +162,84 @@ def test_generate_general_batch_skips_infeasible_and_still_reaches_count(tmp_pat
 
     assert len(records) == 2
     assert builder.call_count == 5
+
+
+def test_generate_general_batch_writes_params_json_per_part(tmp_path: pathlib.Path) -> None:
+    """部品ごとの生成パラメータ(spec・ビード・傾き実績値)がparams/に保存される(SS12)。"""
+    builder = _FakeGeneralBuilder()
+    records = generate_general_batch(builder, tmp_path, count=2, seed=123)
+
+    for record in records:
+        params_path = tmp_path / "params" / f"{record.part_id}.json"
+        assert params_path.exists()
+        data = json.loads(params_path.read_text(encoding="utf-8"))
+        assert data["part_id"] == record.part_id
+        assert data["bead"] is None and data["flange"] is None  # 補強確率0(既定)
+        assert "fold_tilts_deg" in data and "geometry_label" in data
+        # specはそのまま形状を再構築できる完全な記録であること
+        assert data["spec"]["half_width_mm"] == record.spec.half_width_mm
+        assert data["spec"]["point1"]["position_xyz"] == list(record.spec.point1.position_xyz)
+
+
+def test_resolve_bead_slacks_returns_feasible_combination() -> None:
+    """リゾルバの返すslack/ビードは、builderが使うのと同一の権威チェックを通る(SS12)。"""
+    import random
+
+    from synthetic_generator.bead import sample_bead
+    from synthetic_generator.general_geometry import check_bead_feasible_occt, plan_general_two_point
+    from synthetic_generator.templates.general_two_point import (
+        resolve_bead_slacks,
+        sample as sample_general,
+    )
+
+    rng = random.Random(20260825)
+    resolved_count = 0
+    for _ in range(40):
+        spec = sample_general(rng)
+        bead = sample_bead(rng, spec.half_width_mm)
+        result = resolve_bead_slacks(rng, spec, bead)
+        if result is None:
+            continue
+        resolved_count += 1
+        new_spec, new_bead = result
+        # 締結点は不変(slackとビードだけが差し替わる)
+        assert new_spec.point1 == spec.point1 and new_spec.point2 == spec.point2
+        plan = plan_general_two_point(
+            new_spec.point1,
+            new_spec.point2,
+            min_bearing_radius_mm=new_spec.min_bearing_radius_mm,
+            half_width_mm=new_spec.half_width_mm,
+            bend_radius_mm=new_spec.bend_radius_mm,
+            fold1_slack_mm=new_spec.fold1_slack_mm,
+            fold2_slack_mm=new_spec.fold2_slack_mm,
+            fold1_tilt_perturbation_rad=new_spec.fold1_tilt_perturbation_rad,
+        )
+        check_bead_feasible_occt(plan, new_bead, spec.bend_radius_mm)  # 通らなければValueErrorで落ちる
+    assert resolved_count > 0, "40試行で1件も解決できないのはサンプラーが破綻している"
+
+
+def test_corner_relief_plan_arcs_lie_on_edges_and_respect_flange_side() -> None:
+    """余肉カット(SS15): 円弧の両端は側辺(v=±hw)と端辺(run=端)に載り、
+    フランジ側は除外される。"""
+    from synthetic_generator.bead import BeadPanelFrame
+    from synthetic_generator.corner_relief import plan_corner_relief
+
+    frames = [
+        BeadPanelFrame((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), -15.0, 80.0),
+        BeadPanelFrame((100.0, 0.0, 5.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), 0.0, 60.0),
+    ]
+    cuts = plan_corner_relief(
+        frames, half_width_mm=20.0, radius_mm=15.0,
+        fold_tangents=[(0.0, 5.0), (5.0, 0.0)],
+    )
+    assert len(cuts) == 4  # ビード部品: 四隅
+    first = cuts[0]
+    start, end = first.arc_points[0], first.arc_points[-1]
+    assert abs(abs(start[1]) - 20.0) < 1e-9      # 始点は側辺 v=±hw
+    assert abs(end[0] - (-15.0)) < 1e-9          # 終点は端辺 run=near
+    flange_cuts = plan_corner_relief(
+        frames, half_width_mm=20.0, radius_mm=15.0,
+        fold_tangents=[(0.0, 5.0), (5.0, 0.0)], exclude_side=1,
+    )
+    assert len(flange_cuts) == 2                 # フランジ部品: 反フランジ側のみ
+    assert all(c.remove_probe[1] < 0 for c in flange_cuts)

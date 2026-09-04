@@ -1,0 +1,63 @@
+{
+  "family": "occt10",
+  "chunk": 1,
+  "seed": 20260913,
+  "note": "族ごとに何をどれだけどんな多様性で作るかを、ここだけで決める。補強なし(plain)は既定では作らない — 「基本的には何らかの特徴あり」というユーザー指示(2026-09-04)による。比較対象が要るときだけ足すこと。",
+  "parts": [
+    {
+      "kind": "bead",
+      "count": 180,
+      "knobs": {
+        "distance_mm": [
+          110,
+          220
+        ],
+        "fold_weights": [
+          [
+            2,
+            0.6
+          ],
+          [
+            1,
+            0.4
+          ]
+        ]
+      }
+    },
+    {
+      "kind": "rib",
+      "count": 60,
+      "knobs": {
+        "distance_mm": [
+          50,
+          120
+        ],
+        "fold_weights": [
+          [
+            1,
+            0.7
+          ],
+          [
+            2,
+            0.3
+          ]
+        ],
+        "bearing_radius_mm": [
+          15.0,
+          22.0
+        ]
+      }
+    },
+    {
+      "kind": "flange",
+      "count": 60,
+      "knobs": {
+        "distance_mm": [
+          80,
+          220
+        ],
+        "gentle": true
+      }
+    }
+  ]
+}

@@ -47,17 +47,19 @@ import math
 import os
 
 import pythoncom
-from win32com.client import Dispatch
+from win32com.client import Dispatch, GetActiveObject
 
+from synthetic_generator.bead import BEAD_GUIDE_MARGIN_MM as _BEAD_GUIDE_MARGIN_MM
+from synthetic_generator.bead import BeadPanelFrame, BeadParams, plan_bead_on_surface
+from synthetic_generator.corner_relief import plan_corner_relief
+from synthetic_generator.flange import FlangeParams, plan_flange_on_surface
+from synthetic_generator.general_geometry import plan_general_two_point
 from synthetic_generator.classify import (
     MIN_NEUTRAL_PLANE_RADIUS_MM,
     FasteningPoint,
     Vec3,
-    end_panel_corners,
     fold_tangent_length_mm,
-    ramp_fold_angles_rad,
     tangent_length_for_bend_angle_rad,
-    two_point_frame,
 )
 from synthetic_generator.reinforcement import ReinforcementParams
 from synthetic_generator.templates.parallel_same_offset import TwoJointSpec
@@ -207,8 +209,33 @@ class SyntheticPartBuilder:
     """
 
     def __init__(self) -> None:
-        self.catia = Dispatch("CATIA.Application")
+        self.catia = self._connect()
         self.catia.DisplayFileAlerts = False
+
+    # V5の自動化オブジェクトは製品ごとに別のProgIDで登録される。CATIAが入っていない
+    # (あるいはライセンスが無い)環境でも、同じB32インストールのDELMIAが同一の
+    # オブジェクトモデル(Part/HybridShapeFactory/SPAWorkbench等)を公開するので
+    # そのまま使える — 2026-08-25にCATIAのライセンスが取れなくなった際、DELMIAで
+    # Offset/Spline/SweepLine/FilletBiTangent/Project/CurvePar/Join/計測が
+    # 全て動くことを実機で確認した。
+    #
+    # まず**起動中のセッションに接続**する(GetActiveObject)。新規起動(Dispatch)は
+    # ライセンス取得を伴い、失敗しやすいうえ起動コストも高いため後回しにする。
+    PROG_IDS = ("CATIA.Application", "DELMIA.Application")
+
+    @classmethod
+    def _connect(cls):
+        errors = []
+        for get in (GetActiveObject, Dispatch):
+            for prog_id in cls.PROG_IDS:
+                try:
+                    return get(prog_id)
+                except Exception as exc:  # 未起動/未登録/ライセンス無しなど
+                    errors.append(f"{get.__name__}({prog_id}): {str(exc)[:60]}")
+        raise RuntimeError(
+            "Could not connect to a running or startable V5 session. Tried: "
+            + "; ".join(errors)
+        )
 
     def new_part_document(self):
         return self.catia.Documents.Add("Part")
@@ -483,6 +510,24 @@ class SyntheticPartBuilder:
         """AddNewSurfaceEdgeFilletWithConstantRadius(iEdgeToFillet, iPropagMode, iRadius)。
         iPropagMode=0(隣接エッジへの伝播なし、この1エッジのみ)で動作確認済み。"""
         return part.ShapeFactory.AddNewSurfaceEdgeFilletWithConstantRadius(edge_ref, propagation_mode, radius_mm)
+
+    def edge_fillet_group(self, part, edge_refs: list, radius_mm: float):
+        """複数エッジを1つのEdgeFilletフィーチャーにまとめて当てる(AddObjectToFillet)。
+
+        2026-08-21(roadmap SS6.25)の実機検証: ビードが曲げをまたぐと、ビードの縦フィレット列と
+        メイン折れ目のフィレット列が交差する。1エッジずつ順に当てると、**先にどちらを当てても
+        後から当てた側が交差点で必ずUpdate失敗する**(順序・半径・横方向オフセットを変えても
+        再現、SS6.15の「角の共有」の一段上の問題)。全エッジを1フィーチャーにまとめると、
+        CATIA側が交差部のコーナーブレンドを一括で解くため成功する。
+
+        エッジ1本だけを渡した場合は`edge_fillet`と完全に同じ結果になる。
+        """
+        if not edge_refs:
+            raise ValueError("edge_fillet_group requires at least 1 edge")
+        fillet = self.edge_fillet(part, edge_refs[0], radius_mm)
+        for edge_ref in edge_refs[1:]:
+            fillet.AddObjectToFillet(edge_ref)
+        return fillet
 
     # ------------------------------------------------------------ Phase 1 オーケストレーション
 
@@ -791,74 +836,730 @@ class SyntheticPartBuilder:
         *,
         min_bearing_radius_mm: float,
         half_width_mm: float,
-        fold1_run_mm: float,
-        fold2_run_mm: float,
         bend_radius_mm: float,
+        fold1_slack_mm: float,
+        fold2_slack_mm: float,
+        fold1_tilt_perturbation_rad: float,
         out_dir: str,
         part_name: str,
+        bead: BeadParams | None = None,
+        flange: FlangeParams | None = None,
     ) -> GeneratedPart:
-        """任意の法線・任意の位置の締結点2点を、flat1・ランプ・flat2の3ピースでつなぐ。
+        """任意の法線・任意の位置の締結点2点を、単曲げまたは自由折れ目チェーン(3枚パネル)でつなぐ。
+
+        2026-08-24(docs/catia_bead_fillet_investigation_log.md SS8)より、旧来の
+        「flat1・ランプ・flat2をw平行に固定」構成を、`classify.free_fold_seed`/
+        `solve_free_fold`による**自由折れ目チェーン**(折れ目の向きが任意)に置き換えた。
+        締結点2枚の座面(=各締結点を通り法線に垂直な平面)の交線で1回曲げれば足りる
+        「無駄な曲げ量」が大きいケース(`classify.single_fold_layout`が判定)は、
+        従来どおり**パネル2枚+折れ目1本**で作る(この経路はSS8の変更と無関係、
+        w平行のままで問題ない)。それ以外は自由折れ目チェーンで作る。
 
         `classify.two_point_frame`(共通幅方向w、締結点ごとのローカル走行方向u1/u2)を使い、
         `build_parallel_same_offset`のn1=n2専用ロジックを一般化したもの。フランジ・
         Phase 1.5トリム(円弧)は未対応 — まずメイン形状生成の成功を優先する方針
-        (ユーザー確定、2026-08-10)。トリムは`trimmed_end_panel`の円弧掃引角が
-        axis_dir/width_dirの符号に依存するため、flat1・flat2で法線が異なる一般ケースでの
-        符号整合を別途検討してから再適用する。
+        (ユーザー確定、2026-08-10)。
 
-        `fold1_run_mm`/`fold2_run_mm`はそれぞれ締結点1/2からランプ側の折れ目までの距離
-        (旧来の対称な`jog_ramp_extent_mm`分割と異なり、独立な自由パラメータ)。
-        `bend_radius_mm`は両方の折れに共通の単一半径(旧来と同じ設計)。
+        `fold1_slack_mm`/`fold2_slack_mm`/`fold1_tilt_perturbation_rad`は
+        `templates/general_two_point.sample()`が振った「おおまかな」値(SS8.3: 中間折れ位置
+        =bearing半径+接線長+ランダムslack、傾きはfree_fold_seedの必要最小値からの摂動)。
+        ここではそれを`general_geometry.plan_general_two_point`(2026-08-25にCATIA非依存
+        部分を抽出した共有モジュール)に渡し、実際に閉合するか、フィレット同士が
+        重ならないか、曲げ角が上限(135度)を超えないか、非隣接パネル同士が干渉しないかを
+        権威あるチェックとして行う(サンプラー/バッチ側の事前解決も同じ関数を使うので
+        判定は乖離しない)。
         """
-        if bend_radius_mm < MIN_NEUTRAL_PLANE_RADIUS_MM:
-            raise ValueError(
-                f"bend_radius_mm={bend_radius_mm:.1f} is below the mandatory minimum "
-                f"{MIN_NEUTRAL_PLANE_RADIUS_MM:.1f}mm. Infeasible; not attempting construction."
+        if bead is not None and flange is not None:
+            raise ValueError("a part takes either a bead or a flange, not both")
+        # フランジは根本Rが名目幅を食わないよう、フランジ側だけ基準面を広く作る(SS14)
+        side_extension = (0.0, 0.0)
+        if flange is not None:
+            side_extension = (
+                flange.extension_mm if flange.side < 0 else 0.0,
+                flange.extension_mm if flange.side > 0 else 0.0,
             )
-        if bend_radius_mm > 0.9 * half_width_mm:
-            raise ValueError(
-                f"bend_radius_mm={bend_radius_mm:.1f} exceeds 0.9x half_width_mm={half_width_mm:.1f}. "
-                "Infeasible; not attempting construction."
-            )
-
-        frame = two_point_frame(point1, point2)
-        margin = min_bearing_radius_mm
-
-        flat1_corners = end_panel_corners(
-            point1.position_xyz, frame.u1, frame.w, -margin, fold1_run_mm, half_width_mm
+        plan = plan_general_two_point(
+            point1,
+            point2,
+            min_bearing_radius_mm=min_bearing_radius_mm,
+            half_width_mm=half_width_mm,
+            bend_radius_mm=bend_radius_mm,
+            fold1_slack_mm=fold1_slack_mm,
+            fold2_slack_mm=fold2_slack_mm,
+            fold1_tilt_perturbation_rad=fold1_tilt_perturbation_rad,
+            side_extension_mm=side_extension,
         )
-        flat2_corners = end_panel_corners(
-            point2.position_xyz, frame.u2, frame.w, -fold2_run_mm, margin, half_width_mm
+        return self._assemble_general_two_point(
+            plan.panel_corner_sets,
+            plan.fillet_groups,
+            plan.geometry_label,
+            out_dir,
+            part_name,
+            bead=bead,
+            flange=flange,
+            panel_frames=plan.panel_frames,
+            half_width_mm=plan.half_width_mm,
+            min_bearing_radius_mm=plan.min_bearing_radius_mm,
+            fold_tangents=plan.fold_tangents,
+            fold_tilts=plan.fold_tilts,
         )
-        ramp_corners = [flat1_corners[3], flat1_corners[2], flat2_corners[1], flat2_corners[0]]
 
-        mid_near = tuple((flat1_corners[2][i] + flat1_corners[3][i]) / 2 for i in range(3))
-        mid_far = tuple((flat2_corners[0][i] + flat2_corners[1][i]) / 2 for i in range(3))
-        fold1_angle, fold2_angle = ramp_fold_angles_rad(mid_near, mid_far, frame.u1, frame.u2)
+    # ------------------------------------------------------------ ビード(BiTangent方式)
+    # 2026-08-24: 旧セル分解方式(パネルを5ストリップに割ってシャープjoin→エッジフィレット)
+    # から、**完成した基準面の上にビードを載せる後処理方式**へ置き換えた。
+    #
+    # 背景(docs/catia_bead_fillet_investigation_log.md SS3.5〜3.7):
+    # 曲げをまたぐビードの縦シームを丸めるにはエッジ(BRep)参照のフィレットが要るが、
+    # スクリプトからはCATIAの参照解決が必ず失敗する(GUI手動でのみ成功)ことを確定させた。
+    # `AddNewFilletBiTangent`は**サーフェスフィーチャー参照だけ**で動くのでBRep参照が不要。
+    #
+    # 向き(orientation)・ドラフト角・面法線の符号は、いずれも形状依存で解析的に決め打ち
+    # できない(谷折り面ではパネルごとに法線の符号が反転する)。全て「作って期待点との
+    # 距離を測る」probe-and-selectで決める。
+    BEAD_GUIDE_MARGIN_MM = _BEAD_GUIDE_MARGIN_MM  # 一元定義はbead.py(事前判定と共有)
+    FLANGE_WALL_PIERCE_MM = 3.0     # フランジ壁を基準面の下へ貫通させる量(SS14.6)
+    # 壁を頂面・基準面へ貫通させるための(上方延長倍率, 下方延長mm)の候補。
+    # 大きく延ばすほど確実に貫通するが、曲げのR領域を大きくまたぐ壁ではCATIAが
+    # 掃引を解けなくなる。大きい順に試して、通った時点で採用する。
+    BEAD_WALL_EXTENSIONS = ((1.6, 3.0), (1.35, 1.5), (1.15, 0.8))
+    BEAD_PROBE_TOLERANCE_MM = 0.15  # 「残るべき点」が乗っているとみなす距離
+    BEAD_PROBE_REMOVED_MM = 1.0     # 「消えるべき点」が実際に消えたとみなす距離
 
-        tangent1 = tangent_length_for_bend_angle_rad(fold1_angle, bend_radius_mm)
-        tangent2 = tangent_length_for_bend_angle_rad(fold2_angle, bend_radius_mm)
+    @staticmethod
+    def _delete_feature(doc, part, feature) -> None:
+        """不採用・失敗したフィーチャーをツリーから消す。
 
-        if fold1_run_mm - tangent1 < min_bearing_radius_mm:
+        残したままにすると、以降の`part.Update()`が全てその失敗フィーチャーに
+        巻き添えで失敗する(SS6.25で確立済みの定石)。
+        """
+        try:
+            selection = doc.Selection
+            selection.Clear()
+            selection.Add(feature)
+            selection.Delete()
+            part.Update()
+        except Exception:
+            pass
+
+    def _point_refs(self, part, hsf, body, coords: list[Vec3]) -> list:
+        """座標列から点フィーチャーを作り、参照のリストを返す(Updateは1回にまとめる)。"""
+        shapes = [self.point(hsf, body, *coord) for coord in coords]
+        part.Update()
+        return [part.CreateReferenceFromObject(shape) for shape in shapes]
+
+    def _bead_bitangent(
+        self, doc, part, hsf, spa, body, ref1, ref2, radius_mm, keep_refs, remove_refs, label
+    ):
+        """AddNewFilletBiTangentの向き(o1,o2)を総当たりし、幾何プローブで正解を選ぶ。
+
+        「残るべき点」が全て乗っていることに加えて「消えるべき点」が実際に消えたことも
+        要求する。前者だけで判定すると、角に残ったスリバーにプローブが当たって誤合格し、
+        基準面の大半が消えた形状を採ってしまう(SS6.2で実際に踏んだ)。
+        """
+        observed: list[str] = []
+        for orientation1 in (1, -1):
+            for orientation2 in (1, -1):
+                tag = f"o=({orientation1:+d},{orientation2:+d})"
+                fillet = hsf.AddNewFilletBiTangent(
+                    ref1, ref2, radius_mm, orientation1, orientation2, 1, 1
+                )
+                body.AppendHybridShape(fillet)
+                try:
+                    part.Update()
+                except Exception as exc:
+                    observed.append(f"{tag}: update failed ({str(exc)[:40]})")
+                    self._delete_feature(doc, part, fillet)
+                    continue
+                ref = part.CreateReferenceFromObject(fillet)
+                measurable = spa.GetMeasurable(ref)
+                keep_distances = [measurable.GetMinimumDistance(probe) for probe in keep_refs]
+                remove_distances = [measurable.GetMinimumDistance(probe) for probe in remove_refs]
+                kept = all(d < self.BEAD_PROBE_TOLERANCE_MM for d in keep_distances)
+                removed = all(d > self.BEAD_PROBE_REMOVED_MM for d in remove_distances)
+                if kept and removed:
+                    return fillet, ref
+                # なぜ落ちたのかを残す。keepは「面から一番遠かった点」、removeは
+                # 「消えるべきなのに一番近かった点」が効いているので、その最悪値を見る。
+                detail = []
+                if not kept:
+                    worst = max(keep_distances)
+                    n_bad = sum(1 for d in keep_distances if d >= self.BEAD_PROBE_TOLERANCE_MM)
+                    detail.append(f"keep {n_bad}/{len(keep_distances)}外れ 最悪{worst:.2f}mm")
+                if not removed:
+                    worst = min(remove_distances)
+                    n_bad = sum(1 for d in remove_distances if d <= self.BEAD_PROBE_REMOVED_MM)
+                    detail.append(f"remove {n_bad}/{len(remove_distances)}残存 最近{worst:.2f}mm")
+                observed.append(f"{tag}: {', '.join(detail)}")
+                self._delete_feature(doc, part, fillet)
+        raise ValueError(
+            f"bead: no BiTangent orientation satisfied the geometric probes at {label} "
+            f"[{'; '.join(observed)}]. Infeasible; not attempting further construction."
+        )
+
+    def _bead_wall(self, doc, part, hsf, spa, body, curve_ref, surface_ref, top_refs, bead, label):
+        """ビードの壁を1枚掃引する。ドラフト角はprobe-and-selectで決める。
+
+        `SetAngle`に固定値を渡すと、掃引ガイド曲線の向き次第で壁が基準面の**下**へ
+        伸びたり、内側ではなく外側へ倒れたりする(SS6.1)。正しい角度は壁ごとに異なるため、
+        候補を総当たりし「頂部エッジが理論位置に来るか」で選ぶ。
+        """
+        theta = bead.wall_angle_deg
+        observed: list[str] = []
+        for angle_deg in (-theta, -(180.0 - theta), 180.0 - theta, theta):
+            sweep = hsf.AddNewSweepLine(curve_ref)
+            sweep.Mode = 4
+            sweep.FirstGuideSurf = surface_ref
+            sweep.SetAngle(1, angle_deg)
+            sweep.SetLength(1, bead.wall_slant_mm)
+            body.AppendHybridShape(sweep)
+            try:
+                part.Update()
+            except Exception as exc:
+                observed.append(f"{angle_deg:+.0f}deg: sweep failed ({str(exc)[:40]})")
+                self._delete_feature(doc, part, sweep)
+                continue
+            measurable = spa.GetMeasurable(part.CreateReferenceFromObject(sweep))
+            distances = [measurable.GetMinimumDistance(ref) for ref in top_refs]
+            self._delete_feature(doc, part, sweep)
+            observed.append(f"{angle_deg:+.0f}deg: {max(distances):.2f}mm")
+            if max(distances) >= self.BEAD_PROBE_TOLERANCE_MM:
+                continue
+            # 採用。頂面と基準面を貫通させるため、上下に延長して作り直す。
+            # 角度探索時(等倍)は通っても、大きく延長するとCATIAが解けないことがあるので
+            # 延長量の大きい候補から順に試す。
+            for over_ratio, under_mm in self.BEAD_WALL_EXTENSIONS:
+                sweep = hsf.AddNewSweepLine(curve_ref)
+                sweep.Mode = 4
+                sweep.FirstGuideSurf = surface_ref
+                sweep.SetAngle(1, angle_deg)
+                sweep.SetLength(1, bead.wall_slant_mm * over_ratio)
+                sweep.SetLength(2, under_mm)
+                body.AppendHybridShape(sweep)
+                try:
+                    part.Update()
+                except Exception:
+                    self._delete_feature(doc, part, sweep)
+                    continue
+                return sweep, part.CreateReferenceFromObject(sweep)
             raise ValueError(
-                f"fold1 (angle={math.degrees(fold1_angle):.1f}deg, bend_radius_mm={bend_radius_mm:.1f}) "
-                f"eats {tangent1:.1f}mm into flat1, leaving less than min_bearing_radius_mm="
-                f"{min_bearing_radius_mm:.1f}mm before point1. Infeasible; not attempting construction."
+                f"bead wall {label}: CATIA could not sweep the extended wall at any "
+                f"extension (angle={angle_deg:.1f}deg). Infeasible; not attempting "
+                "further construction."
             )
-        if fold2_run_mm - tangent2 < min_bearing_radius_mm:
+        raise ValueError(
+            f"bead wall {label}: no draft angle put the top edge at the expected position "
+            f"[{', '.join(observed)}]. Infeasible; not attempting further construction."
+        )
+
+    def _bead_top_offset(self, doc, part, hsf, spa, body, surface_ref, bead, samples):
+        """ビード頂面(基準面のオフセット)を作り、各サンプル点での立ち上がり方向を実測する。
+
+        谷折り面では連続な面法線の符号がパネル間で反転するため、どちら側へ何mm上が
+        頂面なのかを解析的に決め打ちできない(SS6.1のバグ2)。オフセット面自身に
+        「±depth*法線 の点が乗っているか」を問い合わせて符号を確定する。
+
+        samples: [(基準面上の点, そのパネルの法線), ...]
+        """
+        reasons: list[str] = []
+        for orientation in (0, 1):
+            offset = hsf.AddNewOffset(surface_ref, bead.depth_mm, orientation, 0.01)
+            body.AppendHybridShape(offset)
+            try:
+                part.Update()
+            except Exception as exc:
+                reasons.append(f"orientation={orientation}: build failed ({str(exc)[:60]})")
+                self._delete_feature(doc, part, offset)
+                continue
+            ref = part.CreateReferenceFromObject(offset)
+            measurable = spa.GetMeasurable(ref)
+            signs: list[float] = []
+            for base_point, normal in samples:
+                candidates = [
+                    tuple(base_point[i] + sign * bead.depth_mm * normal[i] for i in range(3))
+                    for sign in (1.0, -1.0)
+                ]
+                distances = [
+                    measurable.GetMinimumDistance(probe)
+                    for probe in self._point_refs(part, hsf, body, candidates)
+                ]
+                if distances[0] < self.BEAD_PROBE_TOLERANCE_MM:
+                    signs.append(1.0)
+                elif distances[1] < self.BEAD_PROBE_TOLERANCE_MM:
+                    signs.append(-1.0)
+                else:
+                    reasons.append(
+                        f"orientation={orientation}: built, but the expected top face is "
+                        f"{min(distances):.2f}mm away at sample {len(signs)}"
+                    )
+                    break
+            if len(signs) == len(samples):
+                return offset, ref, signs
+            self._delete_feature(doc, part, offset)
+        raise ValueError(
+            f"bead: could not build a usable offset surface for the bead top "
+            f"(depth={bead.depth_mm:.1f}mm). {'; '.join(reasons)}. "
+            "Infeasible; not attempting further construction."
+        )
+
+    def _apply_corner_relief(
+        self, doc, part, hsf, spa, body, whole, *, panel_frames, half_width_mm,
+        min_bearing_radius_mm, fold_tangents, exclude_side=None,
+    ):
+        """基準面の隅を R=必要最小半径 で丸めて落とす(余肉カット、SS15)。
+
+        カット円弧は端パネルのベアリング平坦区間に解析的に置く(厳密に面上)ので、
+        スプライン->Splitの実証済みプリミティブだけで構成できる。Splitの残す側は
+        probe-and-select(部品中央が残り、元の隅が消えること)。
+        """
+        cuts = plan_corner_relief(
+            panel_frames,
+            half_width_mm=half_width_mm,
+            radius_mm=min_bearing_radius_mm,
+            fold_tangents=fold_tangents,
+            exclude_side=exclude_side,
+        )
+        # keepは締結点1の座面中心(run=0, v=0)。中央パネルの中心はビード部品では
+        # 基準面が除去されてビード頂面になっているため使えない(2026-08-25に実測:
+        # 全ビード部品が余肉カットで棄却されbatchがフランジだけになった)。
+        # 座面中心はビードの逃げ・フランジの根本R・余肉カットのいずれからも守られている。
+        first = panel_frames[0]
+        keep_point = tuple(first.origin[i] for i in range(3))
+        keep_ref = self._point_refs(part, hsf, body, [keep_point])[0]
+        whole_ref = part.CreateReferenceFromObject(whole)
+        for cut in cuts:
+            point_refs = self._point_refs(part, hsf, body, cut.arc_points)
+            arc = hsf.AddNewSpline()
+            arc.SetSplineType(0)
+            arc.SetClosing(0)
+            for ref in point_refs:
+                arc.AddPointWithConstraintExplicit(ref, None, -1.0, 1, None, 0.0)
+            arc.Name = f"corner_relief_{cut.label}"
+            body.AppendHybridShape(arc)
+            part.Update()
+            arc_ref = part.CreateReferenceFromObject(arc)
+            remove_ref = self._point_refs(part, hsf, body, [cut.remove_probe])[0]
+            reasons: list[str] = []
+            done = None
+            for orientation in (1, -1):
+                split = hsf.AddNewHybridSplit(whole_ref, arc_ref, orientation)
+                body.AppendHybridShape(split)
+                try:
+                    part.Update()
+                except Exception as exc:
+                    reasons.append(f"o={orientation:+d}: update failed ({str(exc)[:40]})")
+                    self._delete_feature(doc, part, split)
+                    continue
+                split_ref = part.CreateReferenceFromObject(split)
+                measurable = spa.GetMeasurable(split_ref)
+                kept = measurable.GetMinimumDistance(keep_ref)
+                removed = measurable.GetMinimumDistance(remove_ref)
+                if kept < self.BEAD_PROBE_TOLERANCE_MM and removed > self.BEAD_PROBE_REMOVED_MM:
+                    done = (split, split_ref)
+                    break
+                reasons.append(
+                    f"o={orientation:+d}: keep {kept:.2f}mm, corner still {removed:.2f}mm"
+                )
+                self._delete_feature(doc, part, split)
+            if done is None:
+                raise ValueError(
+                    f"corner relief at {cut.label}: neither split side removed the corner "
+                    f"while keeping the part [{'; '.join(reasons)}]. Infeasible."
+                )
+            whole, whole_ref = done
+        return whole
+
+    def _add_flange_to_surface(
+        self, doc, part, hsf, spa, body, surface, *, flange, panel_frames, half_width_mm,
+        fold_tangents,
+    ):
+        """完成した基準面の側端にフランジを立て、統合済みの形状フィーチャーを返す(SS14)。
+
+        ユーザー指定の工程(2026-08-25)の写像。spike_flange_over_bends.pyで6/6実証済み:
+          ④ 中心線(標本点->スプライン->投影) -> CurveParで側端の根本曲線
+             -> Mode=4・±90度スイープで壁
+          ⑤ 基準面 x 壁の BiTangent(トリム込み)で根本R
+        基準面はフランジ側に extension_mm 広く作られている(build_general_two_pointの
+        side_extension)ので、根本Rが食っても名目幅が残る(③の意図)。
+        """
+        surface_ref = part.CreateReferenceFromObject(surface)
+        plan = plan_flange_on_surface(
+            panel_frames, flange,
+            half_width_mm=half_width_mm, fold_tangents=fold_tangents,
+        )
+
+        # 中心線: ビードと同じ「解析標本点 -> スプライン -> 投影」(SS8.9)
+        point_objs = self._point_refs(part, hsf, body, plan.centreline_points)
+        spline = hsf.AddNewSpline()
+        spline.SetSplineType(0)
+        spline.SetClosing(0)
+        for point_ref in point_objs:
+            spline.AddPointWithConstraintExplicit(point_ref, None, -1.0, 1, None, 0.0)
+        spline.Name = "flange_centreline_spline"
+        body.AppendHybridShape(spline)
+        part.Update()
+        centre = hsf.AddNewProject(part.CreateReferenceFromObject(spline), surface_ref)
+        centre.Normal = True
+        centre.Name = "flange_centreline"
+        body.AppendHybridShape(centre)
+        try:
+            part.Update()
+        except Exception as exc:
             raise ValueError(
-                f"fold2 (angle={math.degrees(fold2_angle):.1f}deg, bend_radius_mm={bend_radius_mm:.1f}) "
-                f"eats {tangent2:.1f}mm into flat2, leaving less than min_bearing_radius_mm="
-                f"{min_bearing_radius_mm:.1f}mm before point2. Infeasible; not attempting construction."
+                "flange: the centreline could not be projected onto the base surface. "
+                f"Infeasible. Original error: {exc}"
+            ) from exc
+        centre_ref = part.CreateReferenceFromObject(centre)
+
+        # 根本曲線: 側端のわずか内側への測地オフセット。向きはプローブで選ぶ
+        side_probe_ref = self._point_refs(part, hsf, body, [plan.side_probe])[0]
+        root_ref = None
+        reasons: list[str] = []
+        for reverse in (False, True):
+            candidate = hsf.AddNewCurvePar(
+                centre_ref, surface_ref, plan.edge_offset_mm, reverse, True
             )
-        ramp_length = math.sqrt(sum((mid_far[i] - mid_near[i]) ** 2 for i in range(3)))
-        if tangent1 + tangent2 > ramp_length:
+            body.AppendHybridShape(candidate)
+            try:
+                part.Update()
+            except Exception as exc:
+                reasons.append(f"reverse={reverse}: update failed ({str(exc)[:40]})")
+                self._delete_feature(doc, part, candidate)
+                continue
+            ref = part.CreateReferenceFromObject(candidate)
+            distance = spa.GetMeasurable(ref).GetMinimumDistance(side_probe_ref)
+            if distance < 0.5:
+                candidate.Name = "flange_root"
+                root_ref = ref
+                break
+            reasons.append(f"reverse={reverse}: {distance:.2f}mm from the flange side")
+            self._delete_feature(doc, part, candidate)
+        if root_ref is None:
             raise ValueError(
-                f"fold1/fold2 tangent lengths ({tangent1:.1f}mm + {tangent2:.1f}mm) exceed the "
-                f"ramp's own length ({ramp_length:.1f}mm) -- the two fillets would overlap on the "
-                "ramp. Infeasible; not attempting construction."
+                f"flange: no parallel-curve direction reached the flange-side edge "
+                f"(offset={plan.edge_offset_mm:.1f}mm) [{'; '.join(reasons)}]. "
+                "Infeasible; not attempting further construction."
             )
 
+        # 壁: ±90度のドラフトスイープ。期待する上端位置に来る向きを選ぶ
+        top_ref = self._point_refs(part, hsf, body, [plan.wall_top_probe])[0]
+        wall_ref = None
+        reasons = []
+        for angle in (90.0, -90.0):
+            sweep = hsf.AddNewSweepLine(root_ref)
+            sweep.Mode = 4
+            sweep.FirstGuideSurf = surface_ref
+            sweep.SetAngle(1, angle)
+            sweep.SetLength(1, flange.height_mm)
+            # 基準面を下へ貫通させる。壁が面に「接している」だけだと根本BiTangentが
+            # 数値的に退化して落ちる(2026-08-25実測: 貫通3mmで失敗12件中4件が回復。
+            # ビードの壁も同じ理由で延長して作り直している、SS6.1)。
+            sweep.SetLength(2, self.FLANGE_WALL_PIERCE_MM)
+            body.AppendHybridShape(sweep)
+            try:
+                part.Update()
+            except Exception as exc:
+                reasons.append(f"{angle:+.0f}deg: sweep failed ({str(exc)[:40]})")
+                self._delete_feature(doc, part, sweep)
+                continue
+            ref = part.CreateReferenceFromObject(sweep)
+            distance = spa.GetMeasurable(ref).GetMinimumDistance(top_ref)
+            if distance < self.BEAD_PROBE_TOLERANCE_MM:
+                sweep.Name = "flange_wall"
+                wall_ref = ref
+                break
+            reasons.append(f"{angle:+.0f}deg: {distance:.2f}mm")
+            self._delete_feature(doc, part, sweep)
+        if wall_ref is None:
+            raise ValueError(
+                f"flange wall: no 90deg sweep put the top edge at the expected position "
+                f"[{', '.join(reasons)}]. Infeasible; not attempting further construction."
+            )
+
+        # 根本R: 基準面 x 壁のBiTangent(トリム込み)。keep=各パネル中央+壁の上端
+        keep_refs = self._point_refs(
+            part, hsf, body, plan.root_keep_points + [plan.wall_keep_point]
+        )
+        remove_refs = self._point_refs(part, hsf, body, [plan.pierce_remove_point])
+        flange_feature, _ref = self._bead_bitangent(
+            doc, part, hsf, spa, body, wall_ref, surface_ref, flange.root_radius_mm,
+            keep_refs, remove_refs, "flange root",
+        )
+        return flange_feature
+
+    def _add_bead_to_surface(
+        self, doc, part, hsf, spa, body, surface, *, bead, panel_frames, half_width_mm,
+        min_bearing_radius_mm, fold_tangents, fold_tilts,
+    ):
+        """完成した基準面の上にビードを載せ、統合済みの形状フィーチャーを返す。
+
+        ユーザー指定の7手順(docs/bead_construction_flowchart.md SS6.3)をそのまま実装する:
+        ①頂面オフセット ②③輪郭曲線 ④壁4枚を個別に掃引 ⑤BiTangent×3で4隅R付きの
+        連続バンド ⑥頂稜線R ⑦足元R。⑤⑥⑦はいずれもトリムを兼ねるので、
+        別途Joinする必要はない。
+        """
+        surface_ref = part.CreateReferenceFromObject(surface)
+        plan = plan_bead_on_surface(
+            panel_frames,
+            bead,
+            inset_mm=2.0 * min_bearing_radius_mm,
+            guide_margin_mm=self.BEAD_GUIDE_MARGIN_MM,
+            half_width_mm=half_width_mm,
+            fold_tangents=fold_tangents,
+            fold_tilts=fold_tilts,
+        )
+        # u x v = n(自由折れ目チェーンの右手系正規直交基底の規約、classify.ChainPanelFrame
+        # と同じ)。傾いた折れ目(a1/a2!=0)のパネルでも、幅方向vそのものは使わず走行方向u
+        # とのcrossだけを見るので、法線は常に正しく求まる。
+        normals = [_normalize(_cross(frame.u, frame.v)) for frame in panel_frames]
+
+        # ① 頂面オフセット + パネルごとの立ち上がり方向
+        wall_samples = [
+            (base, normals[index])
+            for base, index in zip(plan.wall_top_bases, plan.wall_top_panel_index)
+        ]
+        top_samples = [
+            (base, normals[index])
+            for base, index in zip(plan.top_keep_bases, plan.top_panel_index)
+        ]
+        remove_samples = [
+            (base, normals[index])
+            for base, index in zip(plan.top_remove_bases, plan.top_remove_panel_index)
+        ]
+        _top, top_ref, signs = self._bead_top_offset(
+            doc, part, hsf, spa, body, surface_ref, bead, wall_samples + top_samples + remove_samples
+        )
+
+        def lift(samples, sign_offset):
+            return [
+                tuple(
+                    base[i] + signs[sign_offset + k] * bead.depth_mm * normal[i] for i in range(3)
+                )
+                for k, (base, normal) in enumerate(samples)
+            ]
+
+        wall_tops = lift(wall_samples, 0)
+        top_keeps = lift(top_samples, len(wall_samples))
+        top_removes = lift(remove_samples, len(wall_samples) + len(top_samples))
+
+        # ② ビード中心線 = 解析的に求めた標本点をスプラインで結び、基準面へ投影したもの
+        #    (2026-08-24、SS8.9で確定した方式)。
+        #
+        #    旧w平行版は全パネルが共通のwを持つため「単一の平面 x 基準面」の交線1本で
+        #    足りた。自由折れ目チェーンでは各パネルの幅方向(panel1.v/panel_mid.v/
+        #    panel3.v)が互いに異なるため、この方法は使えない。
+        #
+        #    最初に「パネルごとにv法線平面の交線を作ってJoin」を試したが失敗した。
+        #    原因は実機検証で判明: **平面は無限に広がるので、1枚の平面と基準面の交線が
+        #    自分のパネルだけでなく部品全長(実測167.7mm=部品の全長そのもの)を貫く1本の
+        #    曲線になる**。つまりほぼ重なった3本ができ、その重複のためJoinが失敗していた
+        #    (枝分かれではない。各交線は単独ではLength測定可能な健全な単一曲線)。
+        #    4点(p1/fold1/fold2/p2)への最小二乗平面で代用する案も検討したが、ずれが
+        #    ビードの横方向余裕内に収まるのは800サンプル中55%で不十分だった。
+        #
+        #    確定した方式: 中心線が乗るべき位置(各パネルのv=0のu軸)は解析的に厳密に
+        #    分かっているので、曲げフィレットを避けた平坦区間から標本点を採り
+        #    (`plan.centreline_points`)、スプラインで結んでから`AddNewProject`で
+        #    基準面へ落とす。フィレット領域はスプラインの補間+投影に任せる。
+        #    実機検証済み(tools/probe_curvepar_isolate.py): スプライン・投影とも成功し、
+        #    後続の`AddNewCurvePar`もオフセット2/5/10mm x 向き2通り x Euclidean2通りの
+        #    24通り全てで成功した。
+        point_objs = self._point_refs(part, hsf, body, plan.centreline_points)
+        spline = hsf.AddNewSpline()
+        spline.SetSplineType(0)
+        spline.SetClosing(0)
+        for point_ref in point_objs:
+            spline.AddPointWithConstraintExplicit(point_ref, None, -1.0, 1, None, 0.0)
+        spline.Name = "bead_centreline_spline"
+        body.AppendHybridShape(spline)
+        part.Update()
+
+        centreline = hsf.AddNewProject(part.CreateReferenceFromObject(spline), surface_ref)
+        centreline.Normal = True  # 面法線方向へ投影(SetNormalModeというメソッドは存在しない)
+        centreline.Name = "bead_centreline"
+        body.AppendHybridShape(centreline)
+        part.Update()
+        centreline_ref = part.CreateReferenceFromObject(centreline)
+
+        # ③④ ビード外形(フットプリント)の閉曲線を**基準面そのものから**導出し、
+        #     **1回のMode=4スイープ**で4隅R付きの壁バンドにする(2026-08-25、SS8.14)。
+        #
+        #     旧方式は「壁4枚を別々に掃引し、BiTangent×3で隅を丸めて繋ぐ」だったが、
+        #     最終段(2つのL字リボンの統合)が成立しなかった(SS8.10)。次に試した
+        #     「コーナーRを織り込んだ解析点 -> 閉スプライン -> AddNewProject」は、
+        #     曲げフィレットを横切る区間が面から浮いた弦になり、投影が分断して
+        #     Mode=4スイープが全ドラフト角・全長さで落ちた(41件中14件、SS8.13)。
+        #
+        #     確定方式(ユーザー提案): 基準面を両端でSplitし、その断片の境界を
+        #     `AddNewCurvePar`で内側へ一様オフセットする。曲線は構築上つねに面の上に
+        #     あるので、投影という経路が丸ごと消える。実機12件で境界・平行曲線・
+        #     スイープとも全成功した(旧方式は曲線66%・内向きスイープ67%)。
+        trimmed_ref = surface_ref
+        keep_probe_ref = self._point_refs(part, hsf, body, [plan.trim_keep_probe])[0]
+        remove_probe_refs = self._point_refs(part, hsf, body, plan.trim_remove_probes)
+        for section_index, section in enumerate(plan.trim_sections):
+            corner_refs = self._point_refs(part, hsf, body, list(section))
+            plane = hsf.AddNewPlane3Points(*corner_refs)
+            body.AppendHybridShape(plane)
+            part.Update()
+            plane_ref = part.CreateReferenceFromObject(plane)
+            # 残す側は形状依存なので決め打ちせず、ビード区間の内側の点が乗っている
+            # ほうを採る。
+            reasons: list[str] = []
+            kept = None
+            for orientation in (1, -1):
+                split = hsf.AddNewHybridSplit(trimmed_ref, plane_ref, orientation)
+                body.AppendHybridShape(split)
+                try:
+                    part.Update()
+                except Exception as exc:
+                    reasons.append(f"o={orientation:+d}: update failed ({str(exc)[:40]})")
+                    self._delete_feature(doc, part, split)
+                    continue
+                split_ref = part.CreateReferenceFromObject(split)
+                measurable = spa.GetMeasurable(split_ref)
+                distance = measurable.GetMinimumDistance(keep_probe_ref)
+                # removeプローブはその切断で落ちる側の1点だけを見る。両端まとめて見ると、
+                # 1回目のSplitの時点で反対側がまだ残っているため必ず不合格になる。
+                removed = [measurable.GetMinimumDistance(remove_probe_refs[section_index])]
+                if distance < self.BEAD_PROBE_TOLERANCE_MM and min(removed) > self.BEAD_PROBE_REMOVED_MM:
+                    kept = split_ref
+                    break
+                reasons.append(
+                    f"o={orientation:+d}: keep {distance:.2f}mm away, "
+                    f"cut-off side nearest {min(removed):.2f}mm"
+                )
+                self._delete_feature(doc, part, split)
+            if kept is None:
+                raise ValueError(
+                    f"bead: neither side of trim section {section_index} kept the bead run "
+                    f"[{'; '.join(reasons)}]. Infeasible; not attempting further construction."
+                )
+            trimmed_ref = kept
+
+        boundary = hsf.AddNewBoundaryOfSurface(trimmed_ref)
+        boundary.Name = "bead_footprint_boundary"
+        body.AppendHybridShape(boundary)
+        try:
+            part.Update()
+        except Exception as exc:
+            raise ValueError(
+                "bead: could not extract the boundary of the trimmed base surface. "
+                f"Infeasible. Original error: {exc}"
+            ) from exc
+        boundary_ref = part.CreateReferenceFromObject(boundary)
+
+        # 外形は2段の平行曲線で作る(SS13、ユーザー指摘による四隅R対応):
+        #   ①境界を (d + cR) 内側へ -> 長辺±(hf-cR)・キャップstart_run+cRの**尖った**ループ
+        #   ②それを cR **外向き**へ -> 長辺±hf・キャップstart_run・四隅R=cRの閉曲線
+        # 凸角の外向き測地オフセットが四隅を自動的に半径cRの円弧にするので、Joinも
+        # スプラインも端点合わせも不要。掃引後のエッジフィレット(BRep参照、自動化不可
+        # SS4)を避け、コーナー処理が根本・頂稜線フィレットより必ず先行する
+        # (ユーザー指定の工程順)。実機12件中11件で全ドラフト角のスイープが成立
+        # (Join方式は3/8、旧・単段オフセットは四隅が尖ったまま)。
+        # 各段の向き(内側/外側)は形状依存なので、実測プローブで選ぶ。
+        def _parallel_curve(source_ref, offset_mm, probe_refs, tolerance_mm, label,
+                            corner_type=0):
+            reasons = []
+            for reverse in (False, True):
+                candidate = hsf.AddNewCurvePar(source_ref, surface_ref, offset_mm, reverse, True)
+                if corner_type:
+                    # CurveParType: 0=Sharp(既定、接線延長で角を尖らせる) / 1=Round。
+                    # **既定のままだと外向きオフセットでも四隅は尖ったまま延長される**
+                    # (2026-08-25にユーザーが完成品で発見、実測で確認: 尖り角位置→バンド
+                    # 0.00mm。Roundにすると3.95mm≒理論値3.62mmになり円弧中点に乗る)。
+                    candidate.CurveParType = corner_type
+                body.AppendHybridShape(candidate)
+                try:
+                    part.Update()
+                except Exception as exc:
+                    reasons.append(f"reverse={reverse}: update failed ({str(exc)[:40]})")
+                    self._delete_feature(doc, part, candidate)
+                    continue
+                candidate_ref = part.CreateReferenceFromObject(candidate)
+                measurable = spa.GetMeasurable(candidate_ref)
+                distances = [measurable.GetMinimumDistance(ref) for ref in probe_refs]
+                if max(distances) < tolerance_mm:
+                    return candidate, candidate_ref
+                reasons.append(
+                    f"reverse={reverse}: {sum(1 for d in distances if d >= tolerance_mm)}"
+                    f"/{len(distances)}点が外れ 最悪{max(distances):.2f}mm"
+                )
+                self._delete_feature(doc, part, candidate)
+            raise ValueError(
+                f"bead: no parallel-curve direction put the {label} at the planned position "
+                f"(offset={offset_mm:.1f}mm) [{'; '.join(reasons)}]. "
+                "Infeasible; not attempting further construction."
+            )
+
+        inner_probe_ref = self._point_refs(part, hsf, body, [plan.inner_loop_probe])[0]
+        inner_loop, inner_ref = _parallel_curve(
+            boundary_ref,
+            plan.outline_offset_mm + bead.corner_radius_mm,
+            [inner_probe_ref],
+            1.0,  # 内側ループは向きの判別ができれば十分(最終位置は②が保証する)
+            "inner sharp loop",
+        )
+        inner_loop.Name = "bead_inner_loop"
+        outline_probe_refs = self._point_refs(part, hsf, body, plan.outline_probes)
+        outline, outline_ref = _parallel_curve(
+            inner_ref,
+            bead.corner_radius_mm,
+            outline_probe_refs,
+            self.BEAD_PROBE_TOLERANCE_MM,
+            "rounded footprint outline",
+            corner_type=1,
+        )
+        outline.Name = "bead_footprint"
+
+        # 閉曲線を一括で掃引するので壁4枚は同じ向きに倒れる。長辺の左右2点で
+        # 「内側に倒れている」ことを確認して角度を選ぶ。
+        wall_top_refs = self._point_refs(part, hsf, body, wall_tops)
+        _band, band_ref = self._bead_wall(
+            doc, part, hsf, spa, body, outline_ref, surface_ref,
+            wall_top_refs, bead, "band",
+        )
+        root_refs = self._point_refs(part, hsf, body, plan.wall_root_probes)
+
+        # ⑥ 頂稜線R: バンドと頂面。頂面のビード外側が落ちることも要求する。
+        top_keep_refs = self._point_refs(part, hsf, body, top_keeps)
+        top_remove_refs = self._point_refs(part, hsf, body, top_removes)
+        _hat, hat_ref = self._bead_bitangent(
+            doc, part, hsf, spa, body, band_ref, top_ref, bead.ridge_radius_mm,
+            root_refs + top_keep_refs, top_remove_refs, "top ridge",
+        )
+
+        # ⑦ 足元R: 帽子と基準面。基準面はビード直下だけが落ち、外周は全て残るはず。
+        base_keep_refs = self._point_refs(part, hsf, body, plan.base_keep)
+        base_remove_refs = self._point_refs(part, hsf, body, plan.base_remove)
+        bead_feature, _bead_ref = self._bead_bitangent(
+            doc, part, hsf, spa, body, hat_ref, surface_ref, bead.ridge_radius_mm,
+            base_keep_refs + top_keep_refs, base_remove_refs, "foot ridge",
+        )
+        return bead_feature
+
+    def _assemble_general_two_point(
+        self,
+        panel_corner_sets: list[list[Vec3]],
+        fillet_groups: list[tuple[list[Vec3], float]],
+        geometry_label: str,
+        out_dir: str,
+        part_name: str,
+        *,
+        bead: BeadParams | None = None,
+        flange: FlangeParams | None = None,
+        panel_frames: list[BeadPanelFrame] | None = None,
+        half_width_mm: float = 0.0,
+        min_bearing_radius_mm: float = 0.0,
+        fold_tangents: list[tuple[float, float]] | None = None,
+        fold_tilts: list[tuple[float, float]] | None = None,
+    ) -> GeneratedPart:
+        """平坦パネル群をjoinし、フィレットを当ててエクスポートする。
+
+        単曲げ(パネル2枚・折れ目1本)・2曲げ(flat1+ランプ+flat2・折れ目2本)・ビード付き
+        (パネルを5ストリップに分割、SS6.25)で共通。`fillet_groups`は(折れ目中点のリスト,
+        半径)の組で、1組が1つのEdgeFilletフィーチャーになる — ビードのように複数の
+        フィレット列が交差する場合、まとめないとCATIAが交差点を解けない(SS6.25)。
+        """
         doc = self.new_part_document()
         try:
             part = doc.Part
@@ -867,14 +1568,9 @@ class SyntheticPartBuilder:
             body = part.HybridBodies.Add()
             body.Name = f"{part_name}_synthetic"
 
-            flat1 = self.rect_fill(hsf, part, body, flat1_corners)
-            riser = self.rect_fill(hsf, part, body, ramp_corners)
-            flat2 = self.rect_fill(hsf, part, body, flat2_corners)
-            whole = self.join(hsf, part, body, [flat1, riser, flat2])
+            faces = [self.rect_fill(hsf, part, body, corners) for corners in panel_corner_sets]
+            whole = self.join(hsf, part, body, faces)
             part.Update()
-
-            fold1_mid = tuple((ramp_corners[0][i] + ramp_corners[1][i]) / 2 for i in range(3))
-            fold2_mid = tuple((ramp_corners[2][i] + ramp_corners[3][i]) / 2 for i in range(3))
 
             # 2026-08-10発覚(roadmap SS6.20): 任意法線ケースでは、fold1/fold2の折れ角の
             # 数値自体は事前チェック(タンジェント長・R>=4mm等)を満たしていても、2箇所目の
@@ -888,23 +1584,101 @@ class SyntheticPartBuilder:
             # 委ねる。他のステップ(join等)で例外が出た場合は本来のバグの可能性が高いため、
             # ここでは変換せずそのまま送出する。
             try:
-                edge1_ref = self.find_edge_near(doc, part, spa, hsf, body, whole, fold1_mid)
-                whole = self.edge_fillet(part, edge1_ref, bend_radius_mm)
-                body.AppendHybridShape(whole)
-                part.Update()
-
-                edge2_ref = self.find_edge_near(doc, part, spa, hsf, body, whole, fold2_mid)
-                whole = self.edge_fillet(part, edge2_ref, bend_radius_mm)
-                body.AppendHybridShape(whole)
-                part.Update()
+                for fold_mids, radius_mm in fillet_groups:
+                    edge_refs = [
+                        self.find_edge_near(doc, part, spa, hsf, body, whole, fold_mid)
+                        for fold_mid in fold_mids
+                    ]
+                    whole = self.edge_fillet_group(part, edge_refs, radius_mm)
+                    body.AppendHybridShape(whole)
+                    part.Update()
             except Exception as fillet_exc:
                 raise ValueError(
                     f"CATIA edge fillet failed for this specific fold geometry "
-                    f"(fold1={math.degrees(fold1_angle):.1f}deg, fold2={math.degrees(fold2_angle):.1f}deg, "
-                    f"bend_radius_mm={bend_radius_mm:.1f}) -- a known numerically fragile case "
+                    f"({geometry_label}) -- a known numerically fragile case "
                     f"(roadmap SS6.20), not predictable from a Python-side pre-check. "
                     f"Infeasible; not attempting further construction. Original error: {fillet_exc}"
                 ) from fillet_exc
+
+            # ビードは「完成した基準面の上に載せる後処理」(2026-08-24、SS6)。
+            # メイン曲げのフィレットまで終わった面を入力にするので、曲げをまたぐ
+            # 位置でもビードの輪郭が実際の曲面の上を這う。
+            if bead is not None:
+                assert panel_frames is not None, "bead requires panel_frames"
+                # ビード構築中のCATIA側の失敗はInfeasible(ValueError)に変換し、
+                # batch_generate.pyのskip-and-retryに委ねる(roadmap SS6.20と同じ方針)。
+                # 生の例外を漏らすとバッチ全体が止まる。
+                try:
+                    whole = self._add_bead_to_surface(
+                        doc,
+                        part,
+                        hsf,
+                        spa,
+                        body,
+                        whole,
+                        bead=bead,
+                        panel_frames=panel_frames,
+                        half_width_mm=half_width_mm,
+                        min_bearing_radius_mm=min_bearing_radius_mm,
+                        fold_tangents=fold_tangents or [(0.0, 0.0)] * len(panel_corner_sets),
+                        fold_tilts=fold_tilts or [(0.0, 0.0)] * len(panel_corner_sets),
+                    )
+                except ValueError:
+                    raise
+                except Exception as bead_exc:
+                    raise ValueError(
+                        f"CATIA failed while building the bead on this base surface "
+                        f"({geometry_label}). Infeasible; not attempting further "
+                        f"construction. Original error: {bead_exc}"
+                    ) from bead_exc
+
+            # フランジも同じく「完成した基準面の上に載せる後処理」(SS14)。
+            if flange is not None:
+                assert panel_frames is not None, "flange requires panel_frames"
+                try:
+                    whole = self._add_flange_to_surface(
+                        doc,
+                        part,
+                        hsf,
+                        spa,
+                        body,
+                        whole,
+                        flange=flange,
+                        panel_frames=panel_frames,
+                        half_width_mm=half_width_mm,
+                        fold_tangents=fold_tangents or [(0.0, 0.0)] * len(panel_corner_sets),
+                    )
+                except ValueError:
+                    raise
+                except Exception as flange_exc:
+                    raise ValueError(
+                        f"CATIA failed while building the flange on this base surface "
+                        f"({geometry_label}). Infeasible; not attempting further "
+                        f"construction. Original error: {flange_exc}"
+                    ) from flange_exc
+
+            # 余肉カット(SS15、ユーザー指定): 補強付き部品は基準面の隅を
+            # R=必要最小半径で丸めて落とす。フランジ部品は反フランジ側の2隅のみ、
+            # ビード部品は四隅すべて。
+            if bead is not None or flange is not None:
+                assert panel_frames is not None
+                try:
+                    whole = self._apply_corner_relief(
+                        doc, part, hsf, spa, body, whole,
+                        panel_frames=panel_frames,
+                        half_width_mm=half_width_mm,
+                        min_bearing_radius_mm=min_bearing_radius_mm,
+                        fold_tangents=fold_tangents or [(0.0, 0.0)] * len(panel_corner_sets),
+                        exclude_side=flange.side if flange is not None else None,
+                    )
+                except ValueError:
+                    raise
+                except Exception as relief_exc:
+                    raise ValueError(
+                        f"CATIA failed while cutting the corner relief ({geometry_label}). "
+                        f"Infeasible; not attempting further construction. "
+                        f"Original error: {relief_exc}"
+                    ) from relief_exc
 
             part.InWorkObject = whole
             part.Update()

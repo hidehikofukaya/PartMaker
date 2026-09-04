@@ -24,21 +24,29 @@ def test_sample_reinforcement_respects_manufacturing_constraints() -> None:
         )
         assert params.flange_height_mm > 0
         assert 0.0 <= params.reinforcement_direction_deg <= 180.0
-        # フランジ根本Rは中立面R最小4mm(ユーザー製造制約、2026-08-06)を満たし、
-        # かつflange_height_mmを超えない(超えると隣接パネル長を超えて実機で破綻する
-        # ことがSS6.9で判明したため)。thickness_mm=1.6ではflange_heightの下限
-        # (height_ratio下限3.0)でも0.9倍が4mmを上回るため、この組み合わせでは
-        # 常に「真に実行可能」なはず(強制的な最小値マーカーにはならない)。
-        assert MIN_NEUTRAL_PLANE_RADIUS_MM <= params.flange_bend_radius_mm <= 0.9 * params.flange_height_mm + 1e-9
-        assert params.flange_bend_radius_mm <= FLANGE_BEND_RADIUS_RATIO_CAP * 1.6 + 1e-9
+        # フランジ根本Rは中立面R最小(ユーザー製造制約)を満たし、かつflange_height_mmを
+        # 超えない(超えると隣接パネル長を超えて実機で破綻することがSS6.9で判明)。
+        # 2026-08-24にR最小が4→5mmへ上がった結果、thickness=1.6mmでは
+        # FLANGE_BEND_RADIUS_RATIO_CAP*1.6=4.8mm < 5mm となり、真の実行可能上限が
+        # 常にR最小を下回る。この場合サンプラは「あえてR最小ちょうど」を返して
+        # 下流の事前チェックに弾かせる設計なので、そのマーカーを許容する。
+        assert params.flange_bend_radius_mm >= MIN_NEUTRAL_PLANE_RADIUS_MM
+        forced = params.flange_bend_radius_mm == MIN_NEUTRAL_PLANE_RADIUS_MM
+        assert forced or params.flange_bend_radius_mm <= 0.9 * params.flange_height_mm + 1e-9
+        assert forced or params.flange_bend_radius_mm <= FLANGE_BEND_RADIUS_RATIO_CAP * 1.6 + 1e-9
         angles_seen.add(params.flange_angle_deg == FLANGE_ANGLE_DEFAULT_DEG)
         flange_bend_radii.append(params.flange_bend_radius_mm)
 
     # 200件も引けば90度・斜めフランジの両方が出現するはず(既定確率85%)
     assert angles_seen == {True, False}
-    # flange_bend_radius_mmもランダム性が保たれているはず(4mm付近から上限付近まで)
-    assert min(flange_bend_radii) < MIN_NEUTRAL_PLANE_RADIUS_MM + 0.3
-    assert max(flange_bend_radii) > MIN_NEUTRAL_PLANE_RADIUS_MM + 0.3
+    # 【既知の設計衝突・2026-08-24】中立面R最小がR5に上がった結果、板厚1.6mmでは
+    # フランジ根本Rの真の実行可能上限(FLANGE_BEND_RADIUS_RATIO_CAP*1.6 = 4.8mm)が
+    # R5を下回るため、flange_bend_radius_mmは常に強制最小値5.0になりランダム性が無い。
+    # = この板厚ではフランジが常にInfeasibleとして弾かれる、という状態。
+    # フランジは既定で無効(include_flanges=False)なので現状の生成はブロックしないが、
+    # フランジを再度有効にする際は「根本Rは小さく保つ(1〜3×板厚)」という以前の
+    # ユーザー確定方針とR5最小が両立しないため、どちらを採るかの判断が要る。
+    assert set(flange_bend_radii) == {MIN_NEUTRAL_PLANE_RADIUS_MM}
 
 
 def test_sample_reinforcement_flange_bend_radius_forced_to_minimum_when_infeasible() -> None:
