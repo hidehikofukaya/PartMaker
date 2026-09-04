@@ -49,8 +49,15 @@ RIB_BEND_RADIUS_MM = MIN_NEUTRAL_PLANE_RADIUS_MM
 RIB_HALF_WIDTH_RATIO_RANGE = (0.45, 0.75)
 # 折れ線から A / B までの距離を c の何倍にするか。sqrt(3)≒1.73 で正三角形になる。
 RIB_LEG_RATIO_RANGE = (1.2, 2.2)
-# フィレットがシャープへ落ちる遷移帯の幅[mm](リブ幅のすぐ外側)。
+# フィレットがシャープへ落ちる遷移帯の幅[mm]。
 RIB_TAPER_MM = 1.5
+# リブのフットプリントより外側に残すシャープな折れの幅[mm]。
+#
+# **これが無いと稜線フィレットが通らない。**遷移ロフト(円弧->頂点)の退化頂点が
+# リブの角 V1/V2 と同じ点に来るため、フィレットの walking がそこで破綻する
+# (2026-09-04実測: StripeStatus=2 WalkingFailure。最小構成の平板2枚+四面体では
+#  同じ四面体がR2〜R5すべて通るので、原因は四面体ではなく周囲のトポロジー)。
+RIB_SHARP_MARGIN_MM = 2.5
 # 稜線フィレット(中立面R最小)を入れても形が残る最小サイズ。
 MIN_RIB_HALF_WIDTH_MM = 7.0
 MIN_RIB_LEG_MM = 9.0
@@ -62,6 +69,7 @@ class RibParams:
     leg1_mm: float          # a: 折れ線からパネル1側の頂点Aまでの距離
     leg2_mm: float          # b: 折れ線からパネル2側の頂点Bまでの距離
     taper_mm: float         # フィレットがシャープへ落ちる遷移帯の幅
+    sharp_margin_mm: float  # フットプリントより外側に残すシャープな折れの幅
     fold_index: int         # どの曲げに載せるか(0始まり)
 
     @property
@@ -83,7 +91,7 @@ def sample_rib(
     侵さない範囲、中間パネル側は隣の曲げのタンジェント線まで。
     """
     c_hi = min(RIB_HALF_WIDTH_RATIO_RANGE[1] * half_width_mm,
-               half_width_mm - RIB_TAPER_MM - 2.0,
+               half_width_mm - RIB_TAPER_MM - RIB_SHARP_MARGIN_MM - 2.0,
                min(leg_room_mm) / RIB_LEG_RATIO_RANGE[0])
     c_lo = max(MIN_RIB_HALF_WIDTH_MM, RIB_HALF_WIDTH_RATIO_RANGE[0] * half_width_mm)
     if c_hi < c_lo:
@@ -101,6 +109,7 @@ def sample_rib(
         leg1_mm=legs[0],
         leg2_mm=legs[1],
         taper_mm=RIB_TAPER_MM,
+        sharp_margin_mm=RIB_SHARP_MARGIN_MM,
         fold_index=fold_index,
     )
 

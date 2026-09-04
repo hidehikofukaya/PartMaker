@@ -53,6 +53,7 @@ import os
 from OCC.Core.BRep import BRep_Tool
 from OCC.Core.BRepAdaptor import BRepAdaptor_Curve, BRepAdaptor_Surface
 from OCC.Core.BRepAlgoAPI import BRepAlgoAPI_Cut
+from OCC.Core.BRepCheck import BRepCheck_Analyzer
 from OCC.Core.BRepFilletAPI import BRepFilletAPI_MakeFillet
 from OCC.Core.BRepGProp import brepgprop
 from OCC.Core.BRepBuilderAPI import (
@@ -67,7 +68,7 @@ from OCC.Core.BRepFill import brepfill
 from OCC.Core.BRepOffsetAPI import BRepOffsetAPI_ThruSections
 from OCC.Core.BRepPrimAPI import BRepPrimAPI_MakePrism, BRepPrimAPI_MakeRevol
 from OCC.Core.ShapeUpgrade import ShapeUpgrade_UnifySameDomain
-from OCC.Core.GC import GC_MakeArcOfCircle
+from OCC.Core.GC import GC_MakeArcOfCircle, GC_MakeCircle
 from OCC.Core.Interface import Interface_Static
 from OCC.Core.STEPCAFControl import STEPCAFControl_Writer
 from OCC.Core.TDataStd import TDataStd_Name
@@ -101,6 +102,10 @@ MIN_RUNOUT_MM = 3.0
 CUT_TOOL_HALF_DEPTH_MM = 5.0
 # これ未満のエッジが出た部品は捨てる(引継ぎ書 §4.3 のゴミ幾何)。
 MIN_EDGE_LENGTH_MM = 0.05
+# エッジが1本の直線/円弧から外れてよい上限[mm](引継ぎ書 §3.4 ゲートA、0.25t の
+# 最も厳しい側 t=1.0mm に合わせる)。リブの稜線フィレットは頂点ブレンドの境界が
+# 解析曲線にならないことがあり、実測で最大0.797mm外れた(2026-09-04)。
+MAX_PRIMITIVE_DEVIATION_MM = 0.25
 
 
 @dataclasses.dataclass(frozen=True)
@@ -451,6 +456,42 @@ def face_centroid(face) -> Vec3:
     return (centre.X(), centre.Y(), centre.Z())
 
 
+def primitive_deviation(edge, samples: int = 12) -> float:
+    """エッジを1本の直線/円弧に当てたときの最大ずれ[mm](引継ぎ書 §3.4 ゲートA)。
+
+    OCCTの曲線**型**では判定しない — 直線織り面の稜線は幾何的に厳密な直線なのに
+    B-splineとして表現されるため。下流の抽出器はプリミティブ当てはめで判定する。
+    """
+    curve = BRepAdaptor_Curve(edge)
+    u0, u1 = curve.FirstParameter(), curve.LastParameter()
+    points = [curve.Value(u0 + (u1 - u0) * k / samples) for k in range(samples + 1)]
+    first, last = points[0], points[-1]
+    vector = (last.X() - first.X(), last.Y() - first.Y(), last.Z() - first.Z())
+    squared = sum(c * c for c in vector)
+    line = 1e9
+    if squared > 1e-18:
+        line = 0.0
+        for point in points[1:-1]:
+            offset = (point.X() - first.X(), point.Y() - first.Y(), point.Z() - first.Z())
+            t = sum(a * b for a, b in zip(vector, offset)) / squared
+            projected = tuple(first.Coord()[i] + t * vector[i] for i in range(3))
+            line = max(line, math.dist((point.X(), point.Y(), point.Z()), projected))
+    arc = 1e9
+    try:
+        circle = GC_MakeCircle(first, points[len(points) // 2], last).Value()
+        centre, radius = circle.Location(), circle.Radius()
+        normal = circle.Axis().Direction()
+        arc = 0.0
+        for point in points:
+            arc = max(arc, abs(centre.Distance(point) - radius))
+            delta = (point.X() - centre.X(), point.Y() - centre.Y(), point.Z() - centre.Z())
+            arc = max(arc, abs(delta[0] * normal.X() + delta[1] * normal.Y()
+                              + delta[2] * normal.Z()))
+    except Exception:
+        pass
+    return min(line, arc)
+
+
 def _reject_junk_edges(shape, minimum_mm: float = MIN_EDGE_LENGTH_MM) -> None:
     """0.05mm未満のエッジが1本でもあれば部品を捨てる(サンプラーが引き直す)。
 
@@ -470,6 +511,12 @@ def _reject_junk_edges(shape, minimum_mm: float = MIN_EDGE_LENGTH_MM) -> None:
                 raise ValueError(
                     f"the build produced a {length:.4f}mm junk edge "
                     f"(minimum {minimum_mm:.2f}mm). Infeasible; resample."
+                )
+            deviation = primitive_deviation(edge)
+            if deviation > MAX_PRIMITIVE_DEVIATION_MM:
+                raise ValueError(
+                    f"an edge deviates {deviation:.3f}mm from a single line/arc "
+                    f"(gate A allows {MAX_PRIMITIVE_DEVIATION_MM:.2f}mm). Resample."
                 )
         explorer.Next()
 
@@ -565,10 +612,8 @@ class OcctPartBuilder:
             self._sweep_uniform(path, frame, w, section, faces)
 
         shape, faces = self._sew(faces)
-        # NOTE(2026-09-04): リブの稜線を最小Rで丸める要望があるが、OCCTの
-        # `BRepFilletAPI_MakeFillet` はこの開いたシェルに対して**1本のエッジ・半径2mm
-        # でも 0/6 成功**で使えない(`_fillet_rib_edges` に実装は残してある)。
-        # 丸めるなら構築で作るしかないので、形状の作り直しを待ってから繋ぎ直す。
+        if rib is not None:
+            shape, faces = self._fillet_rib_edges(shape, faces)
         shape, faces = self._apply_corner_relief(
             shape, faces, path, start, ey, normal0, w,
             half_width_mm=half_width_mm,
@@ -577,6 +622,10 @@ class OcctPartBuilder:
         )
         shape, faces = self._unify(shape, faces)
         _reject_junk_edges(shape)
+        # リブの稜線フィレットは、通っても無効なシェルを返すことがある
+        # (2026-09-04実測: 300部品中5件)。ここで捨てて引き直す。
+        if not BRepCheck_Analyzer(shape).IsValid():
+            raise ValueError("the sewn shell is not valid. Infeasible; resample.")
 
         os.makedirs(out_dir, exist_ok=True)
         stp_path = os.path.abspath(os.path.join(out_dir, part_name + "_mid.stp"))
@@ -684,7 +733,9 @@ class OcctPartBuilder:
         """
         frames, tangents = plan.panel_frames, plan.fold_tangents
         width = half_width_mm
-        c, taper = rib.half_width_mm, rib.taper_mm
+        # sharp = リブのフットプリント外側に残すシャープな折れ、taper = その外の遷移帯。
+        c, sharp, taper = rib.half_width_mm, rib.sharp_margin_mm, rib.taper_mm
+        outer = c + sharp                      # ここまでシャープ / ここから遷移
         target = min(rib.fold_index, len(frames) - 2)
 
         def pt(index: int, run: float, y: float) -> Vec3:
@@ -723,7 +774,7 @@ class OcctPartBuilder:
         # --- 曲げ ---
         for k, fold in enumerate(folds):
             axis = gp_Ax1(gp_Pnt(*fold["centre"]), gp_Dir(*w))
-            spans = ([(-width, -(c + taper)), (c + taper, width)] if k == target
+            spans = ([(-width, -(outer + taper)), (outer + taper, width)] if k == target
                      else [(-width, width)])
             for index, (y0, y1) in enumerate(spans):
                 edge = BRepBuilderAPI_MakeEdge(
@@ -736,14 +787,14 @@ class OcctPartBuilder:
 
             # 遷移: y=±(c+taper) の円弧から、y=±c の鋭角の点 V へ落とす。
             for side in (-1, 1):
-                y_arc = side * (c + taper)
+                y_arc = side * (outer + taper)
                 start_pt = pt(k, fold["run"] - fold["cut"], y_arc)
                 mid_pt = _rotate_about(start_pt, fold["centre"], w, fold["phi"] / 2.0)
                 end_pt = _rotate_about(start_pt, fold["centre"], w, fold["phi"])
                 arc = GC_MakeArcOfCircle(gp_Pnt(*start_pt), gp_Pnt(*mid_pt), gp_Pnt(*end_pt)).Value()
                 loft = BRepOffsetAPI_ThruSections(False, True)
                 loft.AddVertex(BRepBuilderAPI_MakeVertex(
-                    gp_Pnt(*pt(k, fold["run"], side * c))).Vertex())
+                    gp_Pnt(*pt(k, fold["run"], side * outer))).Vertex())
                 loft.AddWire(BRepBuilderAPI_MakeWire(
                     BRepBuilderAPI_MakeEdge(arc).Edge()).Wire())
                 loft.Build()
@@ -780,6 +831,7 @@ class OcctPartBuilder:
         リブが載る曲げに面する側だけ V 字(タンジェント線 -> V1 -> 頂点 -> V2 -> タンジェント線)。
         """
         c, taper = rib.half_width_mm, rib.taper_mm
+        outer = c + rib.sharp_margin_mm
         if near:
             if k == 0:
                 run = frames[0].near_run_mm
@@ -789,18 +841,19 @@ class OcctPartBuilder:
             cut = base + cuts[k - 1]
             if k - 1 != target:
                 return [pt(k, cut, -width), pt(k, cut, width)]
-            return [pt(k, cut, -width), pt(k, cut, -(c + taper)), pt(k, base, -c),
-                    pt(k, base + rib.leg2_mm, 0.0), pt(k, base, c), pt(k, cut, c + taper),
-                    pt(k, cut, width)]
+            return [pt(k, cut, -width), pt(k, cut, -(outer + taper)), pt(k, base, -outer),
+                    pt(k, base, -c), pt(k, base + rib.leg2_mm, 0.0), pt(k, base, c),
+                    pt(k, base, outer), pt(k, cut, outer + taper), pt(k, cut, width)]
         if k == len(frames) - 1:
             run = frames[k].far_run_mm
             return [pt(k, run, -width), pt(k, run, width)]
         fold_run, cut = frames[k].far_run_mm, cuts[k]
         if k != target:
             return [pt(k, fold_run - cut, -width), pt(k, fold_run - cut, width)]
-        return [pt(k, fold_run - cut, -width), pt(k, fold_run - cut, -(c + taper)),
-                pt(k, fold_run, -c), pt(k, fold_run - rib.leg1_mm, 0.0),
-                pt(k, fold_run, c), pt(k, fold_run - cut, c + taper),
+        return [pt(k, fold_run - cut, -width), pt(k, fold_run - cut, -(outer + taper)),
+                pt(k, fold_run, -outer), pt(k, fold_run, -c),
+                pt(k, fold_run - rib.leg1_mm, 0.0), pt(k, fold_run, c),
+                pt(k, fold_run, outer), pt(k, fold_run - cut, outer + taper),
                 pt(k, fold_run - cut, width)]
 
     def _loft_runout(self, step: _Straight, frame: _Frame, bead_section, flat_section,
@@ -904,9 +957,16 @@ class OcctPartBuilder:
                 added += 1
         if added == 0:
             return shape, faces
-        builder.Build()
-        if not builder.IsDone():
-            raise ValueError("filleting the rib ridges failed. Infeasible; resample.")
+        try:
+            builder.Build()
+            done = builder.IsDone()
+        except RuntimeError as exc:      # OCCTは内部エラーを例外で投げることがある
+            raise ValueError(f"filleting the rib ridges raised ({str(exc)[:60]}). Resample.")
+        if not done:
+            faulty = builder.NbFaultyContours()
+            raise ValueError(
+                f"filleting the rib ridges failed ({faulty} faulty contours). Resample."
+            )
         result = builder.Shape()
         renamed = {}
         for face, name in faces.items():
