@@ -1,0 +1,28 @@
+{
+  "family": "occt14",
+  "chunk": 1,
+  "seed": 20260921,
+  "note": "半幅サンプリング変更の回帰。既存4族+3点族を少数ずつ。",
+  "parts": [
+    {
+      "kind": "bead",
+      "count": 8
+    },
+    {
+      "kind": "flange",
+      "count": 8
+    },
+    {
+      "kind": "rib",
+      "count": 8
+    },
+    {
+      "kind": "plain",
+      "count": 8
+    },
+    {
+      "kind": "three_point",
+      "count": 8
+    }
+  ]
+}

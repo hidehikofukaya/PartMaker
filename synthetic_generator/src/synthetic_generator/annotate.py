@@ -36,8 +36,13 @@ def build_fastening_joint(joint_id: str, part_id: str, point: FasteningPoint, ho
     )
 
 
-def build_two_joint_pair(part_id: str, point1: FasteningPoint, point2: FasteningPoint, hole_diameter_mm: float) -> list[Joint]:
+def build_joints(part_id: str, points, hole_diameter_mm: float) -> list[Joint]:
+    """締結点を並び順どおりに j0001, j0002, ... として起こす(点数は任意)。"""
     return [
-        build_fastening_joint(f"{part_id}_j0001", part_id, point1, hole_diameter_mm),
-        build_fastening_joint(f"{part_id}_j0002", part_id, point2, hole_diameter_mm),
+        build_fastening_joint(f"{part_id}_j{i:04d}", part_id, point, hole_diameter_mm)
+        for i, point in enumerate(points, start=1)
     ]
+
+
+def build_two_joint_pair(part_id: str, point1: FasteningPoint, point2: FasteningPoint, hole_diameter_mm: float) -> list[Joint]:
+    return build_joints(part_id, (point1, point2), hole_diameter_mm)
