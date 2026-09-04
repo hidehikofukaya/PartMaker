@@ -84,7 +84,7 @@ from OCC.Core.TopoDS import topods
 from OCC.Core.XCAFApp import XCAFApp_Application
 from OCC.Core.XCAFDoc import XCAFDoc_DocumentTool
 from OCC.Core.GProp import GProp_GProps
-from OCC.Core.gp import gp_Ax1, gp_Dir, gp_Pnt, gp_Trsf, gp_Vec
+from OCC.Core.gp import gp_Ax1, gp_Dir, gp_Pln, gp_Pnt, gp_Trsf, gp_Vec
 
 from synthetic_generator.bead import BeadParams
 from synthetic_generator.classify import MIN_NEUTRAL_PLANE_RADIUS_MM, FasteningPoint, Vec3
@@ -105,6 +105,12 @@ MIN_RUNOUT_MM = 3.0
 CUT_TOOL_HALF_DEPTH_MM = 5.0
 # これ未満のエッジが出た部品は捨てる(引継ぎ書 §4.3 のゴミ幾何)。
 MIN_EDGE_LENGTH_MM = 0.05
+# マイター点が余白の何倍まで伸びるのを許すか。超える隅は余白の半径で丸める
+# (CADのストローク結合と同じ考え方。実車20の凸包には約45度の隅がある)。
+FLAT_PLATE_MITER_LIMIT = 1.8
+# 隅Rどうしの間に残す直線の最小長。0.05mmまで許すと縫合後に極小の
+# ゴミエッジが出る(実測 0.0134mm)。
+FLAT_PLATE_MIN_STRAIGHT_MM = 1.0
 # エッジが1本の直線/円弧から外れてよい上限[mm](引継ぎ書 §3.4 ゲートA、0.25t の
 # 最も厳しい側 t=1.0mm に合わせる)。リブの稜線フィレットは頂点ブレンドの境界が
 # 解析曲線にならないことがあり、実測で最大0.797mm外れた(2026-09-04)。
@@ -115,9 +121,18 @@ MAX_PRIMITIVE_DEVIATION_MM = 0.25
 MAX_DIHEDRAL_TURN_DEG = 150.0
 # 締結点が面から外れてよい上限[mm]。部品が自分の座面に届かなくなる崩壊を拾う
 # (2026-09-04実測: 300部品中1件のリブ部品で23.9mm外れていた)。
-# 絞りに使う区間の割合(孤立点の座面手前 2*bearing のうち)。残りは一定幅で残す
-# — 実車014も絞りきったあと孤立点まで27.4mm一定。
-TAPER_SHARE = 0.6
+# 帯幅の絞り(実車014型)。絞りは**逃げより手前**、ビードが通っている途中で起こす —
+# 実車014も絞りは中間パネル(ビードあり)で、孤立点のパネルは絞りきった一定幅。
+TAPER_LENGTH_SHARE = 0.80    # 最後の直線区間のうち絞りに使う割合
+TAPER_STEPS = 8              # smoothstep の刻み数(1段だと稜線が両端で折れる)
+TAPER_CLEAR_BEARINGS = 3.0   # 端から何 bearing ぶんを絞りきった平地にするか
+
+
+def _taper_width(s: float, t0: float, t1: float, wide: float, narrow: float) -> float:
+    """絞り区間の位置 s における半幅。smoothstep なので両端で傾きが 0 になり、
+    フランジの稜線が一定幅の区間となめらかに繋がる。"""
+    x = min(1.0, max(0.0, (s - t0) / max(1e-9, t1 - t0)))
+    return wide + (narrow - wide) * x * x * (3.0 - 2.0 * x)
 MAX_FASTENING_OFFSET_MM = 0.1
 
 
@@ -344,6 +359,36 @@ class _Frame:
     def rotated(self, centre: Vec3, axis: Vec3, angle: float) -> "_Frame":
         moved = _add(centre, _rotate(_add(self.origin, _scale(centre, -1.0)), axis, angle))
         return _Frame(moved, _rotate(self.ey, axis, angle), _rotate(self.ez, axis, angle))
+
+
+def _normalize2(a):
+    n = math.hypot(a[0], a[1])
+    return (a[0] / n, a[1] / n) if n > 1e-12 else a
+
+
+def _outward_normal_2d(a, b):
+    """反時計回りの多角形で、辺 a->b の外向き法線。"""
+    return _normalize2((b[1] - a[1], -(b[0] - a[0])))
+
+
+def _convex_hull_2d(points):
+    """反時計回りの凸包(monotone chain)。同一点はまとめる。"""
+    pts = sorted(set((round(x, 6), round(y, 6)) for x, y in points))
+    if len(pts) < 3:
+        return pts
+
+    def turn(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    def build(seq):
+        out: list = []
+        for p in seq:
+            while len(out) >= 2 and turn(out[-2], out[-1], p) <= 0:
+                out.pop()
+            out.append(p)
+        return out
+
+    return build(pts)[:-1] + build(list(reversed(pts)))[:-1]
 
 
 def _edges_of(section: list[Elem], frame: _Frame):
@@ -800,7 +845,11 @@ class OcctPartBuilder:
                 half_width_mm=half_width_mm,
                 narrow_half_width_mm=taper_half_width_mm,
                 min_bearing_radius_mm=min_bearing_radius_mm,
-                lift=self._bead_lift(path, bead, bend_radius_mm), faces=faces)
+                # フランジとビードは同じ側へ出す(2026-09-04のユーザー指摘)。
+                # フランジの向きは「裏側へ折る」規則で決まっているのでそれに従う。
+                lift=self._bead_lift(path, bead, bend_radius_mm,
+                                     forced=flange.direction if flange else None),
+                faces=faces)
         elif bead is not None:
             lift = self._bead_lift(path, bead, bend_radius_mm)
             section, y_breaks = _bead_section(bead, lift, half_width_mm)
@@ -934,18 +983,141 @@ class OcctPartBuilder:
                     frame = self._sweep_segment(piece, frame, w, sec, faces, tag)
             cursor += step.length
 
+    def build_flat_plate(self, points, *, margin_mm: float, corner_radius_mm: float,
+                         out_dir: str, part_name: str) -> GeneratedPart:
+        """平板 x 多点締結(実車031 / 1285-20)。
+
+        外形は**締結点の凸包の各辺を margin だけ外へ平行移動して交わらせ、隅を
+        corner_radius で丸めたもの**。実車の平板も「締結点の配置に沿った多角形 +
+        小さな隅R」で、材料が締結点を余白つきで包む形をしている(実測: 031は
+        余白18〜22mmに対し隅R4.5〜8、20は隅R5)。余白と隅Rは別物なので分けて持つ。
+        辺は直線・隅は円弧だけなのでゲートAは自明に通る。
+        """
+        normal = _normalize(points[0].normal_xyz)
+        seed = (0.0, 0.0, 1.0) if abs(normal[2]) < 0.9 else (1.0, 0.0, 0.0)
+        u = _normalize(_cross(normal, seed))
+        v = _cross(normal, u)
+        origin = points[0].position_xyz
+
+        def to_plane(p):
+            d = _add(p, _scale(origin, -1.0))
+            return (_dot(d, u), _dot(d, v))
+
+        def to_space(xy):
+            return _add(origin, _add(_scale(u, xy[0]), _scale(v, xy[1])))
+
+        hull = _convex_hull_2d([to_plane(p.position_xyz) for p in points])
+        if len(hull) < 3:
+            raise ValueError("the fastening points are collinear; no plate outline. Infeasible.")
+
+        # 各辺を外へ margin 平行移動し、隣どうしの交点(マイター点)を出す。
+        count = len(hull)
+        lines = []
+        for i in range(count):
+            a, b = hull[i], hull[(i + 1) % count]
+            n = _outward_normal_2d(a, b)
+            lines.append(((a[0] + margin_mm * n[0], a[1] + margin_mm * n[1]),
+                          _normalize2((b[0] - a[0], b[1] - a[1])), n))
+        miters = []
+        for i in range(count):
+            p0, d0, n0 = lines[i]
+            p1, d1, n1 = lines[(i + 1) % count]
+            cross = d0[0] * d1[1] - d0[1] * d1[0]
+            if abs(cross) < 1e-9:
+                raise ValueError("the plate outline has a degenerate corner. Infeasible.")
+            t = ((p1[0] - p0[0]) * d1[1] - (p1[1] - p0[1]) * d1[0]) / cross
+            miters.append(((p0[0] + t * d0[0], p0[1] + t * d0[1]), n0, n1))
+
+        section: list = []
+        first_start = None
+        for i in range(count):
+            miter, n0, n1 = miters[i]
+            b = hull[(i + 1) % count]
+            prev_miter = miters[i - 1][0]
+            d = _normalize2((miter[0] - prev_miter[0], miter[1] - prev_miter[1]))
+            nxt = miters[(i + 1) % count][0]
+            d_next = _normalize2((nxt[0] - miter[0], nxt[1] - miter[1]))
+            cos_turn = max(-1.0, min(1.0, d[0] * d_next[0] + d[1] * d_next[1]))
+            interior = math.pi - math.acos(cos_turn)
+            bisector = _normalize2((n0[0] + n1[0], n0[1] + n1[1]))
+            reach = margin_mm / max(1e-9, math.sin(interior / 2.0))
+            if reach <= FLAT_PLATE_MITER_LIMIT * margin_mm:
+                # 通常の隅: マイター点を小さなRで丸める(実車の隅R4.5〜8mm)。
+                back = corner_radius_mm / math.tan(interior / 2.0)
+                arc_start = (miter[0] - back * d[0], miter[1] - back * d[1])
+                arc_end = (miter[0] + back * d_next[0], miter[1] + back * d_next[1])
+                centre = (miter[0] - (corner_radius_mm / math.sin(interior / 2.0)) * bisector[0],
+                          miter[1] - (corner_radius_mm / math.sin(interior / 2.0)) * bisector[1])
+                arc_mid = (centre[0] + corner_radius_mm * bisector[0],
+                           centre[1] + corner_radius_mm * bisector[1])
+            else:
+                # 鋭い隅はマイターが棘になるので、余白の半径でそのまま回り込ませる
+                # (実車031の外形にもR36.5/R49の大きな円弧がある)。
+                arc_start = (b[0] + margin_mm * n0[0], b[1] + margin_mm * n0[1])
+                arc_end = (b[0] + margin_mm * n1[0], b[1] + margin_mm * n1[1])
+                arc_mid = (b[0] + margin_mm * bisector[0], b[1] + margin_mm * bisector[1])
+            if first_start is None:
+                first_start = arc_start
+            else:
+                if math.dist(section[-1][3], arc_start) < FLAT_PLATE_MIN_STRAIGHT_MM:
+                    raise ValueError("the corner fillets eat a whole edge. Infeasible.")
+                section.append(("line", section[-1][3], arc_start, f"edge_{i}"))
+            section.append(("arc", arc_start, arc_mid, arc_end, f"corner_{i}"))
+        if math.dist(section[-1][3], first_start) < FLAT_PLATE_MIN_STRAIGHT_MM:
+            raise ValueError("the corner fillets eat a whole edge. Infeasible.")
+        section.append(("line", section[-1][3], first_start, "edge_0"))
+
+        edges = []
+        for elem in section:
+            if elem[0] == "line":
+                _, a2, b2, _role = elem
+                edges.append(BRepBuilderAPI_MakeEdge(
+                    gp_Pnt(*to_space(a2)), gp_Pnt(*to_space(b2))).Edge())
+            else:
+                _, a2, m2, b2, _role = elem
+                arc = GC_MakeArcOfCircle(gp_Pnt(*to_space(a2)), gp_Pnt(*to_space(m2)),
+                                         gp_Pnt(*to_space(b2))).Value()
+                edges.append(BRepBuilderAPI_MakeEdge(arc).Edge())
+        wire = BRepBuilderAPI_MakeWire()
+        for edge in edges:
+            wire.Add(edge)
+        if not wire.IsDone():
+            raise ValueError("the plate outline does not close into a wire. Infeasible.")
+        face = BRepBuilderAPI_MakeFace(
+            gp_Pln(gp_Pnt(*origin), gp_Dir(*normal)), wire.Wire())
+        if not face.IsDone():
+            raise ValueError("the plate outline does not bound a planar face. Infeasible.")
+
+        shape, faces = self._sew({face.Face(): "plate"})
+        os.makedirs(out_dir, exist_ok=True)
+        stp_path = os.path.abspath(os.path.join(out_dir, part_name + "_mid.stp"))
+        _export_step(shape, faces, stp_path)
+        try:
+            check_shape(_read_step(stp_path), tuple(p.position_xyz for p in points))
+        except ValueError:
+            os.remove(stp_path)
+            raise
+        return GeneratedPart(stp_path=stp_path, catpart_path="",
+                             face_labels=tuple(describe_faces(faces)))
+
     def _sweep_tapered_bead(self, path, frame: _Frame, w: Vec3, bead: BeadParams,
                             flange, *, half_width_mm: float, narrow_half_width_mm: float,
                             min_bearing_radius_mm: float, lift: int, faces) -> None:
-        """実車014型の掃引。
+        """実車014型の掃引。掃引は必ず「対の側 -> 孤立点」の向きで来る。
 
-        掃引は必ず「対の側 -> 孤立点」の向きで来る(族が host_index=0 で固定する)。
+        区間の並び(実車014の実測どおり):
 
-        * ビードは s=0(対の側の板端)から通し、**逃げは孤立点の側だけ**に取る。
-          対の2点は帯の中心線をまたいでいるのでビードはその間を通り、座面を避ける
-          必要がない(実車014実測: 対のパネルは板端までビード深さ3.5mmが一定)。
-        * 帯幅は孤立点の座面の手前で `narrow_half_width_mm` まで絞る
-          (実車014実測: 50.1 -> 27.4mm、絞ったあとは孤立点まで一定)。
+          0 ─ ビード(広い) ─ 曲げ ─ 絞り(ビードは通ったまま) ─ ビード(狭い)
+            ─ 逃げ(ビード->平地) ─ 平地(狭い、孤立点の座面) ─ total
+
+        * ビードは対の側の板端から通す。対の2点は帯の中心線をまたいでいるので
+          ビードはその間を通り、座面を避ける必要がない(実車014実測: 対のパネルは
+          板端までビード深さ3.5mmが一定)。逃げるのは孤立点の側だけ。
+        * 帯幅は**ビードが通っている途中で**絞る。実車014も絞りは中間パネル
+          (ビードあり)で起き、孤立点のパネルは絞りきった一定幅。孤立点の座面に
+          絞りが食い込まないためにも、絞りは逃げより手前に置く必要がある。
+        * 絞りは smoothstep で刻む。1段のルールド面で落とすとフランジの稜線が
+          両端で折れる(2026-09-04のユーザー指摘)。
         """
         wide_bead, y_breaks = _bead_section(bead, lift, half_width_mm)
         footprint = -y_breaks[1]                       # ビードが幅方向に占める半分
@@ -954,69 +1126,78 @@ class OcctPartBuilder:
                 f"the narrow end ({narrow_half_width_mm:.1f}mm half width) cannot hold the "
                 f"bead footprint ({footprint:.1f}mm). Infeasible; not attempting construction."
             )
-        narrow_breaks = [-narrow_half_width_mm, *y_breaks[1:-1], narrow_half_width_mm]
 
         def wrap(section, hw):
             return _with_flange(section, flange, hw) if flange is not None else section
 
-        sec_bead = wrap(wide_bead, half_width_mm)
-        sec_flat = wrap(_flat_section(y_breaks), half_width_mm)
-        sec_narrow = wrap(_flat_section(narrow_breaks), narrow_half_width_mm)
+        def bead_at(hw):
+            return wrap(_bead_section(bead, lift, hw)[0], hw)
 
-        spans = []
-        cursor = 0.0
+        narrow_breaks = [-narrow_half_width_mm, *y_breaks[1:-1], narrow_half_width_mm]
+        sec_bead_wide = wrap(wide_bead, half_width_mm)
+        sec_bead_narrow = bead_at(narrow_half_width_mm)
+        sec_flat_narrow = wrap(_flat_section(narrow_breaks), narrow_half_width_mm)
+
+        spans, cursor = [], 0.0
         for step in path:
             span = step.length if isinstance(step, _Straight) else abs(step.angle) * step.radius
             spans.append((cursor, cursor + span, isinstance(step, _Straight)))
             cursor += span
         total = cursor
-        inset = 2.0 * min_bearing_radius_mm
         runout = max(BEAD_MIN_RUNOUT_MM, RUNOUT_DEPTH_RATIO * bead.depth_mm)
-        s3 = total - inset                 # ビードが平地に戻りきる位置
-        s2 = s3 - runout                   # 逃げの始まり
-        s4 = s3 + TAPER_SHARE * inset      # 絞りきる位置
-        if s2 <= 0.0:
+        # 孤立点は端から最大 bearing だけ手前に置かれ、その周り bearing が平地で要る。
+        # よって端から 3*bearing は絞りきった平地にしておく。
+        s3 = total - TAPER_CLEAR_BEARINGS * min_bearing_radius_mm
+        s2 = s3 - runout
+        # 絞りは最後の直線区間のうち、逃げより手前に取る。
+        last = next((sp for sp in reversed(spans) if sp[2]), None)
+        if last is None or s2 <= last[0]:
             raise ValueError(
-                f"a bead with a {runout:.1f}mm run-out does not fit before the lone bearing "
-                f"area (inset {inset:.1f}mm of {total:.1f}mm). Infeasible."
+                "the bead run-out does not fit in the last straight stretch. Infeasible."
             )
-        # 逃げも絞りも直線区間の中に収まっていること(曲げは剛体断面でしか掃引できない)。
-        for a, b in ((s2, s3), (s3, s4)):
-            if not any(straight and lo - 1e-6 <= a and b <= hi + 1e-6
-                       for lo, hi, straight in spans):
-                raise ValueError(
-                    f"the run-out/taper stretch ({a:.1f}..{b:.1f}mm) straddles a bend. "
-                    "Infeasible; not attempting construction."
-                )
+        available = s2 - last[0]
+        t1 = s2
+        t0 = t1 - TAPER_LENGTH_SHARE * available
+        if t0 <= last[0] + 1e-6:
+            raise ValueError("no room to taper the band before the run-out. Infeasible.")
 
         cursor = 0.0
         for step in path:
             if isinstance(step, _Bend):
                 span = abs(step.angle) * step.radius
-                if cursor + span > s2 + 1e-6:
-                    raise ValueError("a bend falls inside the run-out or taper stretch")
-                frame = self._sweep_segment(step, frame, w, sec_bead, faces,
+                if cursor + span > t0 + 1e-6:
+                    raise ValueError("a bend falls inside the taper or run-out stretch")
+                frame = self._sweep_segment(step, frame, w, sec_bead_wide, faces,
                                             f"bend_{step.fold}")
                 cursor += span
                 continue
             tag = f"panel_{step.panel}"
-            cuts = [c for c in (s2, s3, s4)
-                    if cursor + 1e-9 < c < cursor + step.length - 1e-9]
-            marks = [cursor] + cuts + [cursor + step.length]
-            for i in range(len(marks) - 1):
-                a, b = marks[i], marks[i + 1]
+            # 絞りは smoothstep の刻みで割る。
+            marks = [cursor]
+            for c in (*(t0 + (t1 - t0) * k / TAPER_STEPS for k in range(TAPER_STEPS + 1)),
+                      s2, s3):
+                if cursor + 1e-9 < c < cursor + step.length - 1e-9 and c > marks[-1] + 1e-9:
+                    marks.append(c)
+            marks.append(cursor + step.length)
+            for a, b in zip(marks, marks[1:]):
                 piece = step.scaled(b - a)
                 mid = 0.5 * (a + b)
-                if mid <= s2:
-                    frame = self._sweep_segment(piece, frame, w, sec_bead, faces, tag)
-                elif mid <= s3:      # ビード -> 平地
-                    frame = self._loft_runout(piece, frame, sec_bead, sec_flat,
+                if mid <= t0:
+                    frame = self._sweep_segment(piece, frame, w, sec_bead_wide, faces, tag)
+                elif mid <= t1:
+                    frame = self._loft_runout(
+                        piece, frame, bead_at(_taper_width(a, t0, t1, half_width_mm,
+                                                           narrow_half_width_mm)),
+                        bead_at(_taper_width(b, t0, t1, half_width_mm,
+                                             narrow_half_width_mm)),
+                        rising=False, faces=faces, tag="taper")
+                elif mid <= s2:
+                    frame = self._sweep_segment(piece, frame, w, sec_bead_narrow, faces, tag)
+                elif mid <= s3:
+                    frame = self._loft_runout(piece, frame, sec_bead_narrow, sec_flat_narrow,
                                               rising=False, faces=faces, tag="runout_1")
-                elif mid <= s4:      # 広い平地 -> 絞った平地
-                    frame = self._loft_runout(piece, frame, sec_flat, sec_narrow,
-                                              rising=False, faces=faces, tag="taper")
                 else:
-                    frame = self._sweep_segment(piece, frame, w, sec_narrow, faces, tag)
+                    frame = self._sweep_segment(piece, frame, w, sec_flat_narrow, faces, tag)
             cursor += step.length
 
     # -------------------------------------------------------- リブ(可変半径のコーナーブレンド)
@@ -1175,13 +1356,19 @@ class OcctPartBuilder:
     # -------------------------------------------------------- 実行可能性(曲げ上のR)
 
     @staticmethod
-    def _bead_lift(path, bead: BeadParams, bend_radius_mm: float) -> int:
+    def _bead_lift(path, bead: BeadParams, bend_radius_mm: float,
+                   forced: int | None = None) -> int:
         """ビードの立ち上げ向き(+1 = パネル法線側)。曲げ上ではビード頂部の半径が
         R + sign(折れ角)*lift*深さ になるので、最小半径が最大になる向きを選ぶ。
-        それでも中立面R最小を割るならInfeasible。"""
+        それでも中立面R最小を割るならInfeasible。
+
+        `forced` を渡すとその向きだけを見る。フランジと同居する部品では、両方が
+        同じ側へ出ていないと実物に見えない(2026-09-04のユーザー指摘)。フランジの
+        向きは「裏側へ折る」規則で決まっているので、ビードがそれに合わせる。
+        """
         bends = [s for s in path if isinstance(s, _Bend)]
         best, best_radius = 1, -1e9
-        for lift in (1, -1):
+        for lift in ((forced,) if forced is not None else (1, -1)):
             worst = min(
                 (bend_radius_mm + (1.0 if b.angle > 0 else -1.0) * lift * bead.depth_mm
                  for b in bends),

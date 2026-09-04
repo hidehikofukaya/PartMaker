@@ -32,6 +32,24 @@ from OCC.Core.TopLoc import TopLoc_Location  # noqa: E402
 from OCC.Core.TopoDS import topods  # noqa: E402
 
 VIEWS = ((28, -60), (28, 30), (80, -90), (5, 0))
+AUTO_TILT_DEG = 28.0   # 真正面すぎると立体感が出ないので少し振る
+
+
+def auto_view(tris):
+    """部品が一番よく見える視線(elev, azim)。
+
+    メッシュ点の共分散で一番薄い方向(平板なら法線)を求め、そこから
+    AUTO_TILT_DEG だけ振った向きから見る。固定アングルだと平板が真横になって
+    線にしか見えないことがある。
+    """
+    points = tris.reshape(-1, 3)
+    centred = points - points.mean(axis=0)
+    _values, vectors = np.linalg.eigh(np.cov(centred.T))
+    thin, fat = vectors[:, 0], vectors[:, -1]
+    tilt = math.radians(AUTO_TILT_DEG)
+    d = thin * math.cos(tilt) + fat * math.sin(tilt)
+    d = d / np.linalg.norm(d)
+    return math.degrees(math.asin(max(-1.0, min(1.0, d[2])))), math.degrees(math.atan2(d[1], d[0]))
 
 
 def triangles(path: str):
@@ -93,7 +111,9 @@ def main() -> None:
         fig = plt.figure(figsize=(3.2 * columns, 3.0 * rows), dpi=150)
         for index, path in enumerate(files):
             ax = fig.add_subplot(rows, columns, index + 1, projection="3d")
-            draw(ax, triangles(path), 26, -55, pathlib.Path(path).stem)
+            tris = triangles(path)
+            elev, azim = auto_view(tris)
+            draw(ax, tris, elev, azim, pathlib.Path(path).stem)
     else:
         tris = triangles(files[0])
         fig = plt.figure(figsize=(11, 10), dpi=150)

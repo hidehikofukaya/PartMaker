@@ -652,6 +652,79 @@ def three_point_span_part(rng: random.Random, knobs: Knobs) -> Result | None:
     return None
 
 
+# --- 平板 x 多点締結(実車031 / 1285-20、2026-09-05) -------------------------
+# 実測: どちらも曲げゼロの平板で締結点は4つ、法線は全て同じ。外形は「締結点の配置に
+# 沿った多角形 + 隅R」(031は隅R4.5〜8、20はR5)。面内の広がりは031が87x54mm、
+# 20が63x62mm、点間距離は16〜88mm、板厚1.275〜1.76mm。
+# 掃引モデルに収まる実車部品は19件中4件しかなく、うち2件がこの平板だった。
+FLAT_PLATE_POINT_WEIGHTS = ((4, 0.60), (5, 0.25), (6, 0.15))
+FLAT_PLATE_SPREAD_MM = (55.0, 95.0)        # 面内の広がり(実車 54〜87mm)
+FLAT_PLATE_MIN_DISTANCE_MM = 20.0          # 点間の最小距離(実車の最小は16mm)
+FLAT_PLATE_MARGIN_RATIO = (1.0, 1.8)       # 外形の余白 / 必要平面R(実車は18〜22mm)
+FLAT_PLATE_MIN_TRIANGLE_MM2 = 400.0        # 一直線に近い配置を弾く
+FLAT_PLATE_CORNER_RADIUS_MM = (5.0, 12.0)  # 外形の隅R。余白とは別物(実車は4.5〜8mm)
+
+
+def _plane_basis(normal):
+    seed = (0.0, 0.0, 1.0) if abs(normal[2]) < 0.9 else (1.0, 0.0, 0.0)
+    u = _unit(_cross3(normal, seed))
+    return u, _cross3(normal, u)
+
+
+def _cross3(a, b):
+    return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0])
+
+
+def _unit(a):
+    n = math.sqrt(sum(x * x for x in a))
+    return tuple(x / n for x in a) if n > 1e-12 else a
+
+
+def _largest_triangle_mm2(xy) -> float:
+    """点集合が張る最大の三角形の面積。一直線に近い配置ほど 0 に近づく。"""
+    best = 0.0
+    for i in range(len(xy)):
+        for j in range(i + 1, len(xy)):
+            for k in range(j + 1, len(xy)):
+                a, b, c = xy[i], xy[j], xy[k]
+                best = max(best, abs((b[0] - a[0]) * (c[1] - a[1])
+                                     - (b[1] - a[1]) * (c[0] - a[0])) / 2.0)
+    return best
+
+
+def flat_plate_part(rng: random.Random, knobs: Knobs) -> Result | None:
+    """平板 x 多点締結。曲げゼロ・法線が全点で一致し、外形は締結点の凸包の外側
+    オフセット(隅Rは余白の半径そのもの)。特徴(ビード/フランジ/リブ)は持たない。"""
+    for _ in range(knobs.attempts):
+        try:
+            spec = _draw_spec(rng, knobs, folds=0)
+        except ValueError:
+            continue
+        normal = spec.point1.normal_xyz
+        u, v = _plane_basis(normal)
+        count = _draw_weighted(rng, knobs.fold_weights or FLAT_PLATE_POINT_WEIGHTS)
+        width = rng.uniform(*FLAT_PLATE_SPREAD_MM)
+        height = rng.uniform(*FLAT_PLATE_SPREAD_MM)
+        xy = [(rng.uniform(0.0, width), rng.uniform(0.0, height)) for _ in range(count)]
+        if min(math.dist(a, b) for a in xy for b in xy if a is not b)                 < FLAT_PLATE_MIN_DISTANCE_MM:
+            continue
+        if _largest_triangle_mm2(xy) < FLAT_PLATE_MIN_TRIANGLE_MM2:
+            continue
+        base = spec.point1.position_xyz
+        points = tuple(
+            FasteningPoint(
+                position_xyz=tuple(base[i] + x * u[i] + y * v[i] for i in range(3)),
+                normal_xyz=normal)
+            for x, y in xy)
+        margin = spec.min_bearing_radius_mm * rng.uniform(*FLAT_PLATE_MARGIN_RATIO)
+        return (dataclasses.replace(
+            spec, point1=points[0], point2=points[1], extra_points=(),
+            annotated_points=points, plate_margin_mm=margin, target_folds=0,
+            plate_corner_radius_mm=rng.uniform(*FLAT_PLATE_CORNER_RADIUS_MM)),
+            None, None, None)
+    return None
+
+
 FAMILIES = {
     "bead": bead_part,
     "flange": flange_part,
@@ -660,6 +733,7 @@ FAMILIES = {
     "three_point": three_point_part,
     "three_point_tri": three_point_tri_part,
     "three_point_span": three_point_span_part,
+    "flat_plate": flat_plate_part,
 }
 
 

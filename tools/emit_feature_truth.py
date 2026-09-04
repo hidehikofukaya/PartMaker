@@ -66,8 +66,36 @@ def _flat_polyline(frames, fold_tangents, width_mm: float, samples: int = 7,
     return pts
 
 
+def _build_flat_plate(meta: dict, spec: dict) -> dict:
+    """平板×多点締結(実車031 / 1285-20)。掃引の計画が無いので真値も別立てで出す。"""
+    points = spec.get("annotated_points") or []
+    return {
+        "schema": SCHEMA,
+        "part_id": meta["part_id"],
+        "geometry_label": meta["geometry_label"],
+        "half_width_mm": None,
+        "min_bearing_radius_mm": spec["min_bearing_radius_mm"],
+        "thickness_mm": spec["thickness_mm"],
+        "folds": 0,
+        "panels": 1,
+        "has_inflection": False,
+        "bead": None, "flange": None, "rib": None,
+        "corner_relief": None,
+        "plate": {
+            "joints": len(points),
+            "margin_mm": spec["plate_margin_mm"],
+            "corner_radius_mm": spec.get("plate_corner_radius_mm"),
+            "normal_xyz": list(points[0]["normal_xyz"]) if points else None,
+            "joint_positions_xyz": [list(p["position_xyz"]) for p in points],
+        },
+        "notes": "flat plate: outline is the fastening hull offset outward by margin",
+    }
+
+
 def build(meta: dict) -> dict:
     spec = meta["spec"]
+    if spec.get("plate_margin_mm") is not None:
+        return _build_flat_plate(meta, spec)
     p1 = FasteningPoint(tuple(spec["point1"]["position_xyz"]), tuple(spec["point1"]["normal_xyz"]))
     p2 = FasteningPoint(tuple(spec["point2"]["position_xyz"]), tuple(spec["point2"]["normal_xyz"]))
     flange = FlangeParams(**meta["flange"]) if meta["flange"] else None
