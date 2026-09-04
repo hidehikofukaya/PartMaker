@@ -83,6 +83,7 @@ def build(meta: dict) -> dict:
         fold2_slack_mm=spec["fold2_slack_mm"],
         fold1_tilt_perturbation_rad=spec["fold1_tilt_perturbation_rad"],
         side_extension_mm=side_ext,
+        target_folds=spec.get("target_folds"),
     )
     frames = plan.panel_frames
     global TILTS

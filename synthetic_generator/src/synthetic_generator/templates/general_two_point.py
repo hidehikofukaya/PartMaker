@@ -27,6 +27,7 @@ import math
 import random
 
 from synthetic_generator.classify import (
+    _cross,
     classify,
     MAX_FOLD_ANGLE_DEG,
     MIN_BASE_BEND_RADIUS_MM,
@@ -36,6 +37,7 @@ from synthetic_generator.classify import (
     free_fold_seed,
     rotate_about_axis,
     solve_free_fold,
+    tangent_length_for_bend_angle_rad,
     two_point_frame,
 )
 from synthetic_generator.bead import BeadParams, sample_bead
@@ -46,7 +48,7 @@ from synthetic_generator.flange import (
     plan_flange_on_surface,
     sample_flange,
 )
-from synthetic_generator.general_geometry import check_bead_feasible, plan_general_two_point
+from synthetic_generator.general_geometry import check_bead_feasible, plan_for
 
 # ユーザー確定(2026-08-24): 締結点1つに必要な最小平面は**直径25mm**(=半径12.5mm)。
 # それ以上大きくしても利点は乏しいので、板金の幅は25〜50mmに抑える。
@@ -103,6 +105,20 @@ SECTION_DISTANCE_RANGE_MM = (120.0, 220.0)  # w直交平面内で測った締結
 # (上限が既に排除している領域なので)。入力カバレッジを広げたくなったら、傾き上限と
 # セットで再検討すること。
 MAX_LATERAL_OFFSET_RATIO = 0.10             # |dw| / 断面距離 の上限
+
+# --- 曲げ0/1本の族(2026-09-04、D1) -----------------------------------------
+# ユーザー決定: 短距離帯は「面のねじれ無し・曲げ0〜1回・曲げ角は鋭角にならない」。
+# 外向きの折れ角の上限90度 = パネル同士のなす内角90度以上 = 部品が折り返さない。
+# 曲げ本数の配分(ユーザー決定 2026-09-04): 2曲げ60% / 1曲げ35% / 0曲げ5%。
+# 狙いが外れた場合は実際の本数を params に記録する(ML側の「本数を先に決めない」方針)。
+FOLD_COUNT_WEIGHTS = ((2, 0.60), (1, 0.35), (0, 0.05))
+
+SHORT_REGIME_MAX_TURN_DEG = 90.0
+SHORT_REGIME_MIN_TURN_DEG = 20.0
+# 折れ目から締結点までの余り(座面半径+接線長 に上乗せする長さ)。
+# 締結点間距離はこの2つと折れ角から決まるので、距離はここで制御する。
+SINGLE_FOLD_LEG_SLACK_RANGE_MM = (0.0, 80.0)
+FLAT_RUN_RANGE_MM = (60.0, 220.0)           # 曲げ0本(平板)の締結点間距離
 OFFSET_DISTANCE_RANGE_MM = (120.0, 220.0)   # 法線平行時のフォールバック用
 
 # 中間折れ目の間に最低限残すランプの長さ。slack予算の計算に使う。
@@ -158,6 +174,9 @@ class GeneralTwoJointSpec:
     fold1_slack_mm: float  # 中間折れ目1(fold1)の位置: bearing半径+接線長+この値
     fold2_slack_mm: float  # 同上、fold2側
     fold1_tilt_perturbation_rad: float  # fold1の傾きをfree_fold_seedの既定値から動かす量
+    # 狙いの曲げ本数(2026-09-04、多様性拡張D1)。Noneは従来どおり(2曲げ優先)。
+    # 0/1は「形状を先に引いて締結点を導く」逆向き構築で作られる。
+    target_folds: int | None = None
 
 
 def _random_unit_vector(rng: random.Random) -> Vec3:
@@ -359,6 +378,107 @@ def _sample_point_pair(rng: random.Random, gentle_folds: bool):
     )
 
 
+def draw_fold_count(rng: random.Random) -> int:
+    """`FOLD_COUNT_WEIGHTS` から狙いの曲げ本数を1つ引く。"""
+    roll = rng.random()
+    cumulative = 0.0
+    for folds, weight in FOLD_COUNT_WEIGHTS:
+        cumulative += weight
+        if roll < cumulative:
+            return folds
+    return FOLD_COUNT_WEIGHTS[-1][0]
+
+
+def _sample_sizes(rng: random.Random, thickness_range_mm, hole_diameter_range_mm):
+    """締結点の配置に依らない寸法(板厚・穴径・座面半径・半幅・曲げR)。
+
+    曲げRは半幅の0.9倍を超えられないので、半幅の**後**に引く(sample()と同じ順序)。
+    """
+    thickness = rng.uniform(*thickness_range_mm)
+    hole_diameter = rng.uniform(*hole_diameter_range_mm)
+    bearing_radius = rng.uniform(*MIN_BEARING_RADIUS_RANGE_MM)
+    half_width = min(MAX_HALF_WIDTH_MM, bearing_radius * rng.uniform(*HALF_WIDTH_MARGIN_RATIO_RANGE))
+    max_bend_radius = min(BEND_RADIUS_CAP_MM, 0.9 * half_width)
+    bend_radius = rng.uniform(MIN_BASE_BEND_RADIUS_MM, max(MIN_BASE_BEND_RADIUS_MM, max_bend_radius))
+    return thickness, hole_diameter, bearing_radius, half_width, bend_radius
+
+
+def _orthonormal_pair(rng: random.Random) -> tuple[Vec3, Vec3]:
+    """(法線, その法線に直交する走行方向)をランダムに1組。"""
+    n = _random_unit_vector(rng)
+    while True:
+        guess = _random_unit_vector(rng)
+        along = sum(guess[i] * n[i] for i in range(3))
+        u = tuple(guess[i] - along * n[i] for i in range(3))
+        length = math.sqrt(sum(c * c for c in u))
+        if length > 1e-3:
+            return n, tuple(c / length for c in u)
+
+
+def _sample_single_fold_spec(rng, thickness_range_mm, hole_diameter_range_mm) -> GeneralTwoJointSpec:
+    """曲げ1本の部品を**形状から**引き、締結点を導出する(2026-09-04、D1)。
+
+    点対を引いてから単曲げを解こうとすると、交線が締結点の後方に来る配置ばかり引いて
+    成立率が23〜33%にしかならない(実測)。逆向きに作れば構造的に必ず成立し、
+    `single_fold_layout` は設計した d1/d2/折れ角 を厳密に復元する(往復誤差 2.1e-14)。
+
+    ユーザー決定(2026-09-04)により、折れ角は鋭角にならない範囲(外向き<=90度)で引き、
+    締結点2は折れ目軸 w に直交する平面内に置く(=面のねじれ無し)。
+    """
+    thickness, hole, bearing, half_width, bend_radius = _sample_sizes(
+        rng, thickness_range_mm, hole_diameter_range_mm)
+    n1, u1 = _orthonormal_pair(rng)
+    w = _cross(n1, u1)                      # 折れ目軸(= panel1 の幅方向 v)
+    turn = math.radians(rng.uniform(SHORT_REGIME_MIN_TURN_DEG, SHORT_REGIME_MAX_TURN_DEG))
+    if rng.random() < 0.5:
+        turn = -turn                        # 山折り/谷折りの両方を出す
+    tangent = tangent_length_for_bend_angle_rad(abs(turn), bend_radius)
+    leg1 = bearing + tangent + rng.uniform(*SINGLE_FOLD_LEG_SLACK_RANGE_MM)
+    leg2 = bearing + tangent + rng.uniform(*SINGLE_FOLD_LEG_SLACK_RANGE_MM)
+    u2 = rotate_about_axis(u1, w, turn)
+    n2 = rotate_about_axis(n1, w, turn)
+    p1: Vec3 = (0.0, 0.0, 0.0)
+    fold_point = tuple(p1[i] + leg1 * u1[i] for i in range(3))
+    p2 = tuple(fold_point[i] + leg2 * u2[i] for i in range(3))
+    return GeneralTwoJointSpec(
+        point1=FasteningPoint(position_xyz=p1, normal_xyz=n1),
+        point2=FasteningPoint(position_xyz=p2, normal_xyz=n2),
+        thickness_mm=thickness,
+        hole_diameter_mm=hole,
+        min_bearing_radius_mm=bearing,
+        half_width_mm=half_width,
+        bend_radius_mm=bend_radius,
+        # slackは「座面半径+接線長」からの上乗せ分。2曲げ族と同じ意味で記録する。
+        fold1_slack_mm=leg1 - bearing - tangent,
+        fold2_slack_mm=leg2 - bearing - tangent,
+        fold1_tilt_perturbation_rad=0.0,
+        target_folds=1,
+    )
+
+
+def _sample_flat_spec(rng, thickness_range_mm, hole_diameter_range_mm) -> GeneralTwoJointSpec:
+    """曲げ0本(平板)。法線が平行で、2点が同一平面上にある構成。"""
+    thickness, hole, bearing, half_width, bend_radius = _sample_sizes(
+        rng, thickness_range_mm, hole_diameter_range_mm)
+    n1, u1 = _orthonormal_pair(rng)
+    run = rng.uniform(*FLAT_RUN_RANGE_MM)
+    p1: Vec3 = (0.0, 0.0, 0.0)
+    p2 = tuple(run * u1[i] for i in range(3))
+    return GeneralTwoJointSpec(
+        point1=FasteningPoint(position_xyz=p1, normal_xyz=n1),
+        point2=FasteningPoint(position_xyz=p2, normal_xyz=n1),
+        thickness_mm=thickness,
+        hole_diameter_mm=hole,
+        min_bearing_radius_mm=bearing,
+        half_width_mm=half_width,
+        bend_radius_mm=bend_radius,
+        fold1_slack_mm=0.0,
+        fold2_slack_mm=0.0,
+        fold1_tilt_perturbation_rad=0.0,
+        target_folds=0,
+    )
+
+
 def sample(
     rng: random.Random,
     *,
@@ -367,6 +487,7 @@ def sample(
     gentle_folds: bool = False,
     target_classes: frozenset[str] | set[str] | None = None,
     gentle_target_max_fold_deg: float | None = None,
+    target_folds: int | None = None,
 ) -> GeneralTwoJointSpec:
     """任意の法線・任意の位置の締結点ペアを1組サンプリングする。
 
@@ -383,6 +504,11 @@ def sample(
     18度以下に集中し、20〜30度の帯が薄くなる(prod01実測で3.5%)。この帯を埋めたい
     ときに25〜28度を渡す。
     """
+    if target_folds == 1:
+        return _sample_single_fold_spec(rng, thickness_range_mm, hole_diameter_range_mm)
+    if target_folds == 0:
+        return _sample_flat_spec(rng, thickness_range_mm, hole_diameter_range_mm)
+
     point1, point2 = _sample_point_pair(rng, gentle_folds)
     if target_classes:
         for _ in range(CLASS_SEARCH_ATTEMPTS):
@@ -459,6 +585,7 @@ def sample(
         fold1_slack_mm=fold1_slack,
         fold2_slack_mm=fold2_slack,
         fold1_tilt_perturbation_rad=fold1_tilt_perturbation,
+        target_folds=target_folds,
     )
 
 
@@ -488,23 +615,16 @@ def resolve_bead_slacks(
 
     def feasible(slack1: float, slack2: float, candidate: BeadParams) -> bool:
         try:
-            plan = plan_general_two_point(
-                spec.point1,
-                spec.point2,
-                min_bearing_radius_mm=spec.min_bearing_radius_mm,
-                half_width_mm=spec.half_width_mm,
-                bend_radius_mm=spec.bend_radius_mm,
-                fold1_slack_mm=slack1,
-                fold2_slack_mm=slack2,
-                fold1_tilt_perturbation_rad=spec.fold1_tilt_perturbation_rad,
-            )
-            check_bead_feasible(plan, candidate)
+            check_bead_feasible(
+                plan_for(spec, fold1_slack_mm=slack1, fold2_slack_mm=slack2), candidate)
         except ValueError:
             return False
         return True
 
     if feasible(spec.fold1_slack_mm, spec.fold2_slack_mm, bead):
         return spec, bead
+    # 曲げ0/1本の族は形状を先に引いて作るのでslackが幾何を動かさない。引き直しは無意味。
+    slack_attempts = 0 if spec.target_folds in (0, 1) else slack_attempts
     for _ in range(slack_attempts):
         slack1 = rng.uniform(*FOLD_SLACK_RANGE_MM)
         slack2 = rng.uniform(*FOLD_SLACK_RANGE_MM)
@@ -524,20 +644,10 @@ def resolve_bead_slacks(
 def _flange_feasible(spec: GeneralTwoJointSpec, flange: FlangeParams) -> bool:
     """このspec+フランジで、拡張幅込みの基準面計画とフランジ計画の両方が通るか。"""
     try:
-        plan = plan_general_two_point(
-            spec.point1,
-            spec.point2,
-            min_bearing_radius_mm=spec.min_bearing_radius_mm,
-            half_width_mm=spec.half_width_mm,
-            bend_radius_mm=spec.bend_radius_mm,
-            fold1_slack_mm=spec.fold1_slack_mm,
-            fold2_slack_mm=spec.fold2_slack_mm,
-            fold1_tilt_perturbation_rad=spec.fold1_tilt_perturbation_rad,
-            side_extension_mm=(
-                flange.extension_mm if flange.side < 0 else 0.0,
-                flange.extension_mm if flange.side > 0 else 0.0,
-            ),
-        )
+        plan = plan_for(spec, side_extension_mm=(
+            flange.extension_mm if flange.side < 0 else 0.0,
+            flange.extension_mm if flange.side > 0 else 0.0,
+        ))
         plan_flange_on_surface(
             plan.panel_frames, flange,
             half_width_mm=spec.half_width_mm, fold_tangents=plan.fold_tangents,
@@ -564,16 +674,7 @@ def resolve_reinforcement(
     戻り値Noneは基準面自体が不成立(呼び出し側は次のspecへ)。
     """
     try:
-        plan = plan_general_two_point(
-            spec.point1,
-            spec.point2,
-            min_bearing_radius_mm=spec.min_bearing_radius_mm,
-            half_width_mm=spec.half_width_mm,
-            bend_radius_mm=spec.bend_radius_mm,
-            fold1_slack_mm=spec.fold1_slack_mm,
-            fold2_slack_mm=spec.fold2_slack_mm,
-            fold1_tilt_perturbation_rad=spec.fold1_tilt_perturbation_rad,
-        )
+        plan = plan_for(spec)
     except ValueError:
         return None
 
@@ -585,21 +686,13 @@ def resolve_reinforcement(
         if flange is not None and _flange_feasible(spec, flange):
             return spec, None, flange
         # slackを選び直して再試行(平坦区間不足などはslackの性質、SS12と同じ理屈)
-        for _ in range(slack_attempts):
+        # 曲げ0/1本の族はslackが幾何を動かさないので引き直さない。
+        for _ in range(0 if spec.target_folds in (0, 1) else slack_attempts):
             slack1 = rng.uniform(*FOLD_SLACK_RANGE_MM)
             slack2 = rng.uniform(*FOLD_SLACK_RANGE_MM)
             candidate = dataclasses.replace(spec, fold1_slack_mm=slack1, fold2_slack_mm=slack2)
             try:
-                plan2 = plan_general_two_point(
-                    candidate.point1,
-                    candidate.point2,
-                    min_bearing_radius_mm=candidate.min_bearing_radius_mm,
-                    half_width_mm=candidate.half_width_mm,
-                    bend_radius_mm=candidate.bend_radius_mm,
-                    fold1_slack_mm=slack1,
-                    fold2_slack_mm=slack2,
-                    fold1_tilt_perturbation_rad=candidate.fold1_tilt_perturbation_rad,
-                )
+                plan2 = plan_for(candidate)
             except ValueError:
                 continue
             if max_fold_angle_deg(plan2.panel_frames) > FLANGE_MAX_FOLD_ANGLE_DEG:

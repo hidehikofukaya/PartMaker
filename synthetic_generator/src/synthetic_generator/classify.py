@@ -277,6 +277,7 @@ def single_fold_layout(
     min_bearing_radius_mm: float,
     half_width_mm: float,
     ramp_fold_angles: tuple[float, float],
+    min_excess_rad: float | None = None,
 ) -> SingleFoldLayout | None:
     """単曲げで作るべきケースならそのレイアウトを、そうでなければNoneを返す。
 
@@ -293,7 +294,10 @@ def single_fold_layout(
 
     bend_angle = math.acos(max(-1.0, min(1.0, _dot(u1, u2))))
     excess = ramp_fold_angles[0] + ramp_fold_angles[1] - bend_angle
-    if excess < SINGLE_FOLD_MIN_EXCESS_RAD:
+    # `min_excess_rad`は「2曲げの救済としてのみ単曲げを使う」ゲート。単曲げを
+    # **設計の選択肢として狙う**場合(target_folds=1、2026-09-04)は0以下を渡して外す。
+    threshold = SINGLE_FOLD_MIN_EXCESS_RAD if min_excess_rad is None else min_excess_rad
+    if excess < threshold:
         return None  # 2つの折れが素直にθを分担している = 妥当な2曲げ部品なので触らない
 
     delta = _sub(point2.position_xyz, point1.position_xyz)

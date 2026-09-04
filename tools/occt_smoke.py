@@ -39,11 +39,12 @@ from OCC.Core.gp import gp_Pnt  # noqa: E402
 
 from synthetic_generator.bead import sample_bead  # noqa: E402
 from synthetic_generator.classify import classify  # noqa: E402
-from synthetic_generator.general_geometry import plan_general_two_point  # noqa: E402
+from synthetic_generator.general_geometry import plan_for  # noqa: E402
 from synthetic_generator.occt_build import (  # noqa: E402
     OcctPartBuilder, _Frame, _Straight, _add, _dot, _scale, _build_path,
 )
 from synthetic_generator.templates.general_two_point import (  # noqa: E402
+    draw_fold_count,
     resolve_reinforcement,
 )
 from synthetic_generator.templates.general_two_point import sample as sample_general  # noqa: E402
@@ -113,11 +114,7 @@ def primitive_deviation(edge) -> float:
 
 def bead_probe(spec, bead):
     """経路中央でのビード頂部の意図位置と、その基準面鏡像を返す。"""
-    plan = plan_general_two_point(
-        spec.point1, spec.point2,
-        min_bearing_radius_mm=spec.min_bearing_radius_mm, half_width_mm=spec.half_width_mm,
-        bend_radius_mm=spec.bend_radius_mm, fold1_slack_mm=spec.fold1_slack_mm,
-        fold2_slack_mm=spec.fold2_slack_mm, fold1_tilt_perturbation_rad=0.0)
+    plan = plan_for(spec)
     path, start, w, n0 = _build_path(plan, spec.bend_radius_mm)
     lift = OcctPartBuilder._bead_lift(path, bead, spec.bend_radius_mm)
     total = sum(s.length if isinstance(s, _Straight) else abs(s.angle) * s.radius for s in path)
@@ -180,6 +177,8 @@ def audit(shape) -> dict:
 def main() -> None:
     count = int(sys.argv[1]) if len(sys.argv) > 1 else 12
     seed = int(sys.argv[2]) if len(sys.argv) > 2 else 20260904
+    # 第3引数で曲げ本数を固定できる(D1の検証用)。省略時は配分どおりに引く。
+    want_folds = int(sys.argv[3]) if len(sys.argv) > 3 else None
     out_dir = pathlib.Path(__file__).resolve().parent / "occt_smoke"
     out_dir.mkdir(exist_ok=True)
 
@@ -189,12 +188,14 @@ def main() -> None:
     surfaces_total: dict[str, int] = {}
     curves_total: dict[str, int] = {}
     kinds = {"bead": 0, "flange": 0, "plain": 0}
+    fold_counts: dict[int, int] = {}
     t0 = time.time()
 
     while made < count and tried < count * 200:
         tried += 1
+        folds = want_folds if want_folds is not None else draw_fold_count(rng)
         try:
-            spec = sample_general(rng, gentle_folds=(tried % 3 == 0))
+            spec = sample_general(rng, gentle_folds=(tried % 3 == 0), target_folds=folds)
         except ValueError as exc:
             failures[str(exc)[:60]] = failures.get(str(exc)[:60], 0) + 1
             continue
@@ -215,6 +216,7 @@ def main() -> None:
                 fold1_slack_mm=spec.fold1_slack_mm,
                 fold2_slack_mm=spec.fold2_slack_mm,
                 fold1_tilt_perturbation_rad=0.0,
+                target_folds=spec.target_folds,
                 out_dir=str(out_dir), part_name=name,
                 bead=bead, flange=flange,
             )
@@ -223,6 +225,8 @@ def main() -> None:
             continue
         made += 1
         kinds["bead" if bead else ("flange" if flange else "plain")] += 1
+        actual = len(plan_for(spec).panel_frames) - 1
+        fold_counts[actual] = fold_counts.get(actual, 0) + 1
 
         shape = read_step(part.stp_path)
         info = audit(shape)
@@ -262,6 +266,7 @@ def main() -> None:
     print(f"\n{made} parts / {tried} attempts ({made / max(1, tried):.1%}) in {dt:.1f}s "
           f"= {dt / max(1, made):.2f}s/part", flush=True)
     print(f"kinds: {kinds}")
+    print(f"folds: {dict(sorted(fold_counts.items()))}")
     print(f"surface types: {dict(sorted(surfaces_total.items(), key=lambda kv: -kv[1]))}")
     print(f"curve types:   {dict(sorted(curves_total.items(), key=lambda kv: -kv[1]))}")
     print("top rejections:")

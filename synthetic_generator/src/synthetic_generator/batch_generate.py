@@ -29,9 +29,10 @@ from synthetic_generator.annotation_schema import AnnotationDocument, PartEntry
 from synthetic_generator.reinforcement import ReinforcementParams, sample_reinforcement
 from synthetic_generator.classify import classify
 from synthetic_generator.flange import FlangeParams, chirality_candidates
-from synthetic_generator.general_geometry import plan_general_two_point
+from synthetic_generator.general_geometry import plan_for
 from synthetic_generator.templates.general_two_point import (
     GeneralTwoJointSpec,
+    draw_fold_count,
     resolve_reinforcement,
 )
 from synthetic_generator.templates.general_two_point import sample as sample_general_two_point
@@ -168,6 +169,7 @@ def build_general_part(builder, spec, bead, flange, out_dir: str, part_name: str
             fold1_slack_mm=spec.fold1_slack_mm,
             fold2_slack_mm=spec.fold2_slack_mm,
             fold1_tilt_perturbation_rad=spec.fold1_tilt_perturbation_rad,
+            target_folds=spec.target_folds,
             out_dir=out_dir,
             part_name=part_name,
             bead=bead,
@@ -176,16 +178,7 @@ def build_general_part(builder, spec, bead, flange, out_dir: str, part_name: str
 
     if flange is None:
         return attempt(None), None
-    plan = plan_general_two_point(
-        spec.point1,
-        spec.point2,
-        min_bearing_radius_mm=spec.min_bearing_radius_mm,
-        half_width_mm=spec.half_width_mm,
-        bend_radius_mm=spec.bend_radius_mm,
-        fold1_slack_mm=spec.fold1_slack_mm,
-        fold2_slack_mm=spec.fold2_slack_mm,
-        fold1_tilt_perturbation_rad=spec.fold1_tilt_perturbation_rad,
-    )
+    plan = plan_for(spec)
     last_error: ValueError | None = None
     for candidate in chirality_candidates(flange, plan.panel_frames, spec.bend_radius_mm):
         try:
@@ -262,7 +255,9 @@ def generate_general_batch(
                     gentle_target_max_fold_deg=mid_fold_target,
                 )
             else:
-                spec = sample_general_two_point(rng, gentle_folds=aim_flange)
+                # 曲げ本数は設計変数(2026-09-04、D1)。狙いが外れたら実測値をparamsへ。
+                spec = sample_general_two_point(
+                    rng, gentle_folds=aim_flange, target_folds=draw_fold_count(rng))
             bead: BeadParams | None = None
             flange: FlangeParams | None = None
             if reinforce:
@@ -294,16 +289,7 @@ def generate_general_batch(
         # 持たないため、再現やビード有無の条件付き学習に必要な情報(slack・ビード寸法・
         # 折れ目の傾き実績値)がどこにも残らなかった。specはビルダー成功時の値
         # (リゾルバがslackを差し替えた後)なので、これだけで形状を再構築できる。
-        plan = plan_general_two_point(
-            spec.point1,
-            spec.point2,
-            min_bearing_radius_mm=spec.min_bearing_radius_mm,
-            half_width_mm=spec.half_width_mm,
-            bend_radius_mm=spec.bend_radius_mm,
-            fold1_slack_mm=spec.fold1_slack_mm,
-            fold2_slack_mm=spec.fold2_slack_mm,
-            fold1_tilt_perturbation_rad=spec.fold1_tilt_perturbation_rad,
-        )
+        plan = plan_for(spec)
         params_dir = out_dir / "params"
         params_dir.mkdir(parents=True, exist_ok=True)
         (params_dir / f"{part_id}.json").write_text(
@@ -312,6 +298,8 @@ def generate_general_batch(
                     "part_id": part_id,
                     "attempts_used": attempt + 1,
                     "geometry_label": plan.geometry_label,
+                    # 実際の曲げ本数(狙いが外れても実測値を残す)
+                    "folds": len(plan.panel_frames) - 1,
                     "fold_tilts_deg": [
                         [math.degrees(a), math.degrees(b)] for a, b in plan.fold_tilts
                     ],

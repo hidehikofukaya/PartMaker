@@ -336,12 +336,12 @@ def _build_path(plan, bend_radius_mm: float) -> tuple[list, Vec3, Vec3, Vec3]:
     tilts = plan.fold_tilts
     normals = [_normalize(_cross(f.u, f.v)) for f in frames]
 
-    # 折れ目軸(解析式)。全ての折れ目で共通のはず。
+    # 折れ目軸(解析式)。全ての折れ目で共通のはず。曲げ0本(平板)なら幅方向をそのまま使う。
     axes = []
     for k in range(len(frames) - 1):
         a = tilts[k][1]
         axes.append(_normalize(_add(_scale(frames[k].v, math.cos(a)), _scale(frames[k].u, math.sin(a)))))
-    w = axes[0]
+    w = axes[0] if axes else frames[0].v
     if _dot(w, frames[0].v) < 0.0:
         w = _scale(w, -1.0)
     for axis in axes[1:]:
@@ -476,6 +476,7 @@ class OcctPartBuilder:
         fold1_slack_mm: float,
         fold2_slack_mm: float,
         fold1_tilt_perturbation_rad: float = 0.0,
+        target_folds: int | None = None,
         out_dir: str,
         part_name: str,
         bead: BeadParams | None = None,
@@ -500,6 +501,7 @@ class OcctPartBuilder:
             fold1_slack_mm=fold1_slack_mm,
             fold2_slack_mm=fold2_slack_mm,
             fold1_tilt_perturbation_rad=0.0,
+            target_folds=target_folds,
         )
 
         path, start, w, normal0 = _build_path(plan, bend_radius_mm)
