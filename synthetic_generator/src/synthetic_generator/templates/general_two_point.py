@@ -48,8 +48,18 @@ from synthetic_generator.flange import (
     plan_flange_on_surface,
     sample_flange,
 )
-from synthetic_generator.general_geometry import check_bead_feasible, plan_for
-from synthetic_generator.rib import RibParams, rib_fits, sample_rib
+from synthetic_generator.general_geometry import (
+    bead_room_mm,
+    check_bead_feasible_occt,
+    path_length_mm,
+    plan_for,
+)
+from synthetic_generator.rib import (
+    RIB_BEND_RADIUS_MM,
+    RIB_MIN_FOLD_ANGLE_DEG,
+    RibParams,
+    sample_rib,
+)
 
 # ユーザー確定(2026-08-24): 締結点1つに必要な最小平面は**直径25mm**(=半径12.5mm)。
 # それ以上大きくしても利点は乏しいので、板金の幅は25〜50mmに抑える。
@@ -114,10 +124,7 @@ MAX_LATERAL_OFFSET_RATIO = 0.10             # |dw| / 断面距離 の上限
 # 狙いが外れた場合は実際の本数を params に記録する(ML側の「本数を先に決めない」方針)。
 FOLD_COUNT_WEIGHTS = ((2, 0.60), (1, 0.35), (0, 0.05))
 
-# フランジ対象外(最大折れ角>20度)の部品のうち、ビードではなくリブを狙う割合。
-# ビードは長い部品にしか載らないので、これが0だと短距離帯が無補強のままになる
-# (実測: 60-100mm帯で84%が無補強)。逆に1.0にすると長い部品のビードが消える。
-RIB_SHARE_AMONG_NON_FLANGE = 0.45
+
 
 SHORT_REGIME_MAX_TURN_DEG = 90.0
 SHORT_REGIME_MIN_TURN_DEG = 20.0
@@ -621,8 +628,9 @@ def resolve_bead_slacks(
 
     def feasible(slack1: float, slack2: float, candidate: BeadParams) -> bool:
         try:
-            check_bead_feasible(
-                plan_for(spec, fold1_slack_mm=slack1, fold2_slack_mm=slack2), candidate)
+            check_bead_feasible_occt(
+                plan_for(spec, fold1_slack_mm=slack1, fold2_slack_mm=slack2),
+                candidate, spec.bend_radius_mm)
         except ValueError:
             return False
         return True
@@ -663,16 +671,33 @@ def _flange_feasible(spec: GeneralTwoJointSpec, flange: FlangeParams) -> bool:
     return True
 
 
-def _resolve_rib(rng: random.Random, spec: GeneralTwoJointSpec, plan) -> RibParams | None:
-    """この基準面に載るリブを返す(載らなければNone)。走行方向の余地はビルダー側が見る。"""
-    folds = len(plan.panel_frames) - 1
+def _resolve_rib(rng: random.Random, spec: GeneralTwoJointSpec):
+    """リブ付きのspec(曲げRを最小に固定)とリブを返す。載らなければNone。
+
+    リブ部品は基準面の曲げRを中立面R最小(5mm)に固定する — ユーザー指定の工程
+    「シャープな折れのままリブを作り、そのあと最小Rでフィレット」に対応する。
+    Rが変わると接線長も変わるので、**計画を引き直してから**リブを引く。
+    """
+    candidate = dataclasses.replace(spec, bend_radius_mm=RIB_BEND_RADIUS_MM)
+    try:
+        plan = plan_for(candidate)
+    except ValueError:
+        return None
+    if max_fold_angle_deg(plan.panel_frames) < RIB_MIN_FOLD_ANGLE_DEG:
+        return None
+    _total, straights = path_length_mm(plan, candidate.bend_radius_mm)
+    index = 0 if len(straights) <= 2 else rng.randrange(len(straights) - 1)
+    # 頂点A/Bが載る2つの直線区間。座面(2×bearing半径)を侵さない範囲に収める。
+    inset = 2.0 * candidate.min_bearing_radius_mm
+    runs = (straights[index] - (inset if index == 0 else 0.0),
+            straights[index + 1] - (inset if index + 1 == len(straights) - 1 else 0.0))
+    if min(runs) <= 1.0:
+        return None
     for _ in range(8):
-        rib = sample_rib(
-            rng, half_width_mm=spec.half_width_mm,
-            bend_radius_mm=spec.bend_radius_mm, fold_count=folds,
-        )
-        if rib is not None and rib_fits(rib, plan.panel_frames, half_width_mm=spec.half_width_mm):
-            return rib
+        rib = sample_rib(rng, half_width_mm=candidate.half_width_mm,
+                         fold_count=len(plan.panel_frames) - 1, flat_runs_mm=runs)
+        if rib is not None:
+            return candidate, dataclasses.replace(rib, fold_index=index)
     return None
 
 
@@ -725,21 +750,24 @@ def resolve_reinforcement(
                 return candidate, None, flange, None
         # フランジ不成立 -> ビードへフォールバック(ユーザー指定の使い分け)
 
-    # ビードとリブの使い分け(2026-09-04、D3/D4): ビードは中心線上に
-    # 「2×座面半径 + ランアウト + 本体」を要求するので短い部品には載らない。
-    # 割合で先に狙いを決め、駄目ならもう一方へ落とす(1部品1補強、ユーザー決定4)。
-    prefer_rib = rng.random() < RIB_SHARE_AMONG_NON_FLANGE
-    if prefer_rib:
-        rib = _resolve_rib(rng, spec, plan)
-        if rib is not None:
-            return spec, None, None, rib
+    # ビードが第一候補。リブは**ビードが置けないときだけ**の代替で、かつ曲げが
+    # ある程度きついこと(ユーザー指定 2026-09-04)。
     bead = sample_bead(rng, spec.half_width_mm)
     resolved = resolve_bead_slacks(rng, spec, bead)
     if resolved is not None:
         new_spec, new_bead = resolved
         return new_spec, new_bead, None, None
-    if not prefer_rib:
-        rib = _resolve_rib(rng, spec, plan)
-        if rib is not None:
-            return spec, None, None, rib
-    return None
+
+    # 「締結点が近すぎてビードが置けない」は**構造的に**判定する(ビード寸法の
+    # サンプリング運で決めない)。曲げの内角を補強する特徴なので折れ角の下限も要る。
+    too_close = bead_room_mm(plan, spec.bend_radius_mm) < 0.0
+    if too_close:
+        resolved_rib = _resolve_rib(rng, spec)
+        if resolved_rib is not None:
+            rib_spec, rib = resolved_rib
+            return rib_spec, None, None, rib
+
+    # 締結点が近すぎて何も載らない構成。**部品自体は作る**(補強なし)。
+    # これがユーザーの言う「特徴を持てない例外」で、ここで None を返して
+    # 引き直すと「短くて曲げが緩い」構成が学習データから丸ごと消えてしまう。
+    return spec, None, None, None

@@ -396,6 +396,82 @@ def _plan_flat(
     )
 
 
+# ビードが中心線上に要求する長さ(occt_build と同じ規則。ここが唯一の定義)。
+BEAD_MIN_RUNOUT_MM = 3.0
+BEAD_MIN_BODY_MM = 5.0
+
+
+def path_length_mm(plan: GeneralTwoPointPlan, bend_radius_mm: float) -> tuple[float, list[float]]:
+    """中心線の全長と、各直線区間(平坦区間)の長さ。曲げは弧長 R*|角度|。"""
+    frames, tangents = plan.panel_frames, plan.fold_tangents
+    straights = []
+    total = 0.0
+    for k, frame in enumerate(frames):
+        near_cut, far_cut = tangents[k]
+        length = (frame.far_run_mm - far_cut) - (frame.near_run_mm + near_cut)
+        straights.append(length)
+        total += length
+        if k < len(frames) - 1:
+            a = _normalize(_cross(frame.u, frame.v))
+            b = _normalize(_cross(frames[k + 1].u, frames[k + 1].v))
+            angle = math.acos(max(-1.0, min(1.0, _dot(a, b))))
+            total += bend_radius_mm * angle
+    return total, straights
+
+
+def bead_room_mm(plan: GeneralTwoPointPlan, bend_radius_mm: float) -> float:
+    """ビード本体に使える中心線の長さ[mm]。負なら**構造的に**ビードが置けない。
+
+    ビードは両端に 2×座面半径 の平地(座面)と、その内側にランアウトを要求する。
+    「締結点が近すぎてビードが置けない」の判定はここ一箇所で行う(リブを作る条件、
+    ユーザー指定 2026-09-04)。ビード寸法のサンプリング運によらない構造的な判定。
+    """
+    total, straights = path_length_mm(plan, bend_radius_mm)
+    inset = 2.0 * plan.min_bearing_radius_mm
+    room_for_runout = min(straights[0], straights[-1]) - inset - 1.0
+    if room_for_runout < BEAD_MIN_RUNOUT_MM:
+        return -1.0
+    return total - 2.0 * inset - 2.0 * BEAD_MIN_RUNOUT_MM - BEAD_MIN_BODY_MM
+
+
+def check_bead_feasible_occt(plan: GeneralTwoPointPlan, bead: BeadParams,
+                             bend_radius_mm: float) -> None:
+    """OCCTバックエンドで実際に要る条件だけを見る(通らなければValueError)。
+
+    CATIA版の `check_bead_feasible` は「全パネルに平坦なビード区間があること」を
+    要求する。これは probe-and-select 構築のための条件で、断面掃引には要らない
+    (実測: これが原因で1500件中210件が「ビードの余地はあるのに不成立」になり、
+    無補強が14.5%まで増えていた。2026-09-04)。ここでは occt_build が実際に
+    使う条件だけを、同じ数式で判定する。
+    """
+    theta = math.radians(bead.wall_angle_deg)
+    setback = bead.ridge_radius_mm * math.tan(theta / 2.0)
+    if bead.top_width_mm / 2.0 - setback <= 0.1:
+        raise ValueError("bead top ridge fillets consume the whole top width. Infeasible.")
+    if bead.half_footprint_mm + setback > plan.half_width_mm - 0.5:
+        raise ValueError("bead footprint does not fit in the half width. Infeasible.")
+    if bead_room_mm(plan, bend_radius_mm) < 0.0:
+        raise ValueError("no room on the centreline for a bead. Infeasible.")
+    # 曲げ上のビード頂部の半径 R + sign(角度)*lift*深さ。向きは有利なほうを選べる。
+    frames = plan.panel_frames
+    worst = -1e9
+    for lift in (1.0, -1.0):
+        radii = []
+        for a, b in zip(frames, frames[1:]):
+            na = _normalize(_cross(a.u, a.v))
+            nb = _normalize(_cross(b.u, b.v))
+            axis = _cross(na, nb)
+            sign = 1.0 if _dot(axis, _cross(a.u, a.v)) >= 0 else -1.0  # 符号は下で厳密化
+            radii.append(bend_radius_mm - bead.depth_mm)  # 最悪ケース(凹側)
+        worst = max(worst, min(radii) if radii else bend_radius_mm)
+    if worst < MIN_NEUTRAL_PLANE_RADIUS_MM:
+        raise ValueError(
+            f"a bead {bead.depth_mm:.1f}mm deep on a bend of R={bend_radius_mm:.1f}mm leaves "
+            f"{worst:.1f}mm at the top, below the {MIN_NEUTRAL_PLANE_RADIUS_MM:.1f}mm minimum. "
+            "Infeasible."
+        )
+
+
 def plan_for(spec, *, fold1_slack_mm=None, fold2_slack_mm=None,
              side_extension_mm: tuple[float, float] = (0.0, 0.0)) -> GeneralTwoPointPlan:
     """specから計画を作る薄いラッパ(同じ8引数の呼び出しが6箇所に散っていたのを集約、

@@ -27,9 +27,12 @@ from synthetic_generator.templates.general_two_point import sample as sample_gen
 def _build(rng, out_dir, name, want):
     """`want` ("bead" / "flange" / "rib" / None) の部品を1つ作る。作れなければNone。"""
     builder = OcctPartBuilder()
-    for _ in range(400):
+    for _ in range(2000):
         try:
-            spec = sample_general(rng, gentle_folds=(want == "flange"))
+            # リブは「締結点が近すぎてビードが置けない」ときだけ出るので、短い部品が
+            # 出やすい単曲げ族を狙う(そうしないと試行のほとんどがビードになる)。
+            spec = sample_general(rng, gentle_folds=(want == "flange"),
+                                  target_folds=1 if want == "rib" else None)
         except ValueError:
             continue
         bead = flange = rib = None
@@ -62,7 +65,7 @@ def _build(rng, out_dir, name, want):
 @pytest.mark.parametrize("want", ["bead", "flange", "rib", None])
 def test_occt_part_is_geometrically_sound(tmp_path, want):
     made = _build(random.Random(4242), tmp_path, f"test_{want}", want)
-    assert made is not None, f"could not sample a {want} part in 400 attempts"
+    assert made is not None, f"could not sample a {want} part in 2000 attempts"
     part, spec, _bead, _flange, _rib = made
 
     shape = read_step(part.stp_path)

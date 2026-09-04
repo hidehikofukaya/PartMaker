@@ -28,7 +28,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "synthetic_generator" / "src"))
 
-from synthetic_generator.bead import BeadParams, _cross, _normalize, plan_bead_on_surface  # noqa: E402
+from synthetic_generator.bead import BeadParams, _cross, _normalize  # noqa: E402
 from synthetic_generator.classify import FasteningPoint  # noqa: E402
 from synthetic_generator.corner_relief import plan_corner_relief  # noqa: E402
 from synthetic_generator.flange import FlangeParams, plan_flange_on_surface  # noqa: E402
@@ -148,17 +148,18 @@ def build(meta: dict) -> dict:
         bead = BeadParams(**meta["bead"])
         inset = 2.0 * spec["min_bearing_radius_mm"]
         run_clip = (frames[0].near_run_mm + inset, frames[-1].far_run_mm - inset)
-        bplan = plan_bead_on_surface(
-            frames, bead, inset_mm=2.0 * spec["min_bearing_radius_mm"],
-            guide_margin_mm=20.0, half_width_mm=hw,
-            fold_tangents=plan.fold_tangents, fold_tilts=plan.fold_tilts)
+        # OCCT版は `plan_bead_on_surface`(CATIAのprobe-and-select用)を使わない。
+        # あれは「全パネルに平坦なビード区間があること」を要求するが、断面掃引には
+        # 不要な条件で、実際に作れるビードまで落としてしまう(2026-09-04)。
+        centreline = _flat_polyline(frames, plan.fold_tangents, 0.0, clip=run_clip)
         out["bead"] = {
             **meta["bead"],
             "half_footprint_mm": bead.half_footprint_mm,
             "wall_run_mm": bead.wall_run_mm,
             "wall_slant_mm": bead.wall_slant_mm,
             "ridge_setback_mm": bead.ridge_setback_mm,
-            "centreline": [list(p) for p in bplan.centreline_points],
+            "inset_mm": inset,
+            "centreline": centreline,
             # 中心線からの測地オフセット。抽出辺の距離がこれに一致すれば当該稜線
             # 稜線フィレットの**接線**位置。シャープ角から後退量 R*tan(θ/2) だけずれる:
             # 足元は外へ(基準面上)、頂稜線は内へ(頂面上)。抽出器の bend_line は
@@ -178,8 +179,8 @@ def build(meta: dict) -> dict:
             # 頂稜線は基準面から depth だけ法線方向に持ち上がる。向きは構築時に
             # CATIA側のプローブで決まるため params に残っていない -> 両符号を出す
             "top_ridge_lift_mm": bead.depth_mm,
-            "run_out": {"start": list(bplan.trim_sections[0][0]),
-                        "end": list(bplan.trim_sections[1][0])},
+            "run_out": {"start": centreline[0] if centreline else None,
+                        "end": centreline[-1] if centreline else None},
         }
     if flange:
         fplan = plan_flange_on_surface(
@@ -199,24 +200,20 @@ def build(meta: dict) -> dict:
             "wall_top_probe": list(fplan.wall_top_probe),
         }
 
-    # --- リブ(曲げをまたぐ菱形のくぼみ、2026-09-04 D3) ---
+    # --- リブ(内角を橋渡しする三角形2枚、2026-09-04 D3改訂) ---
     if meta.get("rib"):
         rib = RibParams(**meta["rib"])
         index = min(rib.fold_index, max(0, len(out["folds"]) - 1))
         fold = out["folds"][index] if out["folds"] else None
         out["rib"] = {
             **meta["rib"],
-            "wall_run_mm": rib.wall_run_mm,
-            "ridge_setback_mm": rib.ridge_setback_mm,
-            "half_footprint_mm": rib.half_footprint_mm,
-            "nose_length_mm": rib.nose_length_mm,
-            # 立ち上げ向きは凹側に固定(構築時の規則そのもの)。符号は fold の concave_side。
-            "lift_side": fold["concave_side"] if fold else 0,
-            # 領域判定用: この折れ目のシャープ線からこの距離までがリブ由来
-            # (中心線に沿っては曲げ弧の端からnose、幅方向は half_footprint + setback)。
+            # 中立面に出るのは四面体 V1-V2-A-B のうち V1AB と V2AB の2面。稜A-Bは曲げ線に直交。
+            "fold_id": index,
             "sharp_line": fold["sharp_line"] if fold else None,
-            "reach_along_mm": rib.nose_length_mm,
-            "reach_across_mm": rib.half_footprint_mm + rib.ridge_setback_mm,
+            "concave_side": fold["concave_side"] if fold else 0,
+            # 領域判定用: 曲げ線から走行方向/幅方向にこの距離まで
+            "reach_along_mm": rib.reach_mm,
+            "reach_across_mm": rib.half_width_mm + rib.taper_mm,
         }
 
     # --- 余肉カット(外形側の特徴) ---

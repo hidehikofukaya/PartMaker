@@ -186,7 +186,7 @@ def test_resolve_bead_slacks_returns_feasible_combination() -> None:
     import random
 
     from synthetic_generator.bead import sample_bead
-    from synthetic_generator.general_geometry import check_bead_feasible, plan_general_two_point
+    from synthetic_generator.general_geometry import check_bead_feasible_occt, plan_general_two_point
     from synthetic_generator.templates.general_two_point import (
         resolve_bead_slacks,
         sample as sample_general,
@@ -214,7 +214,7 @@ def test_resolve_bead_slacks_returns_feasible_combination() -> None:
             fold2_slack_mm=new_spec.fold2_slack_mm,
             fold1_tilt_perturbation_rad=new_spec.fold1_tilt_perturbation_rad,
         )
-        check_bead_feasible(plan, new_bead)  # 通らなければValueErrorで落ちる
+        check_bead_feasible_occt(plan, new_bead, spec.bend_radius_mm)  # 通らなければValueErrorで落ちる
     assert resolved_count > 0, "40試行で1件も解決できないのはサンプラーが破綻している"
 
 
