@@ -111,7 +111,8 @@ def main() -> None:
         n_faces, n_edges = shape_capacity(record.stp_path)
         faces_max, edges_max = max(faces_max, n_faces), max(edges_max, n_edges)
         classes[str(classify(record.spec.point1, record.spec.point2))] += 1
-        kinds["bead" if record.bead else ("flange" if record.flange else "plain")] += 1
+        kinds["bead" if record.bead else ("flange" if record.flange
+              else ("rib" if record.rib else "plain"))] += 1
 
     manifest = {
         "schema": "partmaker_manifest/1",

@@ -108,7 +108,7 @@ class _FakeGeneralBuilder:
     def build_general_two_point(
         self, point1, point2, *, min_bearing_radius_mm, half_width_mm, bend_radius_mm,
         fold1_slack_mm, fold2_slack_mm, fold1_tilt_perturbation_rad, out_dir, part_name,
-        bead=None, flange=None, target_folds=None,
+        bead=None, flange=None, rib=None, target_folds=None,
     ):
         self.calls.append((point1, point2, out_dir, part_name, bead))
         return _FakeGeneratedPart(

@@ -25,20 +25,21 @@ from synthetic_generator.templates.general_two_point import sample as sample_gen
 
 
 def _build(rng, out_dir, name, want):
-    """`want` ("bead" / "flange" / None) の部品を1つ作る。作れなければNone。"""
+    """`want` ("bead" / "flange" / "rib" / None) の部品を1つ作る。作れなければNone。"""
     builder = OcctPartBuilder()
     for _ in range(400):
         try:
             spec = sample_general(rng, gentle_folds=(want == "flange"))
         except ValueError:
             continue
-        bead = flange = None
+        bead = flange = rib = None
         if want is not None:
             resolved = resolve_reinforcement(rng, spec)
             if resolved is None:
                 continue
-            spec, bead, flange = resolved
-            if (want == "bead") != (bead is not None):
+            spec, bead, flange, rib = resolved
+            got = "bead" if bead else ("flange" if flange else ("rib" if rib else None))
+            if got != want:
                 continue
         try:
             part = builder.build_general_two_point(
@@ -49,19 +50,20 @@ def _build(rng, out_dir, name, want):
                 fold1_slack_mm=spec.fold1_slack_mm,
                 fold2_slack_mm=spec.fold2_slack_mm,
                 out_dir=str(out_dir), part_name=name,
-                bead=bead, flange=flange,
+                target_folds=spec.target_folds,
+                bead=bead, flange=flange, rib=rib,
             )
         except ValueError:
             continue
-        return part, spec, bead, flange
+        return part, spec, bead, flange, rib
     return None
 
 
-@pytest.mark.parametrize("want", ["bead", "flange", None])
+@pytest.mark.parametrize("want", ["bead", "flange", "rib", None])
 def test_occt_part_is_geometrically_sound(tmp_path, want):
     made = _build(random.Random(4242), tmp_path, f"test_{want}", want)
     assert made is not None, f"could not sample a {want} part in 400 attempts"
-    part, spec, _bead, _flange = made
+    part, spec, _bead, _flange, _rib = made
 
     shape = read_step(part.stp_path)
     info = audit(shape)
@@ -85,7 +87,7 @@ def test_bead_is_not_twisted(tmp_path):
     (Gemini版が螺旋リボンになった不具合の再発検知)。"""
     made = _build(random.Random(99), tmp_path, "test_twist", "bead")
     assert made is not None
-    part, spec, bead, _ = made
+    part, spec, bead, _, _ = made
     shape = read_step(part.stp_path)
     top, mirror = bead_probe(spec, bead)
     assert distance_to(shape, top) <= 0.1, "the bead top is not where it was planned"

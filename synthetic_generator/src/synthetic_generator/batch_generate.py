@@ -29,6 +29,7 @@ from synthetic_generator.annotation_schema import AnnotationDocument, PartEntry
 from synthetic_generator.reinforcement import ReinforcementParams, sample_reinforcement
 from synthetic_generator.classify import classify
 from synthetic_generator.flange import FlangeParams, chirality_candidates
+from synthetic_generator.rib import RibParams
 from synthetic_generator.general_geometry import plan_for
 from synthetic_generator.templates.general_two_point import (
     GeneralTwoJointSpec,
@@ -75,6 +76,8 @@ class GeneralPartBuilder(Protocol):
         out_dir: str,
         part_name: str,
         bead: BeadParams | None = None,
+        flange: FlangeParams | None = None,
+        rib: RibParams | None = None,
     ) -> GeneratedPartLike: ...
 
 
@@ -154,7 +157,7 @@ def generate_batch(
     return records
 
 
-def build_general_part(builder, spec, bead, flange, out_dir: str, part_name: str):
+def build_general_part(builder, spec, bead, flange, out_dir: str, part_name: str, rib=None):
     """1部品をビルドする。フランジの根本フィレットが落ちた場合はキラリティ
     (側x方向)の反転候補で再試行する(SS14.6: 成立性はキラリティ依存で、失敗7件の
     全てが反転で成立した)。戻り値は(GeneratedPart, 実際に使ったflange)。"""
@@ -174,6 +177,7 @@ def build_general_part(builder, spec, bead, flange, out_dir: str, part_name: str
             part_name=part_name,
             bead=bead,
             flange=candidate_flange,
+            rib=rib,
         )
 
     if flange is None:
@@ -200,6 +204,7 @@ class GeneratedGeneralPartRecord:
     catpart_path: str
     bead: BeadParams | None = None
     flange: FlangeParams | None = None
+    rib: RibParams | None = None
 
 
 def generate_general_batch(
@@ -260,6 +265,7 @@ def generate_general_batch(
                     rng, gentle_folds=aim_flange, target_folds=draw_fold_count(rng))
             bead: BeadParams | None = None
             flange: FlangeParams | None = None
+            rib: RibParams | None = None
             if reinforce:
                 # 補強の種類は基準面の幾何で決まる(ユーザー指定、2026-08-25):
                 # 最大折れ角20度以下ならフランジ、それ以外(急でフランジ不成立)はビード。
@@ -267,14 +273,14 @@ def generate_general_batch(
                 resolved = resolve_reinforcement(rng, spec)
                 if resolved is None:
                     continue
-                spec, bead, flange = resolved
+                spec, bead, flange, rib = resolved
                 # カバレッジ補正用のフィルタ(SS18)。CATIAに触る前の純Python判定なので
                 # 棄却は実質無料。クォータを満たす組だけをビルドへ送る。
                 if accept_filter is not None and not accept_filter(spec, bead, flange):
                     continue
             try:
                 generated, flange = build_general_part(
-                    builder, spec, bead, flange, str(out_dir / "mid"), part_id
+                    builder, spec, bead, flange, str(out_dir / "mid"), part_id, rib=rib
                 )
                 break
             except ValueError:
@@ -306,6 +312,7 @@ def generate_general_batch(
                     "spec": dataclasses.asdict(spec),
                     "bead": dataclasses.asdict(bead) if bead is not None else None,
                     "flange": dataclasses.asdict(flange) if flange is not None else None,
+                    "rib": dataclasses.asdict(rib) if rib is not None else None,
                 },
                 ensure_ascii=False,
                 indent=1,
@@ -350,6 +357,7 @@ def generate_general_batch(
                 catpart_path=generated.catpart_path,
                 bead=bead,
                 flange=flange,
+                rib=rib,
             )
         )
 

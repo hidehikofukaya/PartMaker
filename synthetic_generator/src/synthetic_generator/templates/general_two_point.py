@@ -49,6 +49,7 @@ from synthetic_generator.flange import (
     sample_flange,
 )
 from synthetic_generator.general_geometry import check_bead_feasible, plan_for
+from synthetic_generator.rib import RibParams, rib_fits, sample_rib
 
 # ユーザー確定(2026-08-24): 締結点1つに必要な最小平面は**直径25mm**(=半径12.5mm)。
 # それ以上大きくしても利点は乏しいので、板金の幅は25〜50mmに抑える。
@@ -112,6 +113,11 @@ MAX_LATERAL_OFFSET_RATIO = 0.10             # |dw| / 断面距離 の上限
 # 曲げ本数の配分(ユーザー決定 2026-09-04): 2曲げ60% / 1曲げ35% / 0曲げ5%。
 # 狙いが外れた場合は実際の本数を params に記録する(ML側の「本数を先に決めない」方針)。
 FOLD_COUNT_WEIGHTS = ((2, 0.60), (1, 0.35), (0, 0.05))
+
+# フランジ対象外(最大折れ角>20度)の部品のうち、ビードではなくリブを狙う割合。
+# ビードは長い部品にしか載らないので、これが0だと短距離帯が無補強のままになる
+# (実測: 60-100mm帯で84%が無補強)。逆に1.0にすると長い部品のビードが消える。
+RIB_SHARE_AMONG_NON_FLANGE = 0.45
 
 SHORT_REGIME_MAX_TURN_DEG = 90.0
 SHORT_REGIME_MIN_TURN_DEG = 20.0
@@ -657,12 +663,25 @@ def _flange_feasible(spec: GeneralTwoJointSpec, flange: FlangeParams) -> bool:
     return True
 
 
+def _resolve_rib(rng: random.Random, spec: GeneralTwoJointSpec, plan) -> RibParams | None:
+    """この基準面に載るリブを返す(載らなければNone)。走行方向の余地はビルダー側が見る。"""
+    folds = len(plan.panel_frames) - 1
+    for _ in range(8):
+        rib = sample_rib(
+            rng, half_width_mm=spec.half_width_mm,
+            bend_radius_mm=spec.bend_radius_mm, fold_count=folds,
+        )
+        if rib is not None and rib_fits(rib, plan.panel_frames, half_width_mm=spec.half_width_mm):
+            return rib
+    return None
+
+
 def resolve_reinforcement(
     rng: random.Random,
     spec: GeneralTwoJointSpec,
     *,
     slack_attempts: int = 20,
-) -> tuple[GeneralTwoJointSpec, BeadParams | None, FlangeParams | None] | None:
+) -> tuple[GeneralTwoJointSpec, BeadParams | None, FlangeParams | None, RibParams | None] | None:
     """補強の種類を選び、成立するspec(slack差し替え済み)と補強パラメータを返す。
 
     使い分けはユーザー指定(2026-08-25): **最大折れ角20度以下ならフランジ、
@@ -684,7 +703,7 @@ def resolve_reinforcement(
             spec.half_width_mm, spec.bend_radius_mm, spec.point1.normal_xyz,
         )
         if flange is not None and _flange_feasible(spec, flange):
-            return spec, None, flange
+            return spec, None, flange, None
         # slackを選び直して再試行(平坦区間不足などはslackの性質、SS12と同じ理屈)
         # 曲げ0/1本の族はslackが幾何を動かさないので引き直さない。
         for _ in range(0 if spec.target_folds in (0, 1) else slack_attempts):
@@ -703,12 +722,24 @@ def resolve_reinforcement(
                 candidate.point1.normal_xyz,
             )
             if flange is not None and _flange_feasible(candidate, flange):
-                return candidate, None, flange
+                return candidate, None, flange, None
         # フランジ不成立 -> ビードへフォールバック(ユーザー指定の使い分け)
 
+    # ビードとリブの使い分け(2026-09-04、D3/D4): ビードは中心線上に
+    # 「2×座面半径 + ランアウト + 本体」を要求するので短い部品には載らない。
+    # 割合で先に狙いを決め、駄目ならもう一方へ落とす(1部品1補強、ユーザー決定4)。
+    prefer_rib = rng.random() < RIB_SHARE_AMONG_NON_FLANGE
+    if prefer_rib:
+        rib = _resolve_rib(rng, spec, plan)
+        if rib is not None:
+            return spec, None, None, rib
     bead = sample_bead(rng, spec.half_width_mm)
     resolved = resolve_bead_slacks(rng, spec, bead)
-    if resolved is None:
-        return None
-    new_spec, new_bead = resolved
-    return new_spec, new_bead, None
+    if resolved is not None:
+        new_spec, new_bead = resolved
+        return new_spec, new_bead, None, None
+    if not prefer_rib:
+        rib = _resolve_rib(rng, spec, plan)
+        if rib is not None:
+            return spec, None, None, rib
+    return None

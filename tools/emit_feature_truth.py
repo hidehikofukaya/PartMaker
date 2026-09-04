@@ -33,6 +33,7 @@ from synthetic_generator.classify import FasteningPoint  # noqa: E402
 from synthetic_generator.corner_relief import plan_corner_relief  # noqa: E402
 from synthetic_generator.flange import FlangeParams, plan_flange_on_surface  # noqa: E402
 from synthetic_generator.general_geometry import plan_general_two_point  # noqa: E402
+from synthetic_generator.rib import RibParams  # noqa: E402
 
 SCHEMA = "partmaker_features/1"
 TILTS: list = []
@@ -100,6 +101,7 @@ def build(meta: dict) -> dict:
         "folds": [],
         "bead": None,
         "flange": None,
+        "rib": None,
         "corner_relief": [],
         "notes": [],
     }
@@ -195,6 +197,26 @@ def build(meta: dict) -> dict:
                 flange.side * (fplan.edge_offset_mm - flange.root_radius_mm)),
             "root_probe": list(fplan.side_probe),
             "wall_top_probe": list(fplan.wall_top_probe),
+        }
+
+    # --- リブ(曲げをまたぐ菱形のくぼみ、2026-09-04 D3) ---
+    if meta.get("rib"):
+        rib = RibParams(**meta["rib"])
+        index = min(rib.fold_index, max(0, len(out["folds"]) - 1))
+        fold = out["folds"][index] if out["folds"] else None
+        out["rib"] = {
+            **meta["rib"],
+            "wall_run_mm": rib.wall_run_mm,
+            "ridge_setback_mm": rib.ridge_setback_mm,
+            "half_footprint_mm": rib.half_footprint_mm,
+            "nose_length_mm": rib.nose_length_mm,
+            # 立ち上げ向きは凹側に固定(構築時の規則そのもの)。符号は fold の concave_side。
+            "lift_side": fold["concave_side"] if fold else 0,
+            # 領域判定用: この折れ目のシャープ線からこの距離までがリブ由来
+            # (中心線に沿っては body_margin + nose、幅方向は half_footprint + setback)。
+            "sharp_line": fold["sharp_line"] if fold else None,
+            "reach_along_mm": rib.body_margin_mm + rib.nose_length_mm,
+            "reach_across_mm": rib.half_footprint_mm + rib.ridge_setback_mm,
         }
 
     # --- 余肉カット(外形側の特徴) ---

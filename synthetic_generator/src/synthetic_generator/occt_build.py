@@ -55,12 +55,14 @@ from OCC.Core.BRepAlgoAPI import BRepAlgoAPI_Cut
 from OCC.Core.BRepGProp import brepgprop
 from OCC.Core.BRepBuilderAPI import (
     BRepBuilderAPI_MakeEdge,
+    BRepBuilderAPI_MakeVertex,
     BRepBuilderAPI_MakeFace,
     BRepBuilderAPI_MakeWire,
     BRepBuilderAPI_Sewing,
     BRepBuilderAPI_Transform,
 )
 from OCC.Core.BRepFill import brepfill
+from OCC.Core.BRepOffsetAPI import BRepOffsetAPI_ThruSections
 from OCC.Core.BRepPrimAPI import BRepPrimAPI_MakePrism, BRepPrimAPI_MakeRevol
 from OCC.Core.ShapeUpgrade import ShapeUpgrade_UnifySameDomain
 from OCC.Core.GC import GC_MakeArcOfCircle
@@ -80,6 +82,7 @@ from synthetic_generator.bead import BeadParams
 from synthetic_generator.classify import MIN_NEUTRAL_PLANE_RADIUS_MM, FasteningPoint, Vec3
 from synthetic_generator.flange import FLANGE_CONCAVE_CLEARANCE_MM, FlangeParams
 from synthetic_generator.general_geometry import plan_general_two_point
+from synthetic_generator.rib import RibParams
 
 SEW_TOLERANCE_MM = 0.01
 # ランアウト長(平地->ビード断面の遷移)。実物のビードの走り終いは深さの2〜3倍程度。
@@ -160,7 +163,7 @@ def _flat_section(y_breaks: list[float]) -> list[Elem]:
     ]
 
 
-def _bead_section(bead: BeadParams, lift: int, half_width_mm: float) -> tuple[list[Elem], list[float]]:
+def _bead_section(bead, lift: int, half_width_mm: float, *, role: str = "bead") -> tuple[list[Elem], list[float]]:
     """ビード断面(9要素)と、対応する平地断面のyブレークポイント(10点)を返す。
 
     幾何(右半分、liftを掛ける前):
@@ -213,18 +216,18 @@ def _bead_section(bead: BeadParams, lift: int, half_width_mm: float) -> tuple[li
     section = [
         ("line", p(-half_width_mm, 0.0), p(-(yf + sb), 0.0), "base_l"),
         ("arc", p(-(yf + sb), 0.0), p(-foot_mid[0], foot_mid[1]),
-         p(-(yf - sb * cos_t), sb * sin_t), "bead_foot_l"),
+         p(-(yf - sb * cos_t), sb * sin_t), f"{role}_foot_l"),
         ("line", p(-(yf - sb * cos_t), sb * sin_t),
-         p(-(yt + sb * cos_t), depth - sb * sin_t), "bead_wall_l"),
+         p(-(yt + sb * cos_t), depth - sb * sin_t), f"{role}_wall_l"),
         ("arc", p(-(yt + sb * cos_t), depth - sb * sin_t), p(-top_mid[0], top_mid[1]),
-         p(-(yt - sb), depth), "bead_ridge_l"),
-        ("line", p(-(yt - sb), depth), p(yt - sb, depth), "bead_top"),
+         p(-(yt - sb), depth), f"{role}_ridge_l"),
+        ("line", p(-(yt - sb), depth), p(yt - sb, depth), f"{role}_top"),
         ("arc", p(yt - sb, depth), p(top_mid[0], top_mid[1]),
-         p(yt + sb * cos_t, depth - sb * sin_t), "bead_ridge_r"),
+         p(yt + sb * cos_t, depth - sb * sin_t), f"{role}_ridge_r"),
         ("line", p(yt + sb * cos_t, depth - sb * sin_t),
-         p(yf - sb * cos_t, sb * sin_t), "bead_wall_r"),
+         p(yf - sb * cos_t, sb * sin_t), f"{role}_wall_r"),
         ("arc", p(yf - sb * cos_t, sb * sin_t), p(foot_mid[0], foot_mid[1]),
-         p(yf + sb, 0.0), "bead_foot_r"),
+         p(yf + sb, 0.0), f"{role}_foot_r"),
         ("line", p(yf + sb, 0.0), p(half_width_mm, 0.0), "base_r"),
     ]
     return section, y_breaks
@@ -481,9 +484,10 @@ class OcctPartBuilder:
         part_name: str,
         bead: BeadParams | None = None,
         flange: FlangeParams | None = None,
+        rib: RibParams | None = None,
     ) -> GeneratedPart:
-        if bead is not None and flange is not None:
-            raise ValueError("a part takes either a bead or a flange, not both")
+        if sum(x is not None for x in (bead, flange, rib)) > 1:
+            raise ValueError("a part takes at most one reinforcement (bead, flange or rib)")
         if abs(fold1_tilt_perturbation_rad) > 1e-9:
             # 折れ目軸が共通でなくなる(実測: 摂動ありで軸間角 最大7.3度)ため、
             # 断面掃引の前提が崩れる。サンプラー側で0に固定してある。
@@ -514,6 +518,9 @@ class OcctPartBuilder:
             section, y_breaks = _bead_section(bead, lift, half_width_mm)
             self._sweep_with_bead(path, frame, w, section, _flat_section(y_breaks),
                                   bead, min_bearing_radius_mm, faces)
+        elif rib is not None:
+            self._sweep_with_rib(path, frame, w, rib, half_width_mm,
+                                 min_bearing_radius_mm, faces)
         else:
             section = (_flange_section(flange, half_width_mm) if flange is not None
                        else _flat_section([-half_width_mm, half_width_mm]))
@@ -619,6 +626,122 @@ class OcctPartBuilder:
                     sec = bead_section if s1 - 1e-6 <= mid <= s2 + 1e-6 else flat_section
                     frame = self._sweep_segment(piece, frame, w, sec, faces, tag)
             cursor += step.length
+
+    def _sweep_with_rib(self, path, frame: _Frame, w: Vec3, rib: RibParams,
+                        half_width_mm: float, min_bearing_radius_mm: float, faces) -> None:
+        """曲げをまたぐリブ。凹側(曲げ中心のある側)へ押し込み、前後は1点に収束させる。
+
+        経路: 平地 -(先端=点)- ノーズ - 本体(曲げ弧をまたぐ) - ノーズ -(先端=点)- 平地
+        断面は9要素でビードと共通。平地側は y=0 で2分割しておく(先端でノーズの
+        2枚の平地帯と厳密に突き合わせるため。余分な継ぎ目は最後のUnifySameDomainで消える)。
+        """
+        bends, cursor = [], 0.0
+        for step in path:
+            span = step.length if isinstance(step, _Straight) else abs(step.angle) * step.radius
+            if isinstance(step, _Bend):
+                bends.append((cursor, cursor + span, step))
+            cursor += span
+        total = cursor
+        if not bends:
+            raise ValueError("a rib needs a bend to straddle. Infeasible.")
+        arc_start, arc_end, bend = bends[min(rib.fold_index, len(bends) - 1)]
+
+        # 立ち上げ向きは凹側 = 曲げ中心のある側に固定(ユーザー指定「内角方向」)。
+        # 曲げ中心は sign(phi) が正なら -n 側にあるので、lift = -sign(phi)。
+        lift = -1 if bend.angle > 0 else 1
+        radius_at_top = bend.radius - rib.depth_mm
+        if radius_at_top < MIN_NEUTRAL_PLANE_RADIUS_MM:
+            raise ValueError(
+                f"a rib {rib.depth_mm:.1f}mm deep on the concave side of R={bend.radius:.1f}mm "
+                f"leaves a top radius of {radius_at_top:.1f}mm. Infeasible."
+            )
+
+        nose = rib.nose_length_mm
+        s_body0, s_body1 = arc_start - rib.body_margin_mm, arc_end + rib.body_margin_mm
+        s_tip0, s_tip1 = s_body0 - nose, s_body1 + nose
+        # 締結点まわりのベアリング円は平坦でなければならない。帯はrun=-margin から
+        # 始まり締結点はrun=0にあるので、平坦を要求する範囲は経路の両端 2*margin。
+        # (ビードの inset と同じ規則。これを見ずに直線区間の長さだけで見ると、
+        #  リブのノーズが座面に乗って締結点が面から最大3mm浮く。2026-09-04に実測)
+        inset = 2.0 * min_bearing_radius_mm
+        if s_tip0 < inset or s_tip1 > total - inset:
+            raise ValueError(
+                f"the rib (body {rib.body_margin_mm:.1f}mm + nose {nose:.1f}mm each side) "
+                f"reaches into a bearing area (needs {inset:.1f}mm clear at each end of the "
+                f"{total:.1f}mm path). Infeasible."
+            )
+        # ノーズと本体の張り出しは、曲げに隣接する直線区間の中に収まっていること
+        # (曲げの上で断面を変えると織り面が円筒に接せず折れる)。
+        before = [st for st in path if isinstance(st, _Straight)]
+        if rib.body_margin_mm + nose > min(before[0].length, before[-1].length) - 1.0:
+            raise ValueError(
+                "the rib nose does not fit in the flat run next to the bend. Infeasible."
+            )
+
+        rib_section, _ = _bead_section(rib, lift, half_width_mm, role="rib")
+        flat = _flat_section([-half_width_mm, 0.0, half_width_mm])
+        cuts = (s_tip0, s_body0, s_body1, s_tip1)
+
+        cursor = 0.0
+        for step in path:
+            tag = f"panel_{step.panel}" if isinstance(step, _Straight) else f"bend_{step.fold}"
+            if isinstance(step, _Bend):
+                frame = self._sweep_segment(step, frame, w, rib_section, faces, tag)
+                cursor += abs(step.angle) * step.radius
+                continue
+            inner = [c for c in cuts if cursor + 1e-9 < c < cursor + step.length - 1e-9]
+            marks = [cursor] + inner + [cursor + step.length]
+            for i in range(len(marks) - 1):
+                a, b = marks[i], marks[i + 1]
+                piece = step.scaled(b - a)
+                mid = 0.5 * (a + b)
+                if s_tip0 - 1e-6 <= mid <= s_body0 + 1e-6:
+                    frame = self._rib_nose(piece, frame, rib_section, flat,
+                                           opening=True, faces=faces, tag="rib_nose_0")
+                elif s_body1 - 1e-6 <= mid <= s_tip1 + 1e-6:
+                    frame = self._rib_nose(piece, frame, rib_section, flat,
+                                           opening=False, faces=faces, tag="rib_nose_1")
+                else:
+                    sec = rib_section if s_body0 - 1e-6 <= mid <= s_body1 + 1e-6 else flat
+                    frame = self._sweep_segment(piece, frame, w, sec, faces, tag)
+            cursor += step.length
+
+    def _rib_nose(self, step: _Straight, frame: _Frame, rib_section, flat_section,
+                  *, opening: bool, faces, tag: str) -> _Frame:
+        """リブの先端(1点)と本体断面をつなぐノーズ。
+
+        平地帯2枚は `brepfill` の直線織り面、リブ本体の7要素は「ワイヤ -> 頂点」の
+        `ThruSections`。先端が点になるのはユーザー決定(2026-09-04、真の菱形)。
+        """
+        nxt = frame.translated(step.vector)
+        tip_frame, body_frame = (frame, nxt) if opening else (nxt, frame)
+        tip_edges = _edges_of(flat_section, tip_frame)          # [-W->0, 0->W]
+        body_edges = _edges_of(rib_section, body_frame)         # 9要素
+        apex = gp_Pnt(*tip_frame.point((0.0, 0.0)))
+
+        for index, (tip_index, body_index) in enumerate(((0, 0), (1, 8))):
+            try:
+                face = brepfill.Face(tip_edges[tip_index][0], body_edges[body_index][0])
+            except RuntimeError as exc:
+                raise ValueError(f"{tag}: flat band {index} failed ({exc})")
+            faces[topods.Face(face)] = f"{tag}_base_{'l' if index == 0 else 'r'}"
+
+        maker = BRepBuilderAPI_MakeWire()
+        for edge, _role in body_edges[1:8]:
+            maker.Add(edge)
+        loft = BRepOffsetAPI_ThruSections(False, True)
+        loft.AddVertex(BRepBuilderAPI_MakeVertex(apex).Vertex())
+        loft.AddWire(maker.Wire())
+        loft.Build()
+        if not loft.IsDone():
+            raise ValueError(f"{tag}: the rib nose loft to the tip vertex failed")
+        explorer = TopExp_Explorer(loft.Shape(), TopAbs_FACE)
+        index = 0
+        while explorer.More():
+            faces[topods.Face(explorer.Current())] = f"{tag}_{index}"
+            index += 1
+            explorer.Next()
+        return nxt
 
     def _loft_runout(self, step: _Straight, frame: _Frame, bead_section, flat_section,
                      *, rising: bool, faces, tag: str) -> _Frame:

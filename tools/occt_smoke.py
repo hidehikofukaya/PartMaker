@@ -20,6 +20,7 @@ import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "synthetic_generator" / "src"))
 
+from OCC.Core.BRep import BRep_Tool  # noqa: E402
 from OCC.Core.BRepAdaptor import BRepAdaptor_Curve, BRepAdaptor_Surface  # noqa: E402
 from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_MakeVertex  # noqa: E402
 from OCC.Core.BRepCheck import BRepCheck_Analyzer  # noqa: E402
@@ -152,8 +153,14 @@ def audit(shape) -> dict:
     free_edges = 0
     worst_deviation = 0.0
     tiny_edges = 0
+    degenerate_edges = 0
     for i in range(1, edge_faces.Size() + 1):
         edge = topods.Edge(edge_faces.FindKey(i))
+        if BRep_Tool.Degenerated(edge):
+            # 円錐の頂点(リブの菱形の先端)を閉じるための長さ0のエッジ。B-Repとして
+            # 正しい表現で、ゴミエッジではない。プリミティブ判定からは外す。
+            degenerate_edges += 1
+            continue
         kind = BRepAdaptor_Curve(edge).GetType()
         name = CURVE_NAMES.get(kind, f"type{kind}")
         curves[name] = curves.get(name, 0) + 1
@@ -170,6 +177,7 @@ def audit(shape) -> dict:
         "free_edges": free_edges,
         "deviation": worst_deviation,
         "tiny_edges": tiny_edges,
+        "degenerate_edges": degenerate_edges,
         "valid": bool(BRepCheck_Analyzer(shape).IsValid()),
     }
 
@@ -187,7 +195,7 @@ def main() -> None:
     made, tried, failures = 0, 0, {}
     surfaces_total: dict[str, int] = {}
     curves_total: dict[str, int] = {}
-    kinds = {"bead": 0, "flange": 0, "plain": 0}
+    kinds = {"bead": 0, "flange": 0, "rib": 0, "plain": 0}
     fold_counts: dict[int, int] = {}
     t0 = time.time()
 
@@ -199,13 +207,13 @@ def main() -> None:
         except ValueError as exc:
             failures[str(exc)[:60]] = failures.get(str(exc)[:60], 0) + 1
             continue
-        bead = flange = None
+        bead = flange = rib = None
         if rng.random() < 0.9:
             resolved = resolve_reinforcement(rng, spec)
             if resolved is None:
                 failures["no reinforcement"] = failures.get("no reinforcement", 0) + 1
                 continue
-            spec, bead, flange = resolved
+            spec, bead, flange, rib = resolved
         name = f"OCCT_{made + 1:04d}"
         try:
             part = builder.build_general_two_point(
@@ -218,13 +226,13 @@ def main() -> None:
                 fold1_tilt_perturbation_rad=0.0,
                 target_folds=spec.target_folds,
                 out_dir=str(out_dir), part_name=name,
-                bead=bead, flange=flange,
+                bead=bead, flange=flange, rib=rib,
             )
         except ValueError as exc:
             failures[str(exc)[:60]] = failures.get(str(exc)[:60], 0) + 1
             continue
         made += 1
-        kinds["bead" if bead else ("flange" if flange else "plain")] += 1
+        kinds["bead" if bead else ("flange" if flange else ("rib" if rib else "plain"))] += 1
         actual = len(plan_for(spec).panel_frames) - 1
         fold_counts[actual] = fold_counts.get(actual, 0) + 1
 
@@ -257,7 +265,7 @@ def main() -> None:
             if d_mirror < 0.8 * bead.depth_mm:
                 problems.append(f"bead mirror only {d_mirror:.2f}mm away (depth {bead.depth_mm:.1f}mm)")
         print(f"{name} {classify(spec.point1, spec.point2)!s:24s} "
-              f"{'bead' if bead else ('flange' if flange else 'plain'):6s} "
+              f"{'bead' if bead else ('flange' if flange else ('rib' if rib else 'plain')):6s} "
               f"faces={info['faces']:3d} edges={info['edges']:3d} free={info['free_edges']:3d} "
               f"dev={info['deviation']:.4f} "
               f"{'OK' if not problems else 'NG ' + '; '.join(problems)}", flush=True)
