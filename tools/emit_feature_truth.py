@@ -213,9 +213,9 @@ def build(meta: dict) -> dict:
             # 立ち上げ向きは凹側に固定(構築時の規則そのもの)。符号は fold の concave_side。
             "lift_side": fold["concave_side"] if fold else 0,
             # 領域判定用: この折れ目のシャープ線からこの距離までがリブ由来
-            # (中心線に沿っては body_margin + nose、幅方向は half_footprint + setback)。
+            # (中心線に沿っては曲げ弧の端からnose、幅方向は half_footprint + setback)。
             "sharp_line": fold["sharp_line"] if fold else None,
-            "reach_along_mm": rib.body_margin_mm + rib.nose_length_mm,
+            "reach_along_mm": rib.nose_length_mm,
             "reach_across_mm": rib.half_footprint_mm + rib.ridge_setback_mm,
         }
 

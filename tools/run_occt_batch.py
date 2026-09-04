@@ -61,7 +61,10 @@ def main() -> None:
     chunk = int(sys.argv[2])
     count = int(sys.argv[3])
     seed = int(sys.argv[4])
-    reinforcement = float(sys.argv[5]) if len(sys.argv) > 5 else 0.9
+    # 補強は原則すべての部品に付ける(ユーザー指定 2026-09-04)。例外は締結点が近すぎて
+    # どの補強も載らない場合だけで、それは resolve_reinforcement が None を返して表れる
+    # (実測1491件中0件なので、実質すべての部品に特徴が付く)。
+    reinforcement = float(sys.argv[5]) if len(sys.argv) > 5 else 1.0
     flange_share = float(sys.argv[6]) if len(sys.argv) > 6 else 0.4
 
     out_dir = DEFAULT_OUTPUT_ROOT / family / f"chunk_{chunk:02d}"

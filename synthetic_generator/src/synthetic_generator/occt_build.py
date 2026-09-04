@@ -50,7 +50,8 @@ import dataclasses
 import math
 import os
 
-from OCC.Core.BRepAdaptor import BRepAdaptor_Surface
+from OCC.Core.BRep import BRep_Tool
+from OCC.Core.BRepAdaptor import BRepAdaptor_Curve, BRepAdaptor_Surface
 from OCC.Core.BRepAlgoAPI import BRepAlgoAPI_Cut
 from OCC.Core.BRepGProp import brepgprop
 from OCC.Core.BRepBuilderAPI import (
@@ -70,7 +71,8 @@ from OCC.Core.Interface import Interface_Static
 from OCC.Core.STEPCAFControl import STEPCAFControl_Writer
 from OCC.Core.TDataStd import TDataStd_Name
 from OCC.Core.TDocStd import TDocStd_Document
-from OCC.Core.TopAbs import TopAbs_FACE, TopAbs_SHELL
+from OCC.Core.GCPnts import GCPnts_AbscissaPoint
+from OCC.Core.TopAbs import TopAbs_EDGE, TopAbs_FACE
 from OCC.Core.TopExp import TopExp_Explorer
 from OCC.Core.TopoDS import topods
 from OCC.Core.XCAFApp import XCAFApp_Application
@@ -91,6 +93,8 @@ MIN_RUNOUT_MM = 3.0
 # 隅の余肉カットのツール角柱の張り出し(基準面の両側へこれだけ伸ばす)。カット域の
 # 基準面は厳密に平面なので薄くてよい。厚くするとU字部品で反対側のパネルまで削る。
 CUT_TOOL_HALF_DEPTH_MM = 5.0
+# これ未満のエッジが出た部品は捨てる(引継ぎ書 §4.3 のゴミ幾何)。
+MIN_EDGE_LENGTH_MM = 0.05
 
 
 @dataclasses.dataclass(frozen=True)
@@ -437,6 +441,29 @@ def face_centroid(face) -> Vec3:
     return (centre.X(), centre.Y(), centre.Z())
 
 
+def _reject_junk_edges(shape, minimum_mm: float = MIN_EDGE_LENGTH_MM) -> None:
+    """0.05mm未満のエッジが1本でもあれば部品を捨てる(サンプラーが引き直す)。
+
+    引継ぎ書 §4.3「ゴミ幾何を出さない」。CATIA版は607本出していた。構成的にはほぼ
+    出ないが、余肉カットのブーリアンが既存エッジをかすめる縮退配置で稀に1本出る
+    (2026-09-04実測: 300部品に1本)。棄却は0.1秒なので、混ぜるより捨てるほうが安い。
+    頂点(リブの先端)を閉じる退化エッジは長さ0が正しい表現なので除外する。
+    """
+    explorer = TopExp_Explorer(shape, TopAbs_EDGE)
+    seen = set()
+    while explorer.More():
+        edge = topods.Edge(explorer.Current())
+        if edge not in seen and not BRep_Tool.Degenerated(edge):
+            seen.add(edge)
+            length = GCPnts_AbscissaPoint.Length(BRepAdaptor_Curve(edge))
+            if length < minimum_mm:
+                raise ValueError(
+                    f"the build produced a {length:.4f}mm junk edge "
+                    f"(minimum {minimum_mm:.2f}mm). Infeasible; resample."
+                )
+        explorer.Next()
+
+
 def _export_step(shape, names: dict, step_path: str) -> None:
     app = XCAFApp_Application.GetApplication()
     doc = TDocStd_Document("MDTV-XCAF")
@@ -536,6 +563,7 @@ class OcctPartBuilder:
             exclude_side=(flange.side if flange is not None else None),
         )
         shape, faces = self._unify(shape, faces)
+        _reject_junk_edges(shape)
 
         os.makedirs(out_dir, exist_ok=True)
         stp_path = os.path.abspath(os.path.join(out_dir, part_name + "_mid.stp"))
@@ -656,8 +684,9 @@ class OcctPartBuilder:
                 f"leaves a top radius of {radius_at_top:.1f}mm. Infeasible."
             )
 
+        # 稜(full section)は曲げ弧そのもの。前後はすぐノーズで点へすぼまる。
         nose = rib.nose_length_mm
-        s_body0, s_body1 = arc_start - rib.body_margin_mm, arc_end + rib.body_margin_mm
+        s_body0, s_body1 = arc_start, arc_end
         s_tip0, s_tip1 = s_body0 - nose, s_body1 + nose
         # 締結点まわりのベアリング円は平坦でなければならない。帯はrun=-margin から
         # 始まり締結点はrun=0にあるので、平坦を要求する範囲は経路の両端 2*margin。
@@ -666,14 +695,14 @@ class OcctPartBuilder:
         inset = 2.0 * min_bearing_radius_mm
         if s_tip0 < inset or s_tip1 > total - inset:
             raise ValueError(
-                f"the rib (body {rib.body_margin_mm:.1f}mm + nose {nose:.1f}mm each side) "
-                f"reaches into a bearing area (needs {inset:.1f}mm clear at each end of the "
-                f"{total:.1f}mm path). Infeasible."
+                f"the rib (nose {nose:.1f}mm each side of the bend) reaches into a bearing "
+                f"area (needs {inset:.1f}mm clear at each end of the {total:.1f}mm path). "
+                "Infeasible."
             )
         # ノーズと本体の張り出しは、曲げに隣接する直線区間の中に収まっていること
         # (曲げの上で断面を変えると織り面が円筒に接せず折れる)。
         before = [st for st in path if isinstance(st, _Straight)]
-        if rib.body_margin_mm + nose > min(before[0].length, before[-1].length) - 1.0:
+        if nose > min(before[0].length, before[-1].length) - 1.0:
             raise ValueError(
                 "the rib nose does not fit in the flat run next to the bend. Infeasible."
             )

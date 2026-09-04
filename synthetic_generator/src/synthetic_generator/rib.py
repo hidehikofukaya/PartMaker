@@ -14,11 +14,18 @@
 
 構築(`occt_build`):
 
-    平地 ─(先端=点)─ ノーズ ─ リブ本体(曲げ弧をまたぐ) ─ ノーズ ─(先端=点)─ 平地
+    平地 ─(先端=点)─ ノーズ ─[曲げ弧だけが稜]─ ノーズ ─(先端=点)─ 平地
 
 断面はビードと同じ9要素(平地/足R/壁/稜線R/頂部/稜線R/壁/足R/平地)。違いは
-(a) 区間が曲げの前後だけ、(b) 立ち上げ向きが**凹側に固定**、(c) 先端が1点に収束する
-(ユーザー決定: 六角テーパではなく真の菱形)。
+(a) **曲げ弧のぶんだけが full section**で前後はすぐ点へすぼまる、
+(b) 立ち上げ向きが**凹側に固定**、(c) 先端が1点に収束する。
+平面視は菱形、立体では「八面体の半分が内角側へ出っ張る」形になる
+(2026-09-04のユーザー指摘で、平坦な稜線が長い形から作り直した)。
+
+曲げ弧の上だけを full section にするのは形の狙いだけでなく構築上の要請でもある:
+そこは回転掃引(`MakeRevol`)で厳密な円錐/トーラスになるが、断面を s に沿って
+連続的に縮めると曲げ上でも直線織り面になり、部品の**側端が円弧ではなく弦の折れ線**に
+なってしまう。曲げ弧=稜、直線区間=テーパ、とすると両方が厳密なまま両立する。
 """
 
 from __future__ import annotations
@@ -39,11 +46,11 @@ from synthetic_generator.classify import MIN_NEUTRAL_PLANE_RADIUS_MM
 RIB_DEPTH_RANGE_MM = (4.0, 8.0)
 RIB_TOP_WIDTH_RANGE_MM = (6.0, 20.0)
 RIB_WALL_ANGLE_RANGE_DEG = (45.0, 70.0)
-# 曲げ弧の前後へ本体を伸ばす長さ。短いほど「ひし形」に近くなる。
-RIB_BODY_MARGIN_RANGE_MM = (3.0, 10.0)
-# 先端(点)までのノーズ長。深さに対する倍率。
-RIB_NOSE_DEPTH_RATIO = 2.5
-MIN_RIB_NOSE_MM = 3.0
+# 先端(点)までの長さ。**幅**に対する倍率で決める(2026-09-04にユーザー指摘で変更)。
+# 深さ基準にすると細長い稜線になってしまい、狙いの「八面体の半分」に見えない。
+# 1.0前後だと縦横がほぼ等しい菱形になる。
+RIB_NOSE_WIDTH_RATIO_RANGE = (0.8, 1.6)
+MIN_RIB_NOSE_MM = 4.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -52,7 +59,7 @@ class RibParams:
     top_width_mm: float
     wall_angle_deg: float
     ridge_radius_mm: float
-    body_margin_mm: float   # 曲げ弧の前後へ本体を伸ばす長さ(片側)
+    nose_ratio: float       # 先端までの長さ / フットプリント半幅
     fold_index: int         # どの曲げに載せるか(0始まり)
 
     @property
@@ -69,7 +76,8 @@ class RibParams:
 
     @property
     def nose_length_mm(self) -> float:
-        return max(MIN_RIB_NOSE_MM, RIB_NOSE_DEPTH_RATIO * self.depth_mm)
+        """曲げ弧の端から先端(点)までの長さ。"""
+        return max(MIN_RIB_NOSE_MM, self.nose_ratio * self.half_footprint_mm)
 
 
 def sample_rib(
@@ -125,7 +133,7 @@ def sample_rib(
         top_width_mm=top_width,
         wall_angle_deg=wall_angle,
         ridge_radius_mm=ridge_radius,
-        body_margin_mm=rng.uniform(*RIB_BODY_MARGIN_RANGE_MM),
+        nose_ratio=rng.uniform(*RIB_NOSE_WIDTH_RATIO_RANGE),
         fold_index=rng.randrange(fold_count),
     )
 
