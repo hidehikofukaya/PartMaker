@@ -20,30 +20,27 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "tools"))
 from occt_smoke import audit, bead_probe, distance_to, read_step  # noqa: E402
 
 from synthetic_generator.occt_build import OcctPartBuilder  # noqa: E402
-from synthetic_generator.templates.general_two_point import resolve_reinforcement  # noqa: E402
-from synthetic_generator.templates.general_two_point import sample as sample_general  # noqa: E402
+from synthetic_generator.families import FAMILIES, Knobs  # noqa: E402
+
+
+# 族ごとの生成器が「その特徴が成立する配置」を狙って引く(families.py)。
+KNOBS = {
+    "bead": Knobs(distance_mm=(110.0, 220.0)),
+    "flange": Knobs(gentle=True),
+    "rib": Knobs(distance_mm=(50.0, 120.0), bearing_radius_mm=(15.0, 22.0)),
+    "plain": Knobs(),
+}
 
 
 def _build(rng, out_dir, name, want):
-    """`want` ("bead" / "flange" / "rib" / None) の部品を1つ作る。作れなければNone。"""
+    """`want` の族の部品を1つ作る。作れなければ None。"""
     builder = OcctPartBuilder()
-    for _ in range(2000):
-        try:
-            # リブは「締結点が近すぎてビードが置けない」ときだけ出るので、短い部品が
-            # 出やすい単曲げ族を狙う(そうしないと試行のほとんどがビードになる)。
-            spec = sample_general(rng, gentle_folds=(want == "flange"),
-                                  target_folds=1 if want == "rib" else None)
-        except ValueError:
+    kind = want or "plain"
+    for _ in range(60):
+        drawn = FAMILIES[kind](rng, KNOBS[kind])
+        if drawn is None:
             continue
-        bead = flange = rib = None
-        if want is not None:
-            resolved = resolve_reinforcement(rng, spec)
-            if resolved is None:
-                continue
-            spec, bead, flange, rib = resolved
-            got = "bead" if bead else ("flange" if flange else ("rib" if rib else None))
-            if got != want:
-                continue
+        spec, bead, flange, rib = drawn
         try:
             part = builder.build_general_two_point(
                 spec.point1, spec.point2,
@@ -65,7 +62,7 @@ def _build(rng, out_dir, name, want):
 @pytest.mark.parametrize("want", ["bead", "flange", "rib", None])
 def test_occt_part_is_geometrically_sound(tmp_path, want):
     made = _build(random.Random(4242), tmp_path, f"test_{want}", want)
-    assert made is not None, f"could not sample a {want} part in 2000 attempts"
+    assert made is not None, f"could not build a {want} part in 60 attempts"
     part, spec, _bead, _flange, _rib = made
 
     shape = read_step(part.stp_path)

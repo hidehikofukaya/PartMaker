@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import dataclasses
+import math
 import random
 
 from synthetic_generator.bead import BeadParams, sample_bead
@@ -44,10 +45,15 @@ from synthetic_generator.rib import (
     sample_rib,
 )
 from synthetic_generator.templates.general_two_point import (
+    FOLD_SLACK_RANGE_MM,
     GeneralTwoJointSpec,
     draw_fold_count,
 )
 from synthetic_generator.templates.general_two_point import sample as sample_spec
+
+# ビードが通る折れ目位置を探すときの slack の引き直し回数
+# (当初の `resolve_bead_slacks` と同じ狙い: 置き場所ではなく折れ目の位置で解決する)。
+SLACK_ATTEMPTS = 16
 
 
 @dataclasses.dataclass(frozen=True)
@@ -111,22 +117,40 @@ def _draw_weighted(rng: random.Random, weights) -> int:
 
 
 def bead_part(rng: random.Random, knobs: Knobs) -> Result | None:
-    """ビード部品: 中心線にまともな長さのビードが載る配置を狙う。"""
+    """ビード部品: ビードが**全長を貫通して折れ目を全てまたぐ**配置を狙う。
+
+    当初からの設計(roadmap Step 3)どおり、締結点の座面 2×bearing半径 を両端で
+    避けたうえでビードを通しきる。通らない場合は置き場所を動かすのではなく
+    **折れ目の位置(slack)を選び直す** — 折れ目の位置は
+    `座面半径 + フィレット接線長 + slack` で決まるので、slack がビードの
+    走行長を直接左右する。
+    """
     for _ in range(knobs.attempts):
         try:
             spec = _draw_spec(rng, knobs)
-            plan = plan_for(spec)
         except ValueError:
             continue
-        if bead_room_mm(plan, spec.bend_radius_mm) < RIB_MAX_BEAD_ROOM_MM:
-            continue          # 短すぎてまともなビードにならない -> リブ族の領分
-        for _ in range(20):
-            bead = sample_bead(rng, spec.half_width_mm)
+        for attempt in range(SLACK_ATTEMPTS):
+            candidate = spec if attempt == 0 else dataclasses.replace(
+                spec,
+                fold1_slack_mm=rng.uniform(*FOLD_SLACK_RANGE_MM),
+                fold2_slack_mm=rng.uniform(*FOLD_SLACK_RANGE_MM),
+            )
             try:
-                check_bead_feasible_occt(plan, bead, spec.bend_radius_mm)
+                plan = plan_for(candidate)
             except ValueError:
                 continue
-            return spec, bead, None, None
+            if bead_room_mm(plan, candidate.bend_radius_mm) < RIB_MAX_BEAD_ROOM_MM:
+                continue      # 短すぎてまともなビードにならない -> リブ族の領分
+            for _ in range(12):
+                bead = sample_bead(rng, candidate.half_width_mm)
+                try:
+                    check_bead_feasible_occt(plan, bead, candidate.bend_radius_mm)
+                except ValueError:
+                    continue
+                return candidate, bead, None, None
+            if candidate.target_folds in (0, 1):
+                break         # slackが幾何を動かさない族。次のspecへ
     return None
 
 
@@ -160,6 +184,13 @@ def flange_part(rng: random.Random, knobs: Knobs) -> Result | None:
     return None
 
 
+def fold_angle_deg(frames, index: int) -> float:
+    """折れ目 index の外向きの折れ角[度]。"""
+    a, b = frames[index], frames[index + 1]
+    cosine = max(-1.0, min(1.0, sum(a.u[i] * b.u[i] for i in range(3))))
+    return math.degrees(math.acos(cosine))
+
+
 def rib_part(rng: random.Random, knobs: Knobs) -> Result | None:
     """リブ部品: 締結点が近く(ビードがまともに載らない)、折れ角がきつい配置を狙う。
 
@@ -180,8 +211,9 @@ def rib_part(rng: random.Random, knobs: Knobs) -> Result | None:
         if bead_room_mm(plan, spec.bend_radius_mm) >= RIB_MAX_BEAD_ROOM_MM:
             continue          # ビードがまともに載る -> ビード族の領分
         best = max(range(folds), key=lambda i: min(leg_room_mm(plan, i)))
-        rib = sample_rib(rng, half_width_mm=spec.half_width_mm,
-                         fold_index=best, leg_room_mm=leg_room_mm(plan, best))
+        angle = math.radians(fold_angle_deg(plan.panel_frames, best))
+        rib = sample_rib(rng, half_width_mm=spec.half_width_mm, fold_index=best,
+                         leg_room_mm=leg_room_mm(plan, best), fold_angle_rad=angle)
         if rib is not None:
             return spec, None, None, rib
     return None

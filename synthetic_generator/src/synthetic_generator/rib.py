@@ -64,6 +64,11 @@ RIB_SHARP_MARGIN_MM = 4.0
 # ユーザー了承のもと数mm大きめに寄せる。
 MIN_RIB_HALF_WIDTH_MM = 10.0
 MIN_RIB_LEG_MM = 12.0
+# リブ三角形 V1-A-B の内接円半径が稜線フィレット半径より小さいと、3辺のフィレットが
+# 重なって OCCT が発散する(実測: c=10・脚12・折れ角90度で内接円4.6mm < R5 となり、
+# `BRepFilletAPI_MakeFillet` が数分止まってバッチが停止した。2026-09-04)。
+# 余裕を持って 1.3倍を要求する。
+RIB_INRADIUS_MARGIN = 1.3
 
 
 @dataclasses.dataclass(frozen=True)
@@ -81,12 +86,27 @@ class RibParams:
         return max(self.leg1_mm, self.leg2_mm)
 
 
+def triangle_inradius_mm(half_width: float, leg1: float, leg2: float,
+                         fold_angle_rad: float) -> float:
+    """リブ三角形 V1-A-B の内接円半径。稜線フィレットが成立する条件の指標。"""
+    side_a = math.hypot(leg1, half_width)
+    side_b = math.hypot(leg2, half_width)
+    ridge = math.sqrt(max(0.0, leg1 * leg1 + leg2 * leg2
+                          + 2.0 * leg1 * leg2 * math.cos(fold_angle_rad)))
+    semi = 0.5 * (side_a + side_b + ridge)
+    area_sq = semi * (semi - side_a) * (semi - side_b) * (semi - ridge)
+    if area_sq <= 0.0 or semi <= 0.0:
+        return 0.0
+    return math.sqrt(area_sq) / semi
+
+
 def sample_rib(
     rng: random.Random,
     *,
     half_width_mm: float,
     fold_index: int,
     leg_room_mm: tuple[float, float],
+    fold_angle_rad: float,
 ) -> RibParams | None:
     """この曲げに載るリブを1つ引く(載らなければNone)。
 
@@ -100,14 +120,18 @@ def sample_rib(
     c_lo = min(c_lo, c_hi)          # 幅が足りない板ではとにかく最大まで使う
     if c_hi < c_lo:
         return None
-    c = rng.uniform(c_lo, c_hi)
+    c = rng.uniform(0.5 * (c_lo + c_hi), c_hi)
     legs = []
     for room in leg_room_mm:
         low = max(MIN_RIB_LEG_MM, RIB_LEG_RATIO_RANGE[0] * c)
         high = min(RIB_LEG_RATIO_RANGE[1] * c, room)
         if high < low:
             return None
-        legs.append(rng.uniform(low, high))
+        legs.append(rng.uniform(0.5 * (low + high), high))
+    # 稜線フィレットが成立する大きさか(内接円 >= 1.3 x フィレット半径)。
+    inradius = triangle_inradius_mm(c, legs[0], legs[1], fold_angle_rad)
+    if inradius < RIB_INRADIUS_MARGIN * MIN_NEUTRAL_PLANE_RADIUS_MM:
+        return None
     return RibParams(
         half_width_mm=c,
         leg1_mm=legs[0],

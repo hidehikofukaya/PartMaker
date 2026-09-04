@@ -397,7 +397,10 @@ def _plan_flat(
 
 
 # ビードが中心線上に要求する長さ(occt_build と同じ規則。ここが唯一の定義)。
-BEAD_MIN_RUNOUT_MM = 3.0
+# ランアウトの最小長。深さの2倍が設計値なので、最小深さ4mmに対して8mm。
+# 3mmまで縮めると走り終いの壁がほぼ垂直になり、実物のビードに見えない
+# (2026-09-04のユーザー指摘)。
+BEAD_MIN_RUNOUT_MM = 8.0
 BEAD_MIN_BODY_MM = 5.0
 
 
@@ -441,29 +444,29 @@ def bead_placement(spans, total: float, inset: float,
                    runout_mm: float = BEAD_MIN_RUNOUT_MM):
     """ビードの開始/終了位置(中心線の弧長)を返す。置けなければ None。
 
-    条件は3つだけ: 締結点まわりの座面 `inset` を侵さない / ランアウトが直線区間に
-    収まる(曲げの上で断面を変えると織り面が円筒に接せず折れる) / 本体が残る。
+    **ビードは部品の全長を貫通し、基準面の折れ目を全てまたぐ。**開始/終了は
+    両端の座面をよけた `inset`(= 2×座面半径)に固定する — これは当初からの設計
+    (roadmap Step 3「端の逃げ」)で、締結点の座面を侵さずにビードを通しきるための
+    唯一の置き方。
 
-    **開始位置を端パネルに固定しない**のが要点。固定すると、端パネルの平坦区間が
-    座面径より短い部品(折れ目が締結点の近くにある構成)が全部「ビード不可」になり、
-    185mm離れた大きい部品まで無補強になっていた(2026-09-04に実測)。
+    2026-09-04にいちど「逃げが取れる直線区間を探す」方式へ変えたが、その結果
+    **折れ目をまたがないビード**や、逃げが3mmまで縮んで**壁がほぼ垂直**になるビードが
+    生まれた(ユーザー指摘)。置き場所ではなく**折れ目の位置**(slack)で解決するのが
+    元の設計であり、そちらへ戻した。
+
+    ランアウトは直線区間の中に収まらなければならない(曲げの上で断面を変えると
+    織り面が円筒に接せず折れる)。
     """
-    start = end = None
-    for s0, s1, straight in spans:
-        if not straight:
-            continue
-        low = max(s0, inset)
-        if s1 - low >= runout_mm:
-            start = low
-            break
-    for s0, s1, straight in reversed(spans):
-        if not straight:
-            continue
-        high = min(s1, total - inset)
-        if high - s0 >= runout_mm:
-            end = high
-            break
-    if start is None or end is None or end - start < 2.0 * runout_mm + BEAD_MIN_BODY_MM:
+    straights = [(s0, s1) for s0, s1, straight in spans if straight]
+    if not straights:
+        return None
+    start, end = inset, total - inset
+    head, tail = straights[0], straights[-1]
+    if start + runout_mm > head[1] or end - runout_mm < tail[0]:
+        return None      # 端パネルの平坦区間に逃げが収まらない
+    if start < head[0] or end > tail[1]:
+        return None
+    if end - start < 2.0 * runout_mm + BEAD_MIN_BODY_MM:
         return None
     return start, end
 
@@ -498,8 +501,14 @@ def check_bead_feasible_occt(plan: GeneralTwoPointPlan, bead: BeadParams,
         raise ValueError("bead top ridge fillets consume the whole top width. Infeasible.")
     if bead.half_footprint_mm + setback > plan.half_width_mm - 0.5:
         raise ValueError("bead footprint does not fit in the half width. Infeasible.")
-    if bead_room_mm(plan, bend_radius_mm) < 0.0:
-        raise ValueError("no room on the centreline for a bead. Infeasible.")
+    # ビードは全長を貫通し折れ目を全てまたぐ。ランアウトは深さの2倍(最低8mm)。
+    spans, total = path_spans(plan, bend_radius_mm)
+    runout = max(BEAD_MIN_RUNOUT_MM, 2.0 * bead.depth_mm)
+    if bead_placement(spans, total, 2.0 * plan.min_bearing_radius_mm, runout) is None:
+        raise ValueError(
+            f"a bead with {runout:.1f}mm run-outs does not fit between the bearing areas. "
+            "Infeasible."
+        )
     # 曲げ上のビード頂部の半径 R + sign(角度)*lift*深さ。向きは有利なほうを選べる。
     frames = plan.panel_frames
     worst = -1e9

@@ -54,6 +54,7 @@ from OCC.Core.BRep import BRep_Tool
 from OCC.Core.BRepAdaptor import BRepAdaptor_Curve, BRepAdaptor_Surface
 from OCC.Core.BRepAlgoAPI import BRepAlgoAPI_Cut
 from OCC.Core.BRepCheck import BRepCheck_Analyzer
+from OCC.Core.BRepExtrema import BRepExtrema_DistShapeShape
 from OCC.Core.BRepLProp import BRepLProp_SLProps
 from OCC.Core.BRepFilletAPI import BRepFilletAPI_MakeFillet
 from OCC.Core.BRepGProp import brepgprop
@@ -112,6 +113,9 @@ MAX_PRIMITIVE_DEVIATION_MM = 0.25
 # これを超えるエッジがあれば掃引の破綻(ねじれ・面の裏返り)を意味する。
 # 実測(健全な300部品): 最大 112度。崩壊部品では 180度近くになる。
 MAX_DIHEDRAL_TURN_DEG = 150.0
+# 締結点が面から外れてよい上限[mm]。部品が自分の座面に届かなくなる崩壊を拾う
+# (2026-09-04実測: 300部品中1件のリブ部品で23.9mm外れていた)。
+MAX_FASTENING_OFFSET_MM = 0.1
 
 
 @dataclasses.dataclass(frozen=True)
@@ -592,10 +596,14 @@ def _read_step(path: str):
     if reader.ReadFile(path) != 1:
         raise ValueError(f"cannot read back {path}")
     reader.TransferRoots()
-    return reader.OneShape()
+    shape = reader.OneShape()
+    # 稀に何も転送されない(空のSTEP)。バッチを落とさず、その部品だけ捨てる。
+    if shape is None or shape.IsNull():
+        raise ValueError(f"{path} came back empty. Infeasible; resample.")
+    return shape
 
 
-def check_shape(shape) -> None:
+def check_shape(shape, fastening_points=()) -> None:
     """出来上がった形の合格判定(通らなければValueErrorで棄却)。
 
     * 0.05mm未満のゴミエッジが無い(引継ぎ書 §4.3)
@@ -603,6 +611,7 @@ def check_shape(shape) -> None:
     * シェルが有効
     * **外形が閉じた1本のループ**(崩壊検知。縫合漏れを全部拾う)
     * **隣接面が折り返らない**(崩壊検知。ねじれ・面の裏返りを拾う)
+    * **締結点が面の上にある**(崩壊検知。部品が自分の締結点に届かなくなる型)
     """
     _reject_junk_edges(shape)
     if not BRepCheck_Analyzer(shape).IsValid():
@@ -619,6 +628,15 @@ def check_shape(shape) -> None:
             f"two adjacent faces turn {turn:.0f}deg (limit {MAX_DIHEDRAL_TURN_DEG:.0f}) "
             "-- the surface folds back on itself. Infeasible; resample."
         )
+    for index, point in enumerate(fastening_points):
+        vertex = BRepBuilderAPI_MakeVertex(gp_Pnt(*point)).Vertex()
+        distance = BRepExtrema_DistShapeShape(shape, vertex)
+        distance.Perform()
+        if distance.Value() > MAX_FASTENING_OFFSET_MM:
+            raise ValueError(
+                f"fastening point {index + 1} is {distance.Value():.2f}mm off the surface "
+                "-- the part does not reach its own bearing area. Infeasible; resample."
+            )
 
 
 def _reject_junk_edges(shape, minimum_mm: float = MIN_EDGE_LENGTH_MM) -> None:
@@ -757,7 +775,8 @@ class OcctPartBuilder:
         # STEPの往復で曲線が再近似される(2026-09-04実測: メモリ上0.25mm以内だった
         # フィレット稜線が、読み戻すと0.839mmずれていた)。
         try:
-            check_shape(_read_step(stp_path))
+            check_shape(_read_step(stp_path),
+                        (point1.position_xyz, point2.position_xyz))
         except ValueError:
             os.remove(stp_path)
             raise
@@ -801,21 +820,16 @@ class OcctPartBuilder:
             cursor += span
         total = cursor
         inset = 2.0 * min_bearing_radius_mm
-        placed = bead_placement(spans, total, inset)
+        # ランアウトは深さの2倍で**固定**する。空きに合わせて縮めると走り終いの壁が
+        # ほぼ垂直になり、実物のビードに見えない(2026-09-04のユーザー指摘)。
+        runout = max(BEAD_MIN_RUNOUT_MM, RUNOUT_DEPTH_RATIO * bead.depth_mm)
+        placed = bead_placement(spans, total, inset, runout)
         if placed is None:
             raise ValueError(
-                "no place on the centreline for a bead (bearing areas and run-outs do not "
-                "fit). Infeasible; not attempting construction."
+                f"a bead with {runout:.1f}mm run-outs does not fit between the bearing areas "
+                f"(inset {inset:.1f}mm each end of {total:.1f}mm). Infeasible."
             )
         s0, s3 = placed
-        head = next(s1 for a, s1, straight in spans if straight and a <= s0 < s1)
-        tail = next(a for a, s1, straight in reversed(spans) if straight and a < s3 <= s1)
-        runout = min(RUNOUT_DEPTH_RATIO * bead.depth_mm, head - s0 - 0.5, s3 - tail - 0.5)
-        if runout < BEAD_MIN_RUNOUT_MM:
-            raise ValueError(
-                f"only {runout:.1f}mm is left for the bead run-out "
-                f"(need >= {BEAD_MIN_RUNOUT_MM:.1f}mm). Infeasible."
-            )
         s1, s2 = s0 + runout, s3 - runout
         if s2 - s1 < 5.0:
             raise ValueError(
