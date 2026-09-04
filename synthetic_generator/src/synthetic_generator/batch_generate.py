@@ -23,7 +23,7 @@ import pathlib
 import random
 from typing import Protocol
 
-from synthetic_generator.annotate import build_two_joint_pair
+from synthetic_generator.annotate import build_joints, build_two_joint_pair
 from synthetic_generator.bead import BeadParams, sample_bead
 from synthetic_generator.annotation_schema import AnnotationDocument, PartEntry
 from synthetic_generator.reinforcement import ReinforcementParams, sample_reinforcement
@@ -174,6 +174,7 @@ def build_general_part(builder, spec, bead, flange, out_dir: str, part_name: str
             fold2_slack_mm=spec.fold2_slack_mm,
             fold1_tilt_perturbation_rad=spec.fold1_tilt_perturbation_rad,
             target_folds=spec.target_folds,
+            extra_points=getattr(spec, "extra_points", ()),
             out_dir=out_dir,
             part_name=part_name,
             bead=bead,
@@ -431,7 +432,8 @@ def generate_recipe_batch(
                 json.dumps(
                     {
                         "part_id": part_id,
-                        "kind": kind_of(bead, flange, rib),
+                        "kind": kind,
+                        "feature": kind_of(bead, flange, rib),
                         "attempts_used": attempt + 1,
                         "geometry_label": plan.geometry_label,
                         "folds": len(plan.panel_frames) - 1,
@@ -456,8 +458,8 @@ def generate_recipe_batch(
                 thickness_mm=spec.thickness_mm,
                 thickness_source="synthetic_generator",
             )
-            for joint in build_two_joint_pair(part_id, spec.point1, spec.point2,
-                                              spec.hole_diameter_mm):
+            points = (spec.point1, spec.point2, *getattr(spec, "extra_points", ()))
+            for joint in build_joints(part_id, points, spec.hole_diameter_mm):
                 doc.add_joint(joint)
             if len(records) % 25 == 0:
                 doc.save()

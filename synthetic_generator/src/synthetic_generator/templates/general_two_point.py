@@ -197,6 +197,9 @@ class GeneralTwoJointSpec:
     # 狙いの曲げ本数(2026-09-04、多様性拡張D1)。Noneは従来どおり(2曲げ優先)。
     # 0/1は「形状を先に引いて締結点を導く」逆向き構築で作られる。
     target_folds: int | None = None
+    # 3点目以降の締結点(2026-09-04、実車007/011の再現)。空なら従来どおりの2点部品。
+    # 骨格(中心線・曲げ)は point1/point2 だけで決まり、追加点は既存パネルに載るだけ。
+    extra_points: tuple[FasteningPoint, ...] = ()
 
 
 def _random_unit_vector(rng: random.Random) -> Vec3:
@@ -413,7 +416,8 @@ def draw_fold_count(rng: random.Random) -> int:
 
 
 def _sample_sizes(rng: random.Random, thickness_range_mm, hole_diameter_range_mm,
-                  bearing_radius_mm=None):
+                  bearing_radius_mm=None, half_width_ratio_range=None,
+                  max_half_width_mm=None, bend_radius_range_mm=None):
     """締結点の配置に依らない寸法(板厚・穴径・座面半径・半幅・曲げR)。
 
     曲げRは半幅の0.9倍を超えられないので、半幅の**後**に引く(sample()と同じ順序)。
@@ -421,9 +425,15 @@ def _sample_sizes(rng: random.Random, thickness_range_mm, hole_diameter_range_mm
     thickness = rng.uniform(*thickness_range_mm)
     hole_diameter = rng.uniform(*hole_diameter_range_mm)
     bearing_radius = rng.uniform(*(bearing_radius_mm or MIN_BEARING_RADIUS_RANGE_MM))
-    half_width = min(MAX_HALF_WIDTH_MM, bearing_radius * rng.uniform(*HALF_WIDTH_MARGIN_RATIO_RANGE))
-    max_bend_radius = min(BEND_RADIUS_CAP_MM, 0.9 * half_width)
-    bend_radius = rng.uniform(MIN_BASE_BEND_RADIUS_MM, max(MIN_BASE_BEND_RADIUS_MM, max_bend_radius))
+    # 比を引いてから上限で切ると、比の上端が上限を超える族(帯幅70mmの3点族など)で
+    # 半幅が上限に張り付く(2026-09-04実測: 中央値が上限そのものになった)。上限を先に
+    # 畳んでから一様に引く。既定のつまみでは従来とほぼ同分布。
+    width_lo, width_hi = half_width_ratio_range or HALF_WIDTH_MARGIN_RATIO_RANGE
+    width_top = min(max_half_width_mm or MAX_HALF_WIDTH_MM, bearing_radius * width_hi)
+    half_width = rng.uniform(min(bearing_radius * width_lo, width_top), width_top)
+    floor, cap = bend_radius_range_mm or (MIN_BASE_BEND_RADIUS_MM, BEND_RADIUS_CAP_MM)
+    max_bend_radius = min(cap, 0.9 * half_width)
+    bend_radius = rng.uniform(floor, max(floor, max_bend_radius))
     return thickness, hole_diameter, bearing_radius, half_width, bend_radius
 
 
@@ -440,7 +450,9 @@ def _orthonormal_pair(rng: random.Random) -> tuple[Vec3, Vec3]:
 
 
 def _sample_single_fold_spec(rng, thickness_range_mm, hole_diameter_range_mm,
-                             bearing_radius_mm=None) -> GeneralTwoJointSpec:
+                             bearing_radius_mm=None, turn_range_deg=None,
+                             half_width_ratio_range=None, max_half_width_mm=None,
+                             bend_radius_range_mm=None) -> GeneralTwoJointSpec:
     """曲げ1本の部品を**形状から**引き、締結点を導出する(2026-09-04、D1)。
 
     点対を引いてから単曲げを解こうとすると、交線が締結点の後方に来る配置ばかり引いて
@@ -451,10 +463,12 @@ def _sample_single_fold_spec(rng, thickness_range_mm, hole_diameter_range_mm,
     締結点2は折れ目軸 w に直交する平面内に置く(=面のねじれ無し)。
     """
     thickness, hole, bearing, half_width, bend_radius = _sample_sizes(
-        rng, thickness_range_mm, hole_diameter_range_mm, bearing_radius_mm)
+        rng, thickness_range_mm, hole_diameter_range_mm, bearing_radius_mm,
+        half_width_ratio_range, max_half_width_mm, bend_radius_range_mm)
     n1, u1 = _orthonormal_pair(rng)
     w = _cross(n1, u1)                      # 折れ目軸(= panel1 の幅方向 v)
-    turn = math.radians(rng.uniform(SHORT_REGIME_MIN_TURN_DEG, SHORT_REGIME_MAX_TURN_DEG))
+    turn = math.radians(rng.uniform(*(turn_range_deg or
+                                      (SHORT_REGIME_MIN_TURN_DEG, SHORT_REGIME_MAX_TURN_DEG))))
     if rng.random() < 0.5:
         turn = -turn                        # 山折り/谷折りの両方を出す
     tangent = tangent_length_for_bend_angle_rad(abs(turn), bend_radius)
@@ -482,10 +496,13 @@ def _sample_single_fold_spec(rng, thickness_range_mm, hole_diameter_range_mm,
 
 
 def _sample_flat_spec(rng, thickness_range_mm, hole_diameter_range_mm,
-                      bearing_radius_mm=None, section_distance_mm=None) -> GeneralTwoJointSpec:
+                      bearing_radius_mm=None, section_distance_mm=None,
+                      half_width_ratio_range=None, max_half_width_mm=None,
+                      bend_radius_range_mm=None) -> GeneralTwoJointSpec:
     """曲げ0本(平板)。法線が平行で、2点が同一平面上にある構成。"""
     thickness, hole, bearing, half_width, bend_radius = _sample_sizes(
-        rng, thickness_range_mm, hole_diameter_range_mm, bearing_radius_mm)
+        rng, thickness_range_mm, hole_diameter_range_mm, bearing_radius_mm,
+        half_width_ratio_range, max_half_width_mm, bend_radius_range_mm)
     n1, u1 = _orthonormal_pair(rng)
     run = rng.uniform(*(section_distance_mm or FLAT_RUN_RANGE_MM))
     p1: Vec3 = (0.0, 0.0, 0.0)
@@ -516,6 +533,10 @@ def sample(
     target_folds: int | None = None,
     section_distance_mm: tuple[float, float] | None = None,
     bearing_radius_mm: tuple[float, float] | None = None,
+    turn_range_deg: tuple[float, float] | None = None,
+    half_width_ratio_range: tuple[float, float] | None = None,
+    max_half_width_mm: float | None = None,
+    bend_radius_range_mm: tuple[float, float] | None = None,
 ) -> GeneralTwoJointSpec:
     """任意の法線・任意の位置の締結点ペアを1組サンプリングする。
 
@@ -534,10 +555,14 @@ def sample(
     """
     if target_folds == 1:
         return _sample_single_fold_spec(rng, thickness_range_mm, hole_diameter_range_mm,
-                                        bearing_radius_mm)
+                                        bearing_radius_mm, turn_range_deg,
+                                        half_width_ratio_range, max_half_width_mm,
+                                        bend_radius_range_mm)
     if target_folds == 0:
         return _sample_flat_spec(rng, thickness_range_mm, hole_diameter_range_mm,
-                                 bearing_radius_mm, section_distance_mm)
+                                 bearing_radius_mm, section_distance_mm,
+                                 half_width_ratio_range, max_half_width_mm,
+                                 bend_radius_range_mm)
 
     point1, point2 = _sample_point_pair(rng, gentle_folds, section_distance_mm)
     if target_classes:
@@ -551,15 +576,21 @@ def sample(
     thickness = rng.uniform(*thickness_range_mm)
     hole_diameter = rng.uniform(*hole_diameter_range_mm)
     bearing_radius = rng.uniform(*(bearing_radius_mm or MIN_BEARING_RADIUS_RANGE_MM))
-    half_width = min(MAX_HALF_WIDTH_MM, bearing_radius * rng.uniform(*HALF_WIDTH_MARGIN_RATIO_RANGE))
+    # 比を引いてから上限で切ると、比の上端が上限を超える族(帯幅70mmの3点族など)で
+    # 半幅が上限に張り付く(2026-09-04実測: 中央値が上限そのものになった)。上限を先に
+    # 畳んでから一様に引く。既定のつまみでは従来とほぼ同分布。
+    width_lo, width_hi = half_width_ratio_range or HALF_WIDTH_MARGIN_RATIO_RANGE
+    width_top = min(max_half_width_mm or MAX_HALF_WIDTH_MM, bearing_radius * width_hi)
+    half_width = rng.uniform(min(bearing_radius * width_lo, width_top), width_top)
 
     # bend_radius_mmはhalf_widthの0.9倍を超えられない(gsd_build.build_general_two_point
     # の既存チェックと同じ)。これはhalf_widthだけで決まる独立な制約なので、ここで
     # 先に反映しておけば無駄なInfeasible試行を減らせる — 中間折れ位置(fold*_slack_mm)
     # とは無関係にhalf_widthさえ分かれば計算できるため、SS8.3の「Rを先に決める」原則
     # (T/L1/L3の相互依存)には抵触しない。
-    max_bend_radius = min(BEND_RADIUS_CAP_MM, 0.9 * half_width)
-    bend_radius = rng.uniform(MIN_BASE_BEND_RADIUS_MM, max(MIN_BASE_BEND_RADIUS_MM, max_bend_radius))
+    floor, cap = bend_radius_range_mm or (MIN_BASE_BEND_RADIUS_MM, BEND_RADIUS_CAP_MM)
+    max_bend_radius = min(cap, 0.9 * half_width)
+    bend_radius = rng.uniform(floor, max(floor, max_bend_radius))
 
     # 中間折れ目の位置は「bearing半径 + フィレット接線長 + slack」で決まる。両側の合計が
     # 締結点間の距離を食い尽くすとランプが逆走し、折れ角180度で成立しなくなる。

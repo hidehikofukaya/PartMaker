@@ -7,3 +7,4 @@ __pycache__/
 tools/probe_output/
 synthetic_parts/
 tools/occt_smoke/
+fill_mid_surf/

@@ -715,6 +715,7 @@ class OcctPartBuilder:
         fold2_slack_mm: float,
         fold1_tilt_perturbation_rad: float = 0.0,
         target_folds: int | None = None,
+        extra_points: tuple = (),
         out_dir: str,
         part_name: str,
         bead: BeadParams | None = None,
@@ -778,7 +779,8 @@ class OcctPartBuilder:
         # フィレット稜線が、読み戻すと0.839mmずれていた)。
         try:
             check_shape(_read_step(stp_path),
-                        (point1.position_xyz, point2.position_xyz))
+                        (point1.position_xyz, point2.position_xyz,
+                         *(p.position_xyz for p in extra_points)))
         except ValueError:
             os.remove(stp_path)
             raise

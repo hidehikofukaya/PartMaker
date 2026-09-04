@@ -61,7 +61,8 @@ def api_tree():
         return nodes
 
     # Constrain to known target output directories for instant loading
-    target_dirs = ["synthetic_parts", "tools/probe_output"]
+    # fill_mid_surf = 実車(Tesla Model 3 BIW)の中立面と締結点アノテーション。
+    target_dirs = ["synthetic_parts", "fill_mid_surf", "tools/probe_output"]
     tree = []
     for d_name in target_dirs:
         d_path = ROOT_DIR / d_name
@@ -180,7 +181,16 @@ def api_mesh():
 
 @app.route("/api/sidecar")
 def api_sidecar():
-    """Locates and reads sidecar JSON files corresponding to the STEP file."""
+    """STEPに対応するサイドカー(params / features / joints)を返す。
+
+    合成部品と実車部品でディレクトリ構成も joints.json のスキーマも違うので、
+    ここで**片方に正規化**してからフロントへ渡す:
+
+      合成:  <chunk>/mid/<part_id>_mid.stp     + <chunk>/{params,features,annotations}/
+      実車:  <asm>/fill/<part_id>_....stp      + <asm>/annotations/joints.json
+             (part_id はファイル名の先頭。締結の座標は per_part[] の
+              hole_center_xyz / contact_xyz にあり、軸は axis.direction_xyz)
+    """
     rel_path = request.args.get("path", "")
     if not rel_path:
         return jsonify({"error": "No path provided"}), 400
@@ -189,20 +199,19 @@ def api_sidecar():
     if not stp_path.exists():
         return jsonify({"error": "File not found"}), 404
 
-    # Extract part_id and dir structure
-    # Expected relative path format: path/to/mid/<part_id>_mid.stp
-    part_id = stp_path.name.replace("_mid.stp", "")
-    batch_dir = stp_path.parent.parent  # goes up to chunk/
+    real_vehicle = "fill_mid_surf" in pathlib.Path(rel_path).parts
+    if real_vehicle:
+        part_id = stp_path.name.split("_")[0]
+    else:
+        part_id = stp_path.name.replace("_mid.stp", "")
+    batch_dir = stp_path.parent.parent
 
     params_path = batch_dir / "params" / f"{part_id}.json"
     features_path = batch_dir / "features" / f"{part_id}.json"
     joints_path = batch_dir / "annotations" / "joints.json"
 
-    data = {
-        "params": None,
-        "features": None,
-        "joints": None
-    }
+    data = {"params": None, "features": None, "joints": None,
+            "part_id": part_id, "real_vehicle": real_vehicle}
 
     try:
         if params_path.exists():
@@ -210,17 +219,52 @@ def api_sidecar():
         if features_path.exists():
             data["features"] = json.loads(features_path.read_text(encoding="utf-8"))
         if joints_path.exists():
-            joints_all = json.loads(joints_path.read_text(encoding="utf-8"))
-            # Filter joints specifically for this part_id
-            part_joints = []
-            for j in joints_all.get("joints", []):
-                if part_id in j.get("parts", []):
-                    part_joints.append(j)
-            data["joints"] = part_joints
-    except Exception as e:
-        return jsonify({"error": f"Failed to parse sidecar: {str(e)}"}), 500
+            raw = json.loads(joints_path.read_text(encoding="utf-8"))
+            data["joints"] = normalise_joints(raw, part_id)
+            # 座面(必要平面)半径はjoints.jsonに無く、生成器のspecにある。
+            bearing = ((data["params"] or {}).get("spec") or {}).get("min_bearing_radius_mm")
+            for joint in data["joints"]:
+                joint["bearing_radius_mm"] = joint["bearing_radius_mm"] or bearing
+    except Exception as exc:
+        return jsonify({"error": f"Failed to parse sidecar: {str(exc)}"}), 500
 
     return jsonify(data)
+
+
+def normalise_joints(document, part_id):
+    """joints.json の締結点を、どのスキーマでも同じ形にして返す。
+
+    返す各要素: {type, hole_center_xyz, axis(3要素), hole_diameter_mm,
+                bearing_radius_mm, partners}
+    """
+    out = []
+    for joint in document.get("joints", []):
+        if part_id not in joint.get("parts", []):
+            continue
+        axis = joint.get("axis")
+        if isinstance(axis, dict):                       # 実車 schema 1.1
+            direction = axis.get("direction_xyz")
+            fallback = axis.get("start_xyz")
+        else:                                            # 合成(既に平坦)
+            direction = axis
+            fallback = joint.get("hole_center_xyz")
+        centre = joint.get("hole_center_xyz")
+        diameter = joint.get("hole_diameter_mm")
+        for entry in joint.get("per_part", []):
+            if entry.get("part_id") != part_id:
+                continue
+            centre = entry.get("hole_center_xyz") or entry.get("contact_xyz") or centre
+            diameter = entry.get("hole_diameter_mm", diameter)
+        out.append({
+            "type": joint.get("type", "joint"),
+            "joint_id": joint.get("joint_id"),
+            "hole_center_xyz": centre or fallback,
+            "axis": direction,
+            "hole_diameter_mm": diameter,
+            "bearing_radius_mm": joint.get("bearing_radius_mm"),
+            "partners": [p for p in joint.get("parts", []) if p != part_id],
+        })
+    return out
 
 # ---------------------------------------------------------------- Frontend HTML Template
 
@@ -471,6 +515,7 @@ HTML_TEMPLATE = """
                 <button class="toolbar-btn active" id="btnShaded" onclick="setRenderMode('shaded')">Shaded</button>
                 <button class="toolbar-btn" id="btnColored" onclick="setRenderMode('faceColors')">Face Labeling</button>
                 <button class="toolbar-btn" id="btnEdges" onclick="toggleEdges()">Edges On/Off</button>
+                <button class="toolbar-btn active" id="btnJoints" onclick="toggleJoints()">締結点 On/Off</button>
             </div>
             <div class="viewer-overlay" id="viewerOverlay">No STP selected. Choose a file from the sidebar.</div>
             <div id="canvas3d"></div>
@@ -484,6 +529,7 @@ HTML_TEMPLATE = """
                 <button class="tab-btn" id="tabBtnParams" onclick="switchTab('params')">Params</button>
                 <button class="tab-btn" id="tabBtnFeatures" onclick="switchTab('features')">Features</button>
                 <button class="tab-btn" id="tabBtnFaces" onclick="switchTab('faces')">Face List</button>
+                <button class="tab-btn" id="tabBtnJoints" onclick="switchTab('joints')">締結点</button>
             </div>
             <div class="tab-content" id="tabContent">
                 <p>Select a part file to inspect machine-learning readiness.</p>
@@ -495,6 +541,7 @@ HTML_TEMPLATE = """
         let scene, camera, renderer, controls;
         let meshGroup = null;
         let jointsGroup = null;
+        let showJoints = true;
         let currentStpPath = "";
         let renderMode = "shaded"; // 'shaded' | 'faceColors'
         let showEdges = true;
@@ -754,47 +801,62 @@ HTML_TEMPLATE = """
             `;
         }
 
+        // 締結の種類ごとの色(実車アノテーションと合成の両方に効く)
+        const JOINT_COLORS = {
+            weld:          0xed8936,   // オレンジ: スポット溶接
+            bolt:          0x48bb78,   // 緑: ボルト
+            mounting_hole: 0x4299e1,   // 青: 取付穴
+            other_hole:    0x718096,   // グレー: その他の穴(締結ではない)
+        };
+
         function renderJoints() {
             if (jointsGroup) {
                 scene.remove(jointsGroup);
             }
             jointsGroup = new THREE.Group();
 
-            if (sidecarData && sidecarData.joints) {
+            if (showJoints && sidecarData && sidecarData.joints) {
                 sidecarData.joints.forEach(joint => {
                     const pos = joint.hole_center_xyz;
                     const axis = joint.axis;
-                    if (!pos || !axis) return;
+                    if (!pos) return;
+                    const color = JOINT_COLORS[joint.type] || 0x48bb78;
 
-                    // 1. Create a glowing green sphere representing the fastening point / minimum required flat area
-                    // Radius is set to min_bearing_radius_mm (usually around 10.0mm-15.0mm) to show the bearing zone!
-                    const r = joint.bearing_radius_mm || 10.0;
+                    // 座面(必要平面)の目安。合成は bearing_radius_mm、実車は穴径から。
+                    const r = joint.bearing_radius_mm
+                        || (joint.hole_diameter_mm ? joint.hole_diameter_mm * 1.5 : 10.0);
                     const sphereGeom = new THREE.SphereGeometry(r, 16, 16);
                     const sphereMat = new THREE.MeshBasicMaterial({
-                        color: 0x48bb78, // bright green
-                        transparent: true,
-                        opacity: 0.35, // semi-transparent
-                        wireframe: true // wireframe to not block solid sheet metal view
+                        color: color, transparent: true, opacity: 0.35, wireframe: true
                     });
                     const sphere = new THREE.Mesh(sphereGeom, sphereMat);
                     sphere.position.set(pos[0], pos[1], pos[2]);
                     jointsGroup.add(sphere);
 
-                    // A smaller solid inner core for the exact center of fastening
-                    const coreGeom = new THREE.SphereGeometry(2.0, 8, 8);
-                    const coreMat = new THREE.MeshBasicMaterial({ color: 0x48bb78 });
+                    // 締結点そのもの
+                    const coreGeom = new THREE.SphereGeometry(1.6, 10, 10);
+                    const coreMat = new THREE.MeshBasicMaterial({ color: color });
                     const core = new THREE.Mesh(coreGeom, coreMat);
                     core.position.set(pos[0], pos[1], pos[2]);
                     jointsGroup.add(core);
 
-                    // 2. Create a solid arrow helper pointing along the fastening normal axis (thickness direction)
-                    const dirVec = new THREE.Vector3(axis[0], axis[1], axis[2]).normalize();
-                    const originVec = new THREE.Vector3(pos[0], pos[1], pos[2]);
-                    const arrowHelper = new THREE.ArrowHelper(dirVec, originVec, 25.0, 0x3182ce, 6.0, 3.0); // blue arrow
-                    jointsGroup.add(arrowHelper);
+                    // 締結軸(板厚方向)
+                    if (axis) {
+                        const dirVec = new THREE.Vector3(axis[0], axis[1], axis[2]).normalize();
+                        const originVec = new THREE.Vector3(pos[0], pos[1], pos[2]);
+                        jointsGroup.add(new THREE.ArrowHelper(dirVec, originVec, 25.0, color, 6.0, 3.0));
+                        jointsGroup.add(new THREE.ArrowHelper(
+                            dirVec.clone().negate(), originVec, 25.0, color, 6.0, 3.0));
+                    }
                 });
             }
             scene.add(jointsGroup);
+        }
+
+        function toggleJoints() {
+            showJoints = !showJoints;
+            document.getElementById("btnJoints").classList.toggle("active", showJoints);
+            renderJoints();
         }
 
         function setRenderMode(mode) {
@@ -816,7 +878,7 @@ HTML_TEMPLATE = """
 
         function switchTab(tab) {
             activeTab = tab;
-            ["tabBtnQuality", "tabBtnParams", "tabBtnFeatures", "tabBtnFaces"].forEach(btn => {
+            ["tabBtnQuality", "tabBtnParams", "tabBtnFeatures", "tabBtnFaces", "tabBtnJoints"].forEach(btn => {
                 document.getElementById(btn).classList.remove("active");
             });
             document.getElementById(`tabBtn${tab.charAt(0).toUpperCase() + tab.slice(1)}`).classList.add("active");
@@ -828,6 +890,34 @@ HTML_TEMPLATE = """
             const container = document.getElementById("tabContent");
             if (!currentStpPath) {
                 container.innerHTML = "<p>Select a part file to inspect sidecar metadata.</p>";
+                return;
+            }
+
+            if (activeTab === "joints") {
+                const joints = sidecarData.joints || [];
+                if (!joints.length) {
+                    container.innerHTML = "<p>この部品には締結点アノテーションがありません。</p>";
+                    return;
+                }
+                const swatch = t => ({weld: "#ed8936", bolt: "#48bb78",
+                                      mounting_hole: "#4299e1", other_hole: "#718096"}[t] || "#48bb78");
+                let html = `<div style="margin-bottom:10px;color:#a0aec0;">${joints.length} 箇所`
+                    + (sidecarData.real_vehicle ? "(実車アノテーション)" : "(生成器の真値)") + "</div>";
+                joints.forEach((j, i) => {
+                    const p = j.hole_center_xyz || [];
+                    html += `<div class="quality-metric" style="align-items:flex-start;">
+                        <span class="label">
+                          <span style="display:inline-block;width:10px;height:10px;border-radius:50%;
+                                background:${swatch(j.type)};margin-right:6px;"></span>
+                          ${i + 1}. ${j.type}${j.joint_id ? " (" + j.joint_id + ")" : ""}
+                        </span>
+                        <span class="val" style="text-align:right;">
+                          ${p.length ? p.map(v => v.toFixed(1)).join(", ") : "座標なし"}<br>
+                          ${j.hole_diameter_mm ? "⌀" + j.hole_diameter_mm.toFixed(1) + "mm<br>" : ""}
+                          ${j.partners && j.partners.length ? "相手: " + j.partners.join(", ") : ""}
+                        </span></div>`;
+                });
+                container.innerHTML = html;
                 return;
             }
 

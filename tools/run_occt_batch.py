@@ -103,6 +103,7 @@ def main() -> None:
     classes: collections.Counter = collections.Counter()
     kinds: collections.Counter = collections.Counter()
     faces_max = edges_max = 0
+    counts: list[int] = []   # 締結点の数(3点族で3になる)
     for record in records:
         params_path = out_dir / "params" / f"{record.part_id}.json"
         meta = json.loads(params_path.read_text(encoding="utf-8"))
@@ -122,6 +123,7 @@ def main() -> None:
         faces_max, edges_max = max(faces_max, n_faces), max(edges_max, n_edges)
         classes[str(classify(record.spec.point1, record.spec.point2))] += 1
         kinds[meta["kind"]] += 1
+        counts.append(2 + len(getattr(record.spec, "extra_points", ())))
 
     manifest = {
         "schema": "partmaker_manifest/1",
@@ -133,7 +135,7 @@ def main() -> None:
         "complete": True,
         "n_parts": len(records),
         "recipe": recipe["parts"],
-        "fastener_count": {"min": 2, "max": 2},
+        "fastener_count": {"min": min(counts or [2]), "max": max(counts or [2])},
         "capacity": {"faces_max": faces_max, "edges_max": edges_max, "loops_max": 1},
         "config_classes": dict(classes),
         "reinforcement": dict(kinds),
