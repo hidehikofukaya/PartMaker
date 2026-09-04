@@ -1,0 +1,14 @@
+{
+  "family": "occt12",
+  "chunk": 1,
+  "seed": 20260915,
+  "note": "リブ600 + パッチ(無特徴)200。パッチは締結点が近く曲げ0〜1回でリブの余地が無いものだけ。",
+  "parts": [
+    {"kind": "rib", "count": 600,
+     "knobs": {"distance_mm": [50, 120], "fold_weights": [[1, 0.7], [2, 0.3]],
+               "bearing_radius_mm": [15.0, 22.0]}},
+    {"kind": "plain", "count": 200,
+     "knobs": {"distance_mm": [40, 110], "fold_weights": [[1, 0.65], [0, 0.35]],
+               "bearing_radius_mm": [15.0, 22.0]}}
+  ]
+}

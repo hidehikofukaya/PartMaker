@@ -1,0 +1,12 @@
+{
+  "family": "occt11",
+  "chunk": 1,
+  "seed": 20260914,
+  "note": "確実に生成できる族から。ビード600 + フランジ600。",
+  "parts": [
+    {"kind": "bead", "count": 600,
+     "knobs": {"distance_mm": [110, 220], "fold_weights": [[2, 0.6], [1, 0.4]]}},
+    {"kind": "flange", "count": 600,
+     "knobs": {"distance_mm": [80, 220], "gentle": true}}
+  ]
+}

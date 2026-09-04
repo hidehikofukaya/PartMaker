@@ -200,20 +200,23 @@ def build(meta: dict) -> dict:
             "wall_top_probe": list(fplan.wall_top_probe),
         }
 
-    # --- リブ(内角を橋渡しする三角形2枚、2026-09-04 D3改訂) ---
+    # --- リブ(可変半径のコーナーブレンド、2026-09-04 D3再改訂) ---
     if meta.get("rib"):
         rib = RibParams(**meta["rib"])
         index = min(rib.fold_index, max(0, len(out["folds"]) - 1))
         fold = out["folds"][index] if out["folds"] else None
+        angle = math.radians(fold["angle_deg"]) if fold else 0.0
         out["rib"] = {
             **meta["rib"],
-            # 中立面に出るのは四面体 V1-V2-A-B のうち V1AB と V2AB の2面。稜A-Bは曲げ線に直交。
+            # 曲げのコーナーを、幅 |y|<=c の範囲だけ大きな半径で丸めたもの。
+            # 半径は中央 bulge_radius_mm から、|y|=c で基準面の曲げRへ線形に落ちる。
             "fold_id": index,
             "sharp_line": fold["sharp_line"] if fold else None,
             "concave_side": fold["concave_side"] if fold else 0,
+            "base_bend_radius_mm": spec["bend_radius_mm"],
             # 領域判定用: 曲げ線から走行方向/幅方向にこの距離まで
-            "reach_along_mm": rib.reach_mm,
-            "reach_across_mm": rib.half_width_mm + rib.taper_mm,
+            "reach_along_mm": rib.reach_mm(angle),
+            "reach_across_mm": rib.half_width_mm,
         }
 
     # --- 余肉カット(外形側の特徴) ---

@@ -94,7 +94,7 @@ from synthetic_generator.general_geometry import (
     bead_placement,
     plan_general_two_point,
 )
-from synthetic_generator.rib import RibParams
+from synthetic_generator.rib import RIB_BEND_RADIUS_MM, RibParams
 
 SEW_TOLERANCE_MM = 0.01
 # ランアウト長(平地->ビード断面の遷移)。実物のビードの走り終いは深さの2〜3倍程度。
@@ -161,6 +161,10 @@ def _rotate(v: Vec3, axis: Vec3, angle: float) -> Vec3:
     k = _cross(axis, v)
     d = _dot(axis, v)
     return tuple(v[i] * c + k[i] * s + axis[i] * d * (1.0 - c) for i in range(3))
+
+
+def _sub_axis(fold) -> Vec3:
+    return fold["axis"]
 
 
 def _rotate_about(point: Vec3, centre: Vec3, axis: Vec3, angle: float) -> Vec3:
@@ -759,8 +763,6 @@ class OcctPartBuilder:
             self._sweep_uniform(path, frame, w, section, faces)
 
         shape, faces = self._sew(faces)
-        if rib is not None:
-            shape, faces = self._fillet_rib_edges(shape, faces)
         shape, faces = self._apply_corner_relief(
             shape, faces, path, start, ey, normal0, w,
             half_width_mm=half_width_mm,
@@ -869,53 +871,49 @@ class OcctPartBuilder:
                     frame = self._sweep_segment(piece, frame, w, sec, faces, tag)
             cursor += step.length
 
-    # -------------------------------------------------------- リブ(内角を橋渡しする三角形2枚)
+    # -------------------------------------------------------- リブ(可変半径のコーナーブレンド)
 
     def _build_rib_part(self, plan, w: Vec3, ey: Vec3, rib: RibParams,
                         half_width_mm: float, bend_radius_mm: float, faces) -> None:
         """リブ部品は断面掃引では作れないので、面を明示的に張る。
 
-        パネルの境界が曲げ線のところで **V 字**(V1 -> A -> V2)になり、幅方向に
-        一定でないため。パネルは平面なので多角形1枚で張れる。曲げは:
+        リブは「曲げのコーナーを幅方向の中央だけ大きな半径で丸めたもの」。
+        曲げ線に直交する各断面で パネル1 -> 円弧(半径 rho(y)) -> パネル2 と繋ぐ。
+        rho は中央で大きく、リブの端 |y|=c で基準面の曲げRに一致するので、
+        **基準面のフィレットと連続**する(遷移帯も頂点も要らない)。
 
-          |y| >= c+t : 通常の円筒フィレット(厳密)
-          |y| in [c, c+t] : 円弧から鋭角へ落ちる遷移(頂点V へのロフト)
-          |y| <  c   : フィレットせず、リブの三角形 V1AB / V2AB に置き換わる
+        接線長 T(y) = rho(y)*tan(φ/2) は y に線形なので、パネルの境界は直線になり、
+        平面視のフットプリントは菱形になる。パネルとの境目は接線連続。
 
-        (ユーザー指定 2026-09-04: 基準面をシャープなまま作ってリブを置き、そのあと
-         リブ幅の外側だけを最小Rでフィレットする、という工程の帰結)
+        丸みをフィレット演算で付けようとすると頂点ブレンドの境界が解析曲線にならず、
+        ゲートA(1本の直線/円弧)を通らない(2026-09-04実測: ずれ中央値0.625mm、
+        33件中2件しか通過しない)。**丸みは構築で作る。**
         """
         frames, tangents = plan.panel_frames, plan.fold_tangents
         width = half_width_mm
-        # sharp = リブのフットプリント外側に残すシャープな折れ、taper = その外の遷移帯。
-        c, sharp, taper = rib.half_width_mm, rib.sharp_margin_mm, rib.taper_mm
-        outer = c + sharp                      # ここまでシャープ / ここから遷移
         target = min(rib.fold_index, len(frames) - 2)
 
         def pt(index: int, run: float, y: float) -> Vec3:
             frame = frames[index]
             return _add(frame.origin, _scale(frame.u, run), _scale(ey, y))
 
-        # 接線長は**自分で測った折れ角から**出す。`plan.fold_tangents` は法線どうしの
-        # 角度で計算されており、ここで使う「wまわりの符号付き角」と0.2度ほどずれる。
-        # R=5mmで94度回すと0.8mmの食い違いになり、遷移ロフトが接続しなくなる
-        # (2026-09-04に実測)。自前で閉じたほうが構成的に正しい。
+        # 折れ角と接線長は自分で測った符号付き角から出す(plan側の値とは0.2度ずれる)。
         folds = []
-        cuts = []
         for k in range(len(frames) - 1):
             normal = _normalize(_cross(frames[k].u, frames[k].v))
             phi = _signed_angle_about(frames[k].u, frames[k + 1].u, w)
-            cut = bend_radius_mm * abs(math.tan(phi / 2.0))
-            fold_run = frames[k].far_run_mm
-            centre = _add(pt(k, fold_run - cut, 0.0),
-                          _scale(normal, -(1.0 if phi > 0 else -1.0) * bend_radius_mm))
-            folds.append({"phi": phi, "run": fold_run, "cut": cut, "centre": centre})
-            cuts.append(cut)
+            folds.append({
+                "phi": phi, "run": frames[k].far_run_mm, "normal": normal,
+                "half_tan": abs(math.tan(phi / 2.0)),
+                "next_base": frames[k + 1].near_run_mm, "axis": w,
+            })
+
+        stations = self._rib_stations(rib, width, folds[target], bend_radius_mm)
 
         # --- パネル(平面多角形) ---
         for k, frame in enumerate(frames):
-            near = self._panel_edge(k, frames, cuts, rib, target, width, pt, near=True)
-            far = self._panel_edge(k, frames, cuts, rib, target, width, pt, near=False)
+            near = self._panel_edge(k, frames, folds, target, width, pt, stations, near=True)
+            far = self._panel_edge(k, frames, folds, target, width, pt, stations, near=False)
             points = near + list(reversed(far))
             maker = BRepBuilderAPI_MakeWire()
             for i in range(len(points)):
@@ -927,88 +925,85 @@ class OcctPartBuilder:
 
         # --- 曲げ ---
         for k, fold in enumerate(folds):
-            axis = gp_Ax1(gp_Pnt(*fold["centre"]), gp_Dir(*w))
-            spans = ([(-width, -(outer + taper)), (outer + taper, width)] if k == target
-                     else [(-width, width)])
+            cut = bend_radius_mm * fold["half_tan"]
+            sign = 1.0 if fold["phi"] > 0 else -1.0
+            centre = _add(pt(k, fold["run"] - cut, 0.0),
+                          _scale(fold["normal"], -sign * bend_radius_mm))
+            axis = gp_Ax1(gp_Pnt(*centre), gp_Dir(*w))
+            spans = ([(-width, -rib.half_width_mm), (rib.half_width_mm, width)]
+                     if k == target else [(-width, width)])
             for index, (y0, y1) in enumerate(spans):
                 edge = BRepBuilderAPI_MakeEdge(
-                    gp_Pnt(*pt(k, fold["run"] - fold["cut"], y0)),
-                    gp_Pnt(*pt(k, fold["run"] - fold["cut"], y1))).Edge()
+                    gp_Pnt(*pt(k, fold["run"] - cut, y0)),
+                    gp_Pnt(*pt(k, fold["run"] - cut, y1))).Edge()
                 patch = BRepPrimAPI_MakeRevol(edge, axis, fold["phi"]).Shape()
                 faces[topods.Face(patch)] = f"bend_{k}_{index}"
             if k != target:
                 continue
 
-            # 遷移: y=±(c+taper) の円弧から、y=±c の鋭角の点 V へ落とす。
-            for side in (-1, 1):
-                y_arc = side * (outer + taper)
-                start_pt = pt(k, fold["run"] - fold["cut"], y_arc)
-                mid_pt = _rotate_about(start_pt, fold["centre"], w, fold["phi"] / 2.0)
-                end_pt = _rotate_about(start_pt, fold["centre"], w, fold["phi"])
-                arc = GC_MakeArcOfCircle(gp_Pnt(*start_pt), gp_Pnt(*mid_pt), gp_Pnt(*end_pt)).Value()
-                loft = BRepOffsetAPI_ThruSections(False, True)
-                loft.AddVertex(BRepBuilderAPI_MakeVertex(
-                    gp_Pnt(*pt(k, fold["run"], side * outer))).Vertex())
-                loft.AddWire(BRepBuilderAPI_MakeWire(
-                    BRepBuilderAPI_MakeEdge(arc).Edge()).Wire())
-                loft.Build()
-                if not loft.IsDone():
-                    raise ValueError("the rib fillet taper failed")
-                explorer = TopExp_Explorer(loft.Shape(), TopAbs_FACE)
-                while explorer.More():
-                    faces[topods.Face(explorer.Current())] = \
-                        f"rib_taper_{'p' if side > 0 else 'm'}"
-                    explorer.Next()
-
-            # リブ本体: 四面体 V1-V2-A-B のうち中立面に出る2面。
-            v1 = pt(k, fold["run"], -c)
-            v2 = pt(k, fold["run"], c)
-            apex_a = pt(k, fold["run"] - rib.leg1_mm, 0.0)
-            # **注意**: 折れ目の位置はパネル k+1 の run=0 とは限らない。自由折れ目
-            # チェーンでは origin が折れ目そのものだが、単曲げ(single_fold_layout)では
-            # origin が締結点にあり折れ目は near_run_mm にある(ここを取り違えて
-            # パネルが巨大なスリバーになった。2026-09-04に実測)。
-            base_next = frames[k + 1].near_run_mm
-            apex_b = pt(k + 1, base_next + rib.leg2_mm, 0.0)
-            for name, corner in (("rib_l", v1), ("rib_r", v2)):
-                wire = BRepBuilderAPI_MakeWire(
-                    BRepBuilderAPI_MakeEdge(gp_Pnt(*corner), gp_Pnt(*apex_a)).Edge(),
-                    BRepBuilderAPI_MakeEdge(gp_Pnt(*apex_a), gp_Pnt(*apex_b)).Edge(),
-                    BRepBuilderAPI_MakeEdge(gp_Pnt(*apex_b), gp_Pnt(*corner)).Edge()).Wire()
-                faces[topods.Face(BRepBuilderAPI_MakeFace(wire, True).Face())] = name
+            # --- リブ本体: 隣り合う断面の円弧どうしを直線織り面でつなぐ ---
+            arcs = [self._rib_arc(pt, k, fold, y, radius) for y, radius in stations]
+            for index, (first, second) in enumerate(zip(arcs, arcs[1:])):
+                try:
+                    face = brepfill.Face(first, second)
+                except RuntimeError as exc:
+                    raise ValueError(f"rib blend patch {index} failed ({exc})")
+                faces[topods.Face(face)] = f"rib_{index}"
 
     @staticmethod
-    def _panel_edge(k, frames, cuts, rib: RibParams, target: int,
-                    width: float, pt, *, near: bool) -> list:
+    def _rib_stations(rib: RibParams, width: float, fold, bend_radius_mm: float):
+        """リブ断面を刻む (y, 丸め半径) の列。両端は基準面の曲げRに一致する。"""
+        count = max(2, rib.stations)
+        values = []
+        for i in range(-count, count + 1):
+            y = rib.half_width_mm * i / count
+            values.append((y, rib.radius_at(y, bend_radius_mm)))
+        return values
+
+    @staticmethod
+    def _rib_arc(pt, k: int, fold, y: float, radius: float):
+        """幅座標 y での、両パネルに接する円弧(パネルk -> パネルk+1)。"""
+        cut = radius * fold["half_tan"]
+        sign = 1.0 if fold["phi"] > 0 else -1.0
+        start = pt(k, fold["run"] - cut, y)
+        centre = _add(pt(k, fold["run"] - cut, 0.0), _scale(fold["normal"], -sign * radius))
+        centre = _add(centre, _scale(pt(k, 0.0, y), 1.0), _scale(pt(k, 0.0, 0.0), -1.0))
+        end = _rotate_about(start, centre, _sub_axis(fold), fold["phi"])
+        mid = _rotate_about(start, centre, _sub_axis(fold), fold["phi"] / 2.0)
+        arc = GC_MakeArcOfCircle(gp_Pnt(*start), gp_Pnt(*mid), gp_Pnt(*end)).Value()
+        return BRepBuilderAPI_MakeEdge(arc).Edge()
+
+    @staticmethod
+    def _panel_edge(k, frames, folds, target: int, width: float, pt, stations,
+                    *, near: bool) -> list:
         """パネル k の手前側/奥側の境界を y 昇順の点列で返す。
 
-        リブが載る曲げに面する側だけ V 字(タンジェント線 -> V1 -> 頂点 -> V2 -> タンジェント線)。
+        リブが載る曲げに面する側は、接線長 T(y)=rho(y)*tan(φ/2) をなぞる折れ線になる
+        (rho が y に線形なので実際には直線2本 + 外側の直線)。
         """
-        c, taper = rib.half_width_mm, rib.taper_mm
-        outer = c + rib.sharp_margin_mm
         if near:
             if k == 0:
                 run = frames[0].near_run_mm
                 return [pt(0, run, -width), pt(0, run, width)]
-            # 折れ目はパネルkの near_run_mm の位置(単曲げでは0ではない)。
+            fold = folds[k - 1]
             base = frames[k].near_run_mm
-            cut = base + cuts[k - 1]
             if k - 1 != target:
-                return [pt(k, cut, -width), pt(k, cut, width)]
-            return [pt(k, cut, -width), pt(k, cut, -(outer + taper)), pt(k, base, -outer),
-                    pt(k, base, -c), pt(k, base + rib.leg2_mm, 0.0), pt(k, base, c),
-                    pt(k, base, outer), pt(k, cut, outer + taper), pt(k, cut, width)]
+                cut = RIB_BEND_RADIUS_MM * fold["half_tan"]
+                return [pt(k, base + cut, -width), pt(k, base + cut, width)]
+            edge = [pt(k, base + radius * fold["half_tan"], y) for y, radius in stations]
+            outer = RIB_BEND_RADIUS_MM * fold["half_tan"]
+            return ([pt(k, base + outer, -width)] + edge + [pt(k, base + outer, width)])
         if k == len(frames) - 1:
             run = frames[k].far_run_mm
             return [pt(k, run, -width), pt(k, run, width)]
-        fold_run, cut = frames[k].far_run_mm, cuts[k]
+        fold = folds[k]
         if k != target:
-            return [pt(k, fold_run - cut, -width), pt(k, fold_run - cut, width)]
-        return [pt(k, fold_run - cut, -width), pt(k, fold_run - cut, -(outer + taper)),
-                pt(k, fold_run, -outer), pt(k, fold_run, -c),
-                pt(k, fold_run - rib.leg1_mm, 0.0), pt(k, fold_run, c),
-                pt(k, fold_run, outer), pt(k, fold_run - cut, outer + taper),
-                pt(k, fold_run - cut, width)]
+            cut = RIB_BEND_RADIUS_MM * fold["half_tan"]
+            return [pt(k, fold["run"] - cut, -width), pt(k, fold["run"] - cut, width)]
+        edge = [pt(k, fold["run"] - radius * fold["half_tan"], y) for y, radius in stations]
+        outer = RIB_BEND_RADIUS_MM * fold["half_tan"]
+        return ([pt(k, fold["run"] - outer, -width)] + edge
+                + [pt(k, fold["run"] - outer, width)])
 
     def _loft_runout(self, step: _Straight, frame: _Frame, bead_section, flat_section,
                      *, rising: bool, faces, tag: str) -> _Frame:

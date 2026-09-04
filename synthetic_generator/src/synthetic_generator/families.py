@@ -220,13 +220,40 @@ def rib_part(rng: random.Random, knobs: Knobs) -> Result | None:
 
 
 def plain_part(rng: random.Random, knobs: Knobs) -> Result | None:
-    """補強なしの基準面だけの部品(比較対象として少量だけ作りたいとき用)。"""
+    """補強なしの部品(パッチ)。**明確なルールで作る**(ユーザー指定 2026-09-04):
+
+    1. 締結点同士がリブ部品と同等かそれ以上に短い
+       — リブと同じ構造的判定 `bead_room_mm < RIB_MAX_BEAD_ROOM_MM` を使う。
+    2. 曲げが0〜1回で、リブを生成する余地がない
+       — 折れ角が45度未満、またはリブの寸法が取れない。
+
+    つまり「小さすぎて何も入らない当て板」に相当する部品だけを作る。
+    偶然の無補強ではなく、この条件を満たすものだけを通す。
+    """
     for _ in range(knobs.attempts):
+        folds = _draw_weighted(rng, knobs.fold_weights) if knobs.fold_weights else (
+            0 if rng.random() < 0.3 else 1)
+        if folds > 1:
+            continue                      # 条件2: 曲げは0〜1回まで
         try:
-            spec = _draw_spec(rng, knobs)
-            plan_for(spec)
+            spec = _draw_spec(rng, knobs, folds=folds)
+            spec = dataclasses.replace(spec, bend_radius_mm=RIB_BEND_RADIUS_MM)
+            plan = plan_for(spec)
         except ValueError:
             continue
+        # 条件1: 締結点が近い(ビードがまともに載らない)
+        if bead_room_mm(plan, spec.bend_radius_mm) >= RIB_MAX_BEAD_ROOM_MM:
+            continue
+        # 条件2: リブの余地が無い
+        actual_folds = len(plan.panel_frames) - 1
+        if actual_folds >= 1:
+            angle = fold_angle_deg(plan.panel_frames, 0)
+            if angle >= RIB_MIN_FOLD_ANGLE_DEG:
+                rib = sample_rib(rng, half_width_mm=spec.half_width_mm, fold_index=0,
+                                 leg_room_mm=leg_room_mm(plan, 0),
+                                 fold_angle_rad=math.radians(angle))
+                if rib is not None:
+                    continue      # リブが載る -> リブ族の領分
         return spec, None, None, None
     return None
 
