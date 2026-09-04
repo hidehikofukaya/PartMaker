@@ -1,0 +1,92 @@
+"""OCCTバックエンドの幾何合格テスト(2026-09-04)。
+
+「例外が出ない」だけでは不足(docs/REVIEW_bead_sweep_twist.md の指摘)なので、
+出来た形を測る: シェルの妥当性、エッジが単一のプリミティブに載ること、
+ゴミエッジが無いこと、締結点が面上に残っていること、ビードがねじれていないこと。
+
+判定ロジックは `tools/occt_smoke.py` と共有する(広いサンプルでの計測はそちら:
+`python tools/occt_smoke.py 200 <seed>`)。
+"""
+from __future__ import annotations
+
+import pathlib
+import random
+import sys
+
+import pytest
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "tools"))
+
+from occt_smoke import audit, bead_probe, distance_to, read_step  # noqa: E402
+
+from synthetic_generator.occt_build import OcctPartBuilder  # noqa: E402
+from synthetic_generator.templates.general_two_point import resolve_reinforcement  # noqa: E402
+from synthetic_generator.templates.general_two_point import sample as sample_general  # noqa: E402
+
+
+def _build(rng, out_dir, name, want):
+    """`want` ("bead" / "flange" / None) の部品を1つ作る。作れなければNone。"""
+    builder = OcctPartBuilder()
+    for _ in range(400):
+        try:
+            spec = sample_general(rng, gentle_folds=(want == "flange"))
+        except ValueError:
+            continue
+        bead = flange = None
+        if want is not None:
+            resolved = resolve_reinforcement(rng, spec)
+            if resolved is None:
+                continue
+            spec, bead, flange = resolved
+            if (want == "bead") != (bead is not None):
+                continue
+        try:
+            part = builder.build_general_two_point(
+                spec.point1, spec.point2,
+                min_bearing_radius_mm=spec.min_bearing_radius_mm,
+                half_width_mm=spec.half_width_mm,
+                bend_radius_mm=spec.bend_radius_mm,
+                fold1_slack_mm=spec.fold1_slack_mm,
+                fold2_slack_mm=spec.fold2_slack_mm,
+                out_dir=str(out_dir), part_name=name,
+                bead=bead, flange=flange,
+            )
+        except ValueError:
+            continue
+        return part, spec, bead, flange
+    return None
+
+
+@pytest.mark.parametrize("want", ["bead", "flange", None])
+def test_occt_part_is_geometrically_sound(tmp_path, want):
+    made = _build(random.Random(4242), tmp_path, f"test_{want}", want)
+    assert made is not None, f"could not sample a {want} part in 400 attempts"
+    part, spec, _bead, _flange = made
+
+    shape = read_step(part.stp_path)
+    info = audit(shape)
+    assert info["valid"], "the sewn shell is not valid"
+    assert info["deviation"] <= 0.25 * spec.thickness_mm, (
+        f"an edge deviates {info['deviation']:.4f}mm from a single line/arc "
+        f"(gate A allows {0.25 * spec.thickness_mm:.4f}mm)")
+    assert info["tiny_edges"] == 0, f"{info['tiny_edges']} junk edges under 0.05mm"
+    assert info["free_edges"] > 0, "an open shell must have an outline"
+
+    for label, point in (("point1", spec.point1.position_xyz),
+                         ("point2", spec.point2.position_xyz)):
+        assert distance_to(shape, point) < 0.1, f"{label} is not on the surface"
+
+    assert part.face_labels, "no face labels were produced"
+    assert all(entry["name"] for entry in part.face_labels)
+
+
+def test_bead_is_not_twisted(tmp_path):
+    """ビード頂部の意図位置とその鏡像までの距離で、掃引のねじれを検出する
+    (Gemini版が螺旋リボンになった不具合の再発検知)。"""
+    made = _build(random.Random(99), tmp_path, "test_twist", "bead")
+    assert made is not None
+    part, spec, bead, _ = made
+    shape = read_step(part.stp_path)
+    top, mirror = bead_probe(spec, bead)
+    assert distance_to(shape, top) <= 0.1, "the bead top is not where it was planned"
+    assert distance_to(shape, mirror) >= 0.8 * bead.depth_mm, "the bead is flipped"

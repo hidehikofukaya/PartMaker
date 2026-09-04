@@ -6,3 +6,4 @@ __pycache__/
 .claude/
 tools/probe_output/
 synthetic_parts/
+tools/occt_smoke/

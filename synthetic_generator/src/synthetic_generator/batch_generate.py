@@ -348,6 +348,12 @@ def generate_general_batch(
         if on_part_built is not None:
             on_part_built(spec, bead, flange)
 
+        # joints.jsonは**途中でも書く**。末尾でまとめて書くと、バッチが例外で落ちた
+        # ときに「部品は残るがアノテーションが無い」状態になる(2026-08-26に315部品で
+        # 実際に発生し、tools/rebuild_joints.py で復旧した)。
+        if len(records) % 25 == 0:
+            doc.save()
+
         records.append(
             GeneratedGeneralPartRecord(
                 part_id=part_id,
