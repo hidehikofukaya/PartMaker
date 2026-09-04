@@ -80,6 +80,8 @@ class Knobs:
     max_half_width_mm: float | None = None
     # 基準面の曲げR[mm]。Noneなら既定(5〜50、ただし半幅の0.9倍が上限)。
     bend_radius_mm: tuple[float, float] | None = None
+    # 単曲げの脚の上乗せ[mm]。Noneなら既定(0〜80)。
+    leg_slack_mm: tuple[float, float] | None = None
 
     @staticmethod
     def from_dict(data: dict) -> "Knobs":
@@ -100,6 +102,8 @@ class Knobs:
                                if data.get("max_half_width_mm") else None),
             bend_radius_mm=(tuple(data["bend_radius_mm"])
                             if data.get("bend_radius_mm") else None),
+            leg_slack_mm=(tuple(data["leg_slack_mm"])
+                          if data.get("leg_slack_mm") else None),
         )
 
 
@@ -121,6 +125,7 @@ def _draw_spec(rng: random.Random, knobs: Knobs, *, folds: int | None = None):
         half_width_ratio_range=knobs.half_width_ratio,
         max_half_width_mm=knobs.max_half_width_mm,
         bend_radius_range_mm=knobs.bend_radius_mm,
+        leg_slack_mm=knobs.leg_slack_mm,
     )
 
 
@@ -374,17 +379,296 @@ def three_point_part(rng: random.Random, knobs: Knobs) -> Result | None:
     return None
 
 
+# --- 3締結点・三角形分布(実車011型、2026-09-04) ----------------------------
+# 007型(three_point)は3点がほぼ一直線に並ぶ — 実測で三角形らしさ 中央0.128・最大0.286、
+# 0.30以上は0%だった。実車011は近正三角形(0.765)で、この型は作れていない。
+#
+# 近正三角形にするには対を**帯幅方向にだけ**離す必要がある(実車011は断面内の隔たり
+# 0.2mm・帯幅方向36.8mm)。しかも現実的な帯幅に収めるには対が中心線を**またぐ**必要が
+# ある: 片方を中心線に固定すると Δw <= half_width - bearing にしかならず、36.8mmには
+# 帯幅98mmが要る。またげば Δw <= 2*(half_width - bearing) で、帯幅66mm(実車61mm)で足りる。
+#
+# そこで掃引のアンカー(point1 か point2)を対の**中点**として使い、実際の締結点2つを
+# ±Δw/2 に置く。アンカー自身は締結点ではないので annotated_points から外す。
+THREE_POINT_TRI_TURN_RANGE_DEG = (45.0, 90.0)
+THREE_POINT_TRI_LEG_SLACK_MM = (0.0, 10.0)      # 脚が長いと対が届かず細長い三角になる
+THREE_POINT_TRI_BEARING_MM = (12.5, 16.0)       # 帯幅を対に譲る(従来ルールの下端)
+THREE_POINT_TRI_HALF_WIDTH_RATIO = (2.2, 2.8)
+THREE_POINT_TRI_MAX_HALF_WIDTH_MM = 35.0
+THREE_POINT_TRI_BEND_RADIUS_MM = (8.0, 14.0)    # Rが大きいと接線長で脚が伸びる
+THREE_POINT_TRI_SPREAD_RATIO = (1.0, 1.3)       # Δw / 単独点までの距離。1.155で正三角形
+# 対の置き方(011型・014型で共通)。対称に置くと二等辺三角形しか出ないので、
+# 左右の振り分けと掃引方向のずらしを振る(ユーザー指示 2026-09-04)。
+PAIR_SHARE_RANGE = (0.30, 0.70)                 # 中心線の左右への振り分け。0.5で対称
+PAIR_RUN_REACH_RATIO = 0.55                     # 掃引方向のずらし幅 / 対の広がり
+LONE_OFFSET_RATIO = 0.85                        # 単独点の帯幅方向のずらし / 使える片側
+THREE_POINT_TRI_MIN_TRIANGULARITY = 0.60        # 実車011=0.765、007型=最大0.286
+# 上の3つは総当たりで決めた(2026-09-04、200件ずつ)。閾値0.45/R8-18/slack0-18 では
+# 辺の中央値が [38,56,57] と細長く、実車011の [37,38,41] から外れる。この組では
+# [36,47,47]・三角形らしさ中央0.73 まで寄る。折れ角を60-90度に狭めても改善しないので
+# 45-90度の多様性は残す。
+
+
+def triangularity(positions) -> float:
+    """3点の三角形らしさ = 最小高さ / 最長辺。0 = 一直線、0.866 = 正三角形。"""
+    a = math.dist(positions[0], positions[1])
+    b = math.dist(positions[1], positions[2])
+    c = math.dist(positions[0], positions[2])
+    half = (a + b + c) / 2.0
+    area = math.sqrt(max(0.0, half * (half - a) * (half - b) * (half - c)))
+    longest = max(a, b, c)
+    return (2.0 * area / longest) / longest if longest > 1e-9 else 0.0
+
+
+def _panel_room(spec, plan, index):
+    """パネル index の上で締結点を置ける範囲 (掃引方向の下限, 上限, 帯幅方向の片側)。
+
+    余白は従来ルールを踏襲 — 帯端・曲げの接線・パネル端のいずれからも
+    `min_bearing_radius_mm` 以上を空ける。
+    """
+    bearing = spec.min_bearing_radius_mm
+    frame = plan.panel_frames[index]
+    near_cut, far_cut = plan.fold_tangents[index]
+    return (frame.near_run_mm + near_cut + bearing,
+            frame.far_run_mm - far_cut - bearing,
+            spec.half_width_mm - bearing)
+
+
+def _on_panel(frame, run: float, offset: float, normal) -> FasteningPoint:
+    position = tuple(frame.origin[i] + run * frame.u[i] + offset * frame.v[i]
+                     for i in range(3))
+    return FasteningPoint(position_xyz=position, normal_xyz=normal)
+
+
+def _straddle_pair(rng: random.Random, spec, plan, spread_ratio=None,
+                   share_range=None, run_reach_ratio=None, host_index=None,
+                   min_offset_mm=0.0, lone_room_mm=None, lone_run_limit_mm=None):
+    """締結点3つをパネルの上に置く。戻り値は (対の2点, 単独の1点)。
+
+    掃引アンカー(point1 / point2)は中心線上の**基準にすぎず、締結点ではない**。
+    対を中心線の両側にまたがせることで、片側固定なら帯幅98mmを要する広がりが
+    帯幅66mmで出せる(実車011)。
+
+    対称に置く必要はない(ユーザー指示 2026-09-04)。左右の振り分け・掃引方向の
+    ずらしに加え、**単独点も中心線から外す** — 単独点を中心線に固定すると
+    長い2辺がほぼ等しくなり、二等辺三角形しか出ない(実測: 二等辺からのずれが
+    中央0.04止まり。実車は007=0.27 / 011=0.07 / 014=0.02)。
+    """
+    hosts = [(0, spec.point1, spec.point2), (1, spec.point2, spec.point1)]
+    rng.shuffle(hosts)
+    if host_index is not None:      # 掃引の向きを固定したい族(014型)
+        hosts = [h for h in hosts if h[0] == host_index]
+    share_lo, share_hi = share_range or PAIR_SHARE_RANGE
+    reach_ratio = PAIR_RUN_REACH_RATIO if run_reach_ratio is None else run_reach_ratio
+    for index, anchor, lone in hosts:
+        lo, hi, half_room = _panel_room(spec, plan, index)
+        lone_lo, lone_hi, lone_room = _panel_room(spec, plan, 1 - index)
+        if lone_room_mm is not None:
+            # 孤立点の側が絞られている族(014型)。横ずれは**絞ったあとの**帯で決める。
+            lone_room = lone_room_mm
+        if hi < lo or lone_hi < lone_lo or half_room <= 0.0 or lone_room <= 0.0:
+            continue
+        frame = plan.panel_frames[index]
+        span = math.dist(anchor.position_xyz, lone.position_xyz)
+        share = rng.uniform(share_lo, share_hi)
+        spread = min(rng.uniform(*(spread_ratio or THREE_POINT_TRI_SPREAD_RATIO)) * span,
+                     half_room / max(share, 1.0 - share))
+        if min_offset_mm > 0.0:      # ビードの足の外へ出す(014型)
+            spread = max(spread, min_offset_mm / min(share, 1.0 - share))
+            if spread * max(share, 1.0 - share) > half_room:
+                continue
+        reach = hi if abs(hi) > abs(lo) else lo
+        limit = min(abs(reach), reach_ratio * spread)
+        mates = tuple(
+            _on_panel(frame,
+                      math.copysign(rng.uniform(0.0, limit), reach) if abs(reach) > 1e-9 else 0.0,
+                      offset, anchor.normal_xyz)
+            for offset in (spread * share, -spread * (1.0 - share)))
+        # 単独点も帯の中心から外す。長い2辺が一次で変わるので三角形が不等辺になる。
+        lone_reach = lone_hi if abs(lone_hi) > abs(lone_lo) else lone_lo
+        # 掃引方向の可動域。014型はビードが孤立点の手前で平地に戻るので、その先
+        # (座面ぶん)より奥へは行かせない — 行くと座面が走り終いの壁に乗る。
+        lone_limit = min(abs(lone_reach), reach_ratio * spread,
+                         lone_run_limit_mm if lone_run_limit_mm is not None else math.inf)
+        lone_point = _on_panel(
+            plan.panel_frames[1 - index],
+            math.copysign(rng.uniform(0.0, lone_limit), lone_reach)
+            if abs(lone_reach) > 1e-9 else 0.0,
+            rng.uniform(-1.0, 1.0) * lone_room * LONE_OFFSET_RATIO,
+            lone.normal_xyz)
+        return mates, lone_point
+    return None
+
+
+def three_point_tri_part(rng: random.Random, knobs: Knobs) -> Result | None:
+    """3締結点・三角形分布(実車011型)。法線が一致する対が曲げ線と平行に並び、
+    3点目が曲げの向こう側。その曲げを側端フランジが跨ぐ。"""
+    aimed = dataclasses.replace(
+        knobs,
+        turn_range_deg=knobs.turn_range_deg or THREE_POINT_TRI_TURN_RANGE_DEG,
+        bearing_radius_mm=knobs.bearing_radius_mm or THREE_POINT_TRI_BEARING_MM,
+        half_width_ratio=knobs.half_width_ratio or THREE_POINT_TRI_HALF_WIDTH_RATIO,
+        max_half_width_mm=knobs.max_half_width_mm or THREE_POINT_TRI_MAX_HALF_WIDTH_MM,
+        bend_radius_mm=knobs.bend_radius_mm or THREE_POINT_TRI_BEND_RADIUS_MM,
+        leg_slack_mm=knobs.leg_slack_mm or THREE_POINT_TRI_LEG_SLACK_MM,
+    )
+    for _ in range(knobs.attempts):
+        try:
+            spec = _draw_spec(rng, aimed, folds=1)
+            plan = plan_for(spec)
+        except ValueError:
+            continue
+        flange = sample_flange(
+            rng, plan.panel_frames, plan.fold_tilts,
+            spec.half_width_mm, spec.bend_radius_mm, spec.point1.normal_xyz,
+        )
+        if flange is None:
+            continue
+        placed = _straddle_pair(rng, spec, plan)
+        if placed is None:
+            continue
+        mates, lone = placed
+        annotated = (lone, *mates)
+        if triangularity([p.position_xyz for p in annotated]) < THREE_POINT_TRI_MIN_TRIANGULARITY:
+            continue
+        extension = (flange.extension_mm if flange.side < 0 else 0.0,
+                     flange.extension_mm if flange.side > 0 else 0.0)
+        try:
+            wide = plan_for(spec, side_extension_mm=extension)
+            plan_flange_on_surface(wide.panel_frames, flange,
+                                   half_width_mm=spec.half_width_mm,
+                                   fold_tangents=wide.fold_tangents)
+        except ValueError:
+            continue
+        return (dataclasses.replace(spec, extra_points=annotated, annotated_points=annotated),
+                None, flange, None)
+    return None
+
+
+# --- 3締結点・単独点が遠い型(実車014、2026-09-04) --------------------------
+# 007(0.254) と 011(0.765) の三角形らしさの間に 014(0.465) が入る。決め手は
+# 「単独点までの距離 / 対の間隔」で、011=1.05 に対し 014=2.04 と2倍離れている。
+# 離れた分だけ曲げをまたぐ荷重が増えるので、実車は**両側にフランジ + 帯の中央に
+# ビード**を入れて1点と2点の間の剛性を確保している(断面実測: 対のパネルで
+# ビード深さ3.5mm・フランジ4.6mm、単独点のパネルではビードが消えて平地に戻る)。
+#
+# 1部品1特徴の唯一の例外(ユーザー決定 2026-09-04)。フランジ高さも実車の4.6〜5.8mmに
+# 寄せてこの族だけ6〜12mmにする(成立率はどちらでも100%で、忠実度だけの選択)。
+THREE_POINT_SPAN_TURN_RANGE_DEG = (45.0, 90.0)
+THREE_POINT_SPAN_LEG_SLACK_MM = (10.0, 40.0)     # 対の広がりが大きい分、単独点も遠い
+# 脚を伸ばすと単独点までの距離だけが伸び、対の広がりは帯幅(2*(半幅-座面R))で頭打ちに
+# なるので三角形が潰れる。150件ずつの実測: slack(25,70)で三角形らしさ中央0.23、
+# slack(5,25)で0.34、slack(0,15)で0.37(実車014は0.465)。
+# 実車014の対は**溶接**(座面クリアランス7.6mm)。ボルト前提の12.5mm下限を当てると、
+# 「ビードの足 + 座面R」を対の外に確保するのに帯幅が実車の1.5倍(71〜80mm)要る。
+# ユーザー裁定(2026-09-04): この族の対だけ溶接相当まで下げる。他族は12.5〜25mm据え置き。
+THREE_POINT_SPAN_BEARING_MM = (7.5, 11.0)
+THREE_POINT_SPAN_HALF_WIDTH_RATIO = (2.8, 3.8)
+# 半幅 >= ビードの足 + 2*座面R が要る(対をビードの足の外へ出すため)。
+# 座面7.5〜11・足8〜13 なら半幅25〜34mm、帯幅50〜68mmで実車の50mmに重なる。
+THREE_POINT_SPAN_MAX_HALF_WIDTH_MM = 34.0
+THREE_POINT_SPAN_BEND_RADIUS_MM = (12.0, 18.0)
+THREE_POINT_SPAN_SPREAD_RATIO = (0.38, 0.62)     # Δw / 単独点までの距離。実車014は0.50
+THREE_POINT_SPAN_FLANGE_HEIGHT_MM = (6.0, 12.0)  # 実車014は4.6〜5.8mm
+# 実車014は開口7.8mm程度の「細長いビード」。既定の頂部幅下限10mmでは太すぎて、
+# 対の座面がビードに乗ってしまう(実測: 足が片側11.9〜24.9mm)。
+THREE_POINT_SPAN_BEAD_TOP_WIDTH_MM = (4.0, 12.0)
+# 深さが壁の投影長 depth/tan(θ) を決め、それが足の幅を支配する。実車014は3.5〜4.4mm。
+THREE_POINT_SPAN_BEAD_DEPTH_MM = (4.0, 5.5)
+THREE_POINT_SPAN_TRIANGULARITY = (0.30, 0.59)    # 007型(<=0.286)と011型(>=0.60)の隙間
+THREE_POINT_SPAN_NARROW_MARGIN_MM = 1.5   # 絞った端がビードの足を飲み込むための余白
+BEAD_DRAW_ATTEMPTS = 12
+
+
+def _bead_half_footprint_mm(bead) -> float:
+    """ビードが幅方向に占める片側の量(足Rの後退量まで含む)。断面のブレーク点と同じ値。"""
+    return bead.half_footprint_mm + bead.ridge_radius_mm * math.tan(
+        math.radians(bead.wall_angle_deg) / 2.0)
+
+
+def three_point_span_part(rng: random.Random, knobs: Knobs) -> Result | None:
+    """3締結点・単独点が対から遠い型(実車014)。両側フランジ + 中央ビード。"""
+    aimed = dataclasses.replace(
+        knobs,
+        turn_range_deg=knobs.turn_range_deg or THREE_POINT_SPAN_TURN_RANGE_DEG,
+        bearing_radius_mm=knobs.bearing_radius_mm or THREE_POINT_SPAN_BEARING_MM,
+        half_width_ratio=knobs.half_width_ratio or THREE_POINT_SPAN_HALF_WIDTH_RATIO,
+        max_half_width_mm=knobs.max_half_width_mm or THREE_POINT_SPAN_MAX_HALF_WIDTH_MM,
+        bend_radius_mm=knobs.bend_radius_mm or THREE_POINT_SPAN_BEND_RADIUS_MM,
+        leg_slack_mm=knobs.leg_slack_mm or THREE_POINT_SPAN_LEG_SLACK_MM,
+    )
+    for _ in range(knobs.attempts):
+        try:
+            spec = _draw_spec(rng, aimed, folds=1)
+            plan = plan_for(spec)
+        except ValueError:
+            continue
+        flange = sample_flange(
+            rng, plan.panel_frames, plan.fold_tilts,
+            spec.half_width_mm, spec.bend_radius_mm, spec.point1.normal_xyz,
+            height_range_mm=THREE_POINT_SPAN_FLANGE_HEIGHT_MM, both_sides=True,
+        )
+        if flange is None:
+            continue
+        # ビードは載る置き方が引けるまで引き直す(ビード族と同じ事前判定)。
+        bead = narrow = None
+        for _ in range(BEAD_DRAW_ATTEMPTS):
+            candidate = sample_bead(rng, spec.half_width_mm,
+                                    THREE_POINT_SPAN_BEAD_TOP_WIDTH_MM,
+                                    THREE_POINT_SPAN_BEAD_DEPTH_MM)
+            # 対の座面(半径 min_bearing_radius_mm の平地)がビードに乗らないこと。
+            # 対は中心線の両側なので、片側に「ビードの足 + 座面R」が要る。
+            if _bead_half_footprint_mm(candidate) + 2.0 * spec.min_bearing_radius_mm                     > spec.half_width_mm:
+                continue
+            try:
+                check_bead_feasible_occt(plan, candidate, spec.bend_radius_mm)
+            except ValueError:
+                continue
+            bead = candidate
+            break
+        if bead is None:
+            continue
+        # 孤立点の側は必要平面ぶんまで絞る(実車014は50.1 -> 27.4mm)。
+        narrow = max(spec.min_bearing_radius_mm,
+                     _bead_half_footprint_mm(bead) + THREE_POINT_SPAN_NARROW_MARGIN_MM)
+        if narrow >= spec.half_width_mm - 2.0:
+            continue                      # 絞る余地が無い
+        # 対を必ず panel 0 に載せる = 掃引が「対 -> 孤立点」の向きに揃う。
+        placed = _straddle_pair(
+            rng, spec, plan, THREE_POINT_SPAN_SPREAD_RATIO, host_index=0,
+            min_offset_mm=_bead_half_footprint_mm(bead) + spec.min_bearing_radius_mm,
+            lone_room_mm=max(0.0, narrow - spec.min_bearing_radius_mm),
+            lone_run_limit_mm=spec.min_bearing_radius_mm)
+        if placed is None:
+            continue
+        mates, lone = placed
+        annotated = (lone, *mates)
+        low, high = THREE_POINT_SPAN_TRIANGULARITY
+        if not low <= triangularity([p.position_xyz for p in annotated]) <= high:
+            continue
+        return (dataclasses.replace(spec, extra_points=annotated, annotated_points=annotated,
+                                    taper_half_width_mm=narrow),
+                bead, flange, None)
+    return None
+
+
 FAMILIES = {
     "bead": bead_part,
     "flange": flange_part,
     "rib": rib_part,
     "plain": plain_part,
     "three_point": three_point_part,
+    "three_point_tri": three_point_tri_part,
+    "three_point_span": three_point_span_part,
 }
 
 
 def kind_of(bead, flange, rib) -> str:
-    return "bead" if bead else ("flange" if flange else ("rib" if rib else "plain"))
+    """特徴の名前。ビード + フランジの併存(実車014型)は "bead+flange"。"""
+    if rib:
+        return "rib"
+    present = [name for name, value in (("bead", bead), ("flange", flange)) if value]
+    return "+".join(present) or "plain"
 
 
 def classify_spec(spec) -> str:

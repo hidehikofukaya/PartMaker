@@ -51,6 +51,10 @@ class FlangeParams:
     root_radius_mm: float   # 根本R(基準面 x 壁のBiTangent)
     side: int               # +1 = v正側 / -1 = v負側
     direction: int          # +1 = パネル法線(+u x v)側へ立てる / -1 = 反対側
+    # 両側に壁を立てる(実車014型)。sideは計画・キラリティ用の代表側として残す。
+    # 左右の壁は同じ direction に立つので、曲げ軸(wに平行)からの半径は ez だけで
+    # 決まり側には依らない — 凹側クリアランスの判定は片側と同一でよい。
+    both_sides: bool = False
 
     @property
     def extension_mm(self) -> float:
@@ -147,6 +151,9 @@ def sample_flange(
     half_width_mm: float,
     bend_radius_mm: float,
     fastening_normal: Vec3,
+    *,
+    height_range_mm: tuple[float, float] | None = None,
+    both_sides: bool = False,
 ) -> FlangeParams | None:
     """このパネル列に載るフランジを1つサンプリングする。成立しなければNone。
 
@@ -157,16 +164,16 @@ def sample_flange(
     """
     side = choose_flange_side(rng, panel_frames, fold_tilts, half_width_mm)
     direction = backside_direction(panel_frames, fastening_normal)
-    h_max = min(FLANGE_HEIGHT_RANGE_MM[1],
-                max_flange_height_mm(panel_frames, direction, bend_radius_mm))
-    if h_max < FLANGE_HEIGHT_RANGE_MM[0]:
+    limits = height_range_mm or FLANGE_HEIGHT_RANGE_MM
+    h_max = min(limits[1], max_flange_height_mm(panel_frames, direction, bend_radius_mm))
+    if h_max < limits[0]:
         return None
-    height = rng.uniform(FLANGE_HEIGHT_RANGE_MM[0], h_max)
+    height = rng.uniform(limits[0], h_max)
     root_radius = rng.uniform(*FLANGE_ROOT_RADIUS_RANGE_MM)
     if height < root_radius + 2.0:  # 根本Rの上に真っ直ぐな壁が残ること
         root_radius = max(MIN_NEUTRAL_PLANE_RADIUS_MM, height - 2.0)
     return FlangeParams(height_mm=height, root_radius_mm=root_radius,
-                        side=side, direction=direction)
+                        side=side, direction=direction, both_sides=both_sides)
 
 
 def plan_flange_on_surface(

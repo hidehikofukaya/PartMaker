@@ -73,3 +73,88 @@ def test_mate_keeps_the_existing_margin_rules():
                                      - frame.u[(i + 2) % 3] * frame.v[(i + 1) % 3])
                          for i in range(3))
         assert abs(normal_off) < 1e-6, "相方はパネル平面上にある"
+
+
+# ---------------------------------------------------- 三角形分布(実車011型)
+
+def _draw_tri(count: int = 12):
+    from synthetic_generator.families import three_point_tri_part
+    rng = random.Random(1123)
+    knobs = Knobs()
+    out = []
+    while len(out) < count:
+        got = three_point_tri_part(rng, knobs)
+        if got is not None:
+            out.append(got)
+    return out
+
+
+def test_tri_annotates_three_points_and_drops_the_sweep_anchor():
+    """掃引アンカー(point1/point2)は中心線上の基準で、締結点ではない。"""
+    for spec, _bead, flange, _rib in _draw_tri():
+        assert flange is not None
+        assert spec.annotated_points is not None and len(spec.annotated_points) == 3
+        # 実在の3点は全部 extra_points に入る(check_shape の面上検査を通すため)
+        assert [p.position_xyz for p in spec.extra_points] ==                [p.position_xyz for p in spec.annotated_points]
+        normals = [p.normal_xyz for p in spec.annotated_points]
+        assert sum(_angle_deg(normals[0], n) < 0.01 for n in normals) == 1,             "1点目(単独点)は他の2点と法線が違う"
+        assert _angle_deg(normals[1], normals[2]) < 0.01, "残る2点が対"
+
+
+def _pair_panel_index(spec):
+    return 0 if _angle_deg(spec.annotated_points[1].normal_xyz,
+                           spec.point1.normal_xyz) < 0.01 else 1
+
+
+def _offset_across(frame, point):
+    return sum((point.position_xyz[i] - frame.origin[i]) * frame.v[i] for i in range(3))
+
+
+def test_tri_pair_straddles_the_centreline():
+    """対は中心線の両側に分かれる — これが007型(片側のみ)との構造的な違い。"""
+    from synthetic_generator.families import triangularity
+    for spec, _bead, _flange, _rib in _draw_tri():
+        plan = plan_for(spec)
+        lone, mate_a, mate_b = spec.annotated_points
+        index = _pair_panel_index(spec)
+        frame = plan.panel_frames[index]
+        offsets = [_offset_across(frame, m) for m in (mate_a, mate_b)]
+        assert offsets[0] * offsets[1] < 0, "対は中心線をまたぐ"
+        room = spec.half_width_mm - spec.min_bearing_radius_mm
+        assert all(abs(o) <= room + 1e-9 for o in offsets), "帯端の余白は従来ルールどおり"
+        # 単独点も中心線に乗っている必要はない(二等辺三角形に固定しない)
+        assert abs(_offset_across(plan.panel_frames[1 - index], lone)) <= room + 1e-9
+        assert triangularity([p.position_xyz for p in spec.annotated_points]) >= 0.60
+
+
+# ------------------------------------------------- 単独点が遠い型(実車014)
+
+def _draw_span(count: int = 8):
+    from synthetic_generator.families import three_point_span_part
+    rng = random.Random(3141)
+    knobs = Knobs()
+    out = []
+    while len(out) < count:
+        got = three_point_span_part(rng, knobs)
+        if got is not None:
+            out.append(got)
+    return out
+
+
+def test_span_carries_a_bead_and_a_both_side_flange():
+    """1部品1特徴の唯一の例外。両側フランジ + 中央ビード(実車014)。"""
+    from synthetic_generator.families import kind_of
+    for spec, bead, flange, rib in _draw_span():
+        assert bead is not None and flange is not None and rib is None
+        assert flange.both_sides is True
+        assert kind_of(bead, flange, rib) == "bead+flange"
+        assert 6.0 <= flange.height_mm <= 12.0, "この族だけ実車寄せの低いフランジ"
+        assert len(spec.annotated_points) == 3
+
+
+def test_span_sits_between_the_other_two_triangle_bands():
+    """007型(<=0.286)と011型(>=0.60)の隙間を埋める帯であること。"""
+    from synthetic_generator.families import triangularity
+    for spec, _bead, _flange, _rib in _draw_span():
+        shape = triangularity([p.position_xyz for p in spec.annotated_points])
+        assert 0.30 <= shape <= 0.59, f"三角形らしさが帯を外れた: {shape:.3f}"

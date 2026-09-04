@@ -119,7 +119,9 @@ class BeadParams:
         return 2.0 * self.ridge_setback_mm <= self.wall_slant_mm
 
 
-def sample_bead(rng: random.Random, half_width_mm: float) -> BeadParams:
+def sample_bead(rng: random.Random, half_width_mm: float,
+                top_width_range_mm: tuple[float, float] | None = None,
+                depth_range_mm: tuple[float, float] | None = None) -> BeadParams:
     """板の半幅`half_width_mm`に収まるビード断面を1つサンプリングする。
 
     このプロジェクトで一貫している「実行可能な上限を計算してから、その中でサンプリング
@@ -154,7 +156,9 @@ def sample_bead(rng: random.Random, half_width_mm: float) -> BeadParams:
     #    実行可能率は約60%なので平均1.7回で当たる。
     for _ in range(1000):
         wall_angle = rng.uniform(*BEAD_WALL_ANGLE_RANGE_DEG)
-        depth = rng.uniform(*BEAD_DEPTH_RANGE_MM)
+        # 深さは族から絞れる。壁の投影長 depth/tan(θ) が足の幅を支配するので、
+        # 実車014の「細長いビード」(深さ3.5〜4.4mm)を出すには深さの上限が要る。
+        depth = rng.uniform(*(depth_range_mm or BEAD_DEPTH_RANGE_MM))
         theta = math.radians(wall_angle)
         half_angle_tangent = math.tan(theta / 2.0)
         min_depth = (
@@ -177,8 +181,11 @@ def sample_bead(rng: random.Random, half_width_mm: float) -> BeadParams:
     wall_run = depth / math.tan(theta)
     side_margin = ridge_radius * half_angle_tangent + BEAD_SIDE_CLEARANCE_MM
     max_top_half = half_width_mm - side_margin - wall_run
-    min_top_half = BEAD_TOP_WIDTH_RANGE_MM[0] / 2.0
-    max_top_half = min(max_top_half, BEAD_TOP_WIDTH_RANGE_MM[1] / 2.0)
+    # 頂部幅は族から絞れる。実車014の「細長いビード」は開口7.8mm程度で、既定の
+    # 下限10mmより細い(2026-09-04実測)。
+    top_limits = top_width_range_mm or BEAD_TOP_WIDTH_RANGE_MM
+    min_top_half = top_limits[0] / 2.0
+    max_top_half = min(max_top_half, top_limits[1] / 2.0)
     top_width = 2.0 * rng.uniform(min_top_half, max(min_top_half, max_top_half))
 
     # 4. 平面視の四隅R: 壁同士の縦エッジの丸め(2026-08-25、ユーザー指摘で復活)。

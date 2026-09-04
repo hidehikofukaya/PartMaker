@@ -123,7 +123,9 @@ def main() -> None:
         faces_max, edges_max = max(faces_max, n_faces), max(edges_max, n_edges)
         classes[str(classify(record.spec.point1, record.spec.point2))] += 1
         kinds[meta["kind"]] += 1
-        counts.append(2 + len(getattr(record.spec, "extra_points", ())))
+        annotated = getattr(record.spec, "annotated_points", None)
+        counts.append(len(annotated) if annotated
+                      else 2 + len(getattr(record.spec, "extra_points", ())))
 
     manifest = {
         "schema": "partmaker_manifest/1",
