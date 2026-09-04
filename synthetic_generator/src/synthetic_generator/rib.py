@@ -33,15 +33,27 @@ from synthetic_generator.classify import MIN_NEUTRAL_PLANE_RADIUS_MM
 
 # リブを作る折れ角の下限(ユーザー決定 2026-09-04)。
 RIB_MIN_FOLD_ANGLE_DEG = 45.0
+
+# 「締結点が近すぎてビードが置けない」の判定値[mm]。`bead_room_mm`(ビード本体に
+# 使える中心線の長さ)がこれ未満ならリブ。**構築可否では判定しない** —
+# ビードの置き場所を端パネル固定から探索に変えたら、技術的には長さ10mmのビードでも
+# 置けてしまい、リブが1件も出なくなった(2026-09-04実測)。狙いは「短くて
+# まともなビードにならない部品」なので、本体長で切る。
+# 実測: この値で全体の3.0%、その帯の締結点間距離は中央値65mm(40〜131mm)。
+RIB_MAX_BEAD_ROOM_MM = 40.0
 # リブ部品の基準面フィレット半径。ユーザー決定により中立面R最小に固定する。
 RIB_BEND_RADIUS_MM = MIN_NEUTRAL_PLANE_RADIUS_MM
 
-# 半幅に対するリブ半幅 c の比。0.5なら板幅のちょうど半分をリブが占める。
-RIB_HALF_WIDTH_RATIO_RANGE = (0.30, 0.60)
+# 半幅に対するリブ半幅 c の比。稜線を最小Rでフィレットするぶんくぼみが浅くなるので、
+# ユーザー了承(2026-09-04)のもと数mm大きめに振る。
+RIB_HALF_WIDTH_RATIO_RANGE = (0.45, 0.75)
 # 折れ線から A / B までの距離を c の何倍にするか。sqrt(3)≒1.73 で正三角形になる。
-RIB_LEG_RATIO_RANGE = (1.0, 2.0)
+RIB_LEG_RATIO_RANGE = (1.2, 2.2)
 # フィレットがシャープへ落ちる遷移帯の幅[mm](リブ幅のすぐ外側)。
 RIB_TAPER_MM = 1.5
+# 稜線フィレット(中立面R最小)を入れても形が残る最小サイズ。
+MIN_RIB_HALF_WIDTH_MM = 7.0
+MIN_RIB_LEG_MM = 9.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -62,26 +74,25 @@ def sample_rib(
     rng: random.Random,
     *,
     half_width_mm: float,
-    fold_count: int,
-    flat_runs_mm: tuple[float, float],
+    fold_index: int,
+    leg_room_mm: tuple[float, float],
 ) -> RibParams | None:
-    """この基準面に載るリブを1つ引く(載らなければNone)。
+    """この曲げに載るリブを1つ引く(載らなければNone)。
 
-    `flat_runs_mm` はリブを載せる曲げの前後にある直線区間の長さ。頂点A/Bがそこに
-    収まらなければならない。
+    `leg_room_mm` は頂点 A / B を置ける走行方向の余地。端パネル側は締結点の座面円を
+    侵さない範囲、中間パネル側は隣の曲げのタンジェント線まで。
     """
-    if fold_count < 1:
+    c_hi = min(RIB_HALF_WIDTH_RATIO_RANGE[1] * half_width_mm,
+               half_width_mm - RIB_TAPER_MM - 2.0,
+               min(leg_room_mm) / RIB_LEG_RATIO_RANGE[0])
+    c_lo = max(MIN_RIB_HALF_WIDTH_MM, RIB_HALF_WIDTH_RATIO_RANGE[0] * half_width_mm)
+    if c_hi < c_lo:
         return None
-    c_max = RIB_HALF_WIDTH_RATIO_RANGE[1] * half_width_mm
-    if c_max < 3.0 or half_width_mm - c_max < RIB_TAPER_MM + 2.0:
-        return None
-    c = rng.uniform(RIB_HALF_WIDTH_RATIO_RANGE[0] * half_width_mm,
-                    min(c_max, half_width_mm - RIB_TAPER_MM - 2.0))
-    run1, run2 = flat_runs_mm
+    c = rng.uniform(c_lo, c_hi)
     legs = []
-    for run in (run1, run2):
-        low = 1.0 * c
-        high = min(RIB_LEG_RATIO_RANGE[1] * c, run - 1.0)
+    for room in leg_room_mm:
+        low = max(MIN_RIB_LEG_MM, RIB_LEG_RATIO_RANGE[0] * c)
+        high = min(RIB_LEG_RATIO_RANGE[1] * c, room)
         if high < low:
             return None
         legs.append(rng.uniform(low, high))
@@ -90,5 +101,26 @@ def sample_rib(
         leg1_mm=legs[0],
         leg2_mm=legs[1],
         taper_mm=RIB_TAPER_MM,
-        fold_index=rng.randrange(fold_count),
+        fold_index=fold_index,
     )
+
+
+def leg_room_mm(plan, fold_index: int) -> tuple[float, float]:
+    """曲げ `fold_index` の前後で、リブの頂点を置ける走行方向の余地[mm]。
+
+    端パネル側は締結点の座面円(半径=座面半径)を侵さない範囲まで、
+    中間パネル側は隣の曲げのタンジェント線まで。
+    ここを「平坦区間の長さ − 2×座面半径」で近似すると、単曲げでパネル原点が締結点に
+    ある構成で余地を過小評価して、リブが作れるのに作らなくなる(2026-09-04実測)。
+    """
+    frames, tangents = plan.panel_frames, plan.fold_tangents
+    margin = plan.min_bearing_radius_mm
+    before, after = frames[fold_index], frames[fold_index + 1]
+    block_before = (before.near_run_mm + 2.0 * margin if fold_index == 0
+                    else before.near_run_mm + tangents[fold_index][0])
+    room_before = before.far_run_mm - block_before
+    last = fold_index + 1 == len(frames) - 1
+    block_after = (after.far_run_mm - 2.0 * margin if last
+                   else after.far_run_mm - tangents[fold_index + 1][1])
+    room_after = block_after - after.near_run_mm
+    return room_before, room_after

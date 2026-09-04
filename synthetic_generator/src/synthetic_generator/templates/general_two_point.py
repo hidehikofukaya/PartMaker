@@ -56,8 +56,10 @@ from synthetic_generator.general_geometry import (
 )
 from synthetic_generator.rib import (
     RIB_BEND_RADIUS_MM,
+    RIB_MAX_BEAD_ROOM_MM,
     RIB_MIN_FOLD_ANGLE_DEG,
     RibParams,
+    leg_room_mm,
     sample_rib,
 )
 
@@ -130,6 +132,11 @@ SHORT_REGIME_MAX_TURN_DEG = 90.0
 SHORT_REGIME_MIN_TURN_DEG = 20.0
 # 折れ目から締結点までの余り(座面半径+接線長 に上乗せする長さ)。
 # 締結点間距離はこの2つと折れ角から決まるので、距離はここで制御する。
+#
+# 下限は0のまま(2026-09-04): 折れ目が座面のすぐ横に来る構成は「ビードは置けないが
+# リブは置ける」帯そのもので、ここを潰すとリブが1件も出なくなる(実測で0%になった)。
+# 「大きいのに無補強」は下限ではなく、リブの脚の余地を正しく測ることで解決した
+# (`rib.leg_room_mm`)。
 SINGLE_FOLD_LEG_SLACK_RANGE_MM = (0.0, 80.0)
 FLAT_RUN_RANGE_MM = (60.0, 220.0)           # 曲げ0本(平板)の締結点間距離
 OFFSET_DISTANCE_RANGE_MM = (120.0, 220.0)   # 法線平行時のフォールバック用
@@ -200,7 +207,8 @@ def _random_unit_vector(rng: random.Random) -> Vec3:
 
 
 def _place_second_point(rng: random.Random, n1: Vec3, n2: Vec3, p1: Vec3,
-                        gentle: bool = False) -> Vec3:
+                        gentle: bool = False,
+                        section_distance_mm: tuple[float, float] | None = None) -> Vec3:
     """締結点2を、共通折れ目方向 w に対して制御した位置へ置く。
 
     w = n1 x n2 は全ての折れ目に共通の方向で、**w方向の変位は中間折れ目の配置予算を
@@ -215,7 +223,7 @@ def _place_second_point(rng: random.Random, n1: Vec3, n2: Vec3, p1: Vec3,
     )
     cross_len = math.sqrt(sum(c * c for c in cross))
     if cross_len < 1e-9:
-        distance = rng.uniform(*OFFSET_DISTANCE_RANGE_MM)
+        distance = rng.uniform(*(section_distance_mm or OFFSET_DISTANCE_RANGE_MM))
         direction = _random_unit_vector(rng)
         if gentle:
             # 座面にほぼ平行な方向へ: 法線成分を±sin(GENTLE_DIP_MAX_DEG)に制限
@@ -261,7 +269,7 @@ def _place_second_point(rng: random.Random, n1: Vec3, n2: Vec3, p1: Vec3,
         theta = theta0 + dip if sign > 0 else theta0 + math.pi - dip
     else:
         theta = rng.uniform(0.0, 2.0 * math.pi)
-    section = rng.uniform(*SECTION_DISTANCE_RANGE_MM)
+    section = rng.uniform(*(section_distance_mm or SECTION_DISTANCE_RANGE_MM))
     lateral = section * rng.uniform(-MAX_LATERAL_OFFSET_RATIO, MAX_LATERAL_OFFSET_RATIO)
     return tuple(
         p1[i] + section * (math.cos(theta) * e1[i] + math.sin(theta) * e2[i]) + lateral * w[i]
@@ -366,7 +374,8 @@ def _choose_tilt_perturbation(
 CLASS_SEARCH_ATTEMPTS = 400
 
 
-def _sample_point_pair(rng: random.Random, gentle_folds: bool):
+def _sample_point_pair(rng: random.Random, gentle_folds: bool,
+                       section_distance_mm: tuple[float, float] | None = None):
     """締結点ペア(法線と位置)だけをサンプリングする。
 
     sample()の重い部分(slack探索・傾き摂動探索)の**前**に配置クラスで足切りできるよう、
@@ -384,7 +393,8 @@ def _sample_point_pair(rng: random.Random, gentle_folds: bool):
             rotation_angle = rng.uniform(0.0, math.pi)  # 谷の帯は重みを下げる(1回だけ引き直す)
     n2 = rotate_about_axis(n1, rotation_axis, rotation_angle)
     p1: Vec3 = (0.0, 0.0, 0.0)
-    p2 = _place_second_point(rng, n1, n2, p1, gentle=gentle_folds)
+    p2 = _place_second_point(rng, n1, n2, p1, gentle=gentle_folds,
+                             section_distance_mm=section_distance_mm)
     return (
         FasteningPoint(position_xyz=p1, normal_xyz=n1),
         FasteningPoint(position_xyz=p2, normal_xyz=n2),
@@ -402,14 +412,15 @@ def draw_fold_count(rng: random.Random) -> int:
     return FOLD_COUNT_WEIGHTS[-1][0]
 
 
-def _sample_sizes(rng: random.Random, thickness_range_mm, hole_diameter_range_mm):
+def _sample_sizes(rng: random.Random, thickness_range_mm, hole_diameter_range_mm,
+                  bearing_radius_mm=None):
     """締結点の配置に依らない寸法(板厚・穴径・座面半径・半幅・曲げR)。
 
     曲げRは半幅の0.9倍を超えられないので、半幅の**後**に引く(sample()と同じ順序)。
     """
     thickness = rng.uniform(*thickness_range_mm)
     hole_diameter = rng.uniform(*hole_diameter_range_mm)
-    bearing_radius = rng.uniform(*MIN_BEARING_RADIUS_RANGE_MM)
+    bearing_radius = rng.uniform(*(bearing_radius_mm or MIN_BEARING_RADIUS_RANGE_MM))
     half_width = min(MAX_HALF_WIDTH_MM, bearing_radius * rng.uniform(*HALF_WIDTH_MARGIN_RATIO_RANGE))
     max_bend_radius = min(BEND_RADIUS_CAP_MM, 0.9 * half_width)
     bend_radius = rng.uniform(MIN_BASE_BEND_RADIUS_MM, max(MIN_BASE_BEND_RADIUS_MM, max_bend_radius))
@@ -428,7 +439,8 @@ def _orthonormal_pair(rng: random.Random) -> tuple[Vec3, Vec3]:
             return n, tuple(c / length for c in u)
 
 
-def _sample_single_fold_spec(rng, thickness_range_mm, hole_diameter_range_mm) -> GeneralTwoJointSpec:
+def _sample_single_fold_spec(rng, thickness_range_mm, hole_diameter_range_mm,
+                             bearing_radius_mm=None) -> GeneralTwoJointSpec:
     """曲げ1本の部品を**形状から**引き、締結点を導出する(2026-09-04、D1)。
 
     点対を引いてから単曲げを解こうとすると、交線が締結点の後方に来る配置ばかり引いて
@@ -439,7 +451,7 @@ def _sample_single_fold_spec(rng, thickness_range_mm, hole_diameter_range_mm) ->
     締結点2は折れ目軸 w に直交する平面内に置く(=面のねじれ無し)。
     """
     thickness, hole, bearing, half_width, bend_radius = _sample_sizes(
-        rng, thickness_range_mm, hole_diameter_range_mm)
+        rng, thickness_range_mm, hole_diameter_range_mm, bearing_radius_mm)
     n1, u1 = _orthonormal_pair(rng)
     w = _cross(n1, u1)                      # 折れ目軸(= panel1 の幅方向 v)
     turn = math.radians(rng.uniform(SHORT_REGIME_MIN_TURN_DEG, SHORT_REGIME_MAX_TURN_DEG))
@@ -469,12 +481,13 @@ def _sample_single_fold_spec(rng, thickness_range_mm, hole_diameter_range_mm) ->
     )
 
 
-def _sample_flat_spec(rng, thickness_range_mm, hole_diameter_range_mm) -> GeneralTwoJointSpec:
+def _sample_flat_spec(rng, thickness_range_mm, hole_diameter_range_mm,
+                      bearing_radius_mm=None, section_distance_mm=None) -> GeneralTwoJointSpec:
     """曲げ0本(平板)。法線が平行で、2点が同一平面上にある構成。"""
     thickness, hole, bearing, half_width, bend_radius = _sample_sizes(
-        rng, thickness_range_mm, hole_diameter_range_mm)
+        rng, thickness_range_mm, hole_diameter_range_mm, bearing_radius_mm)
     n1, u1 = _orthonormal_pair(rng)
-    run = rng.uniform(*FLAT_RUN_RANGE_MM)
+    run = rng.uniform(*(section_distance_mm or FLAT_RUN_RANGE_MM))
     p1: Vec3 = (0.0, 0.0, 0.0)
     p2 = tuple(run * u1[i] for i in range(3))
     return GeneralTwoJointSpec(
@@ -501,6 +514,8 @@ def sample(
     target_classes: frozenset[str] | set[str] | None = None,
     gentle_target_max_fold_deg: float | None = None,
     target_folds: int | None = None,
+    section_distance_mm: tuple[float, float] | None = None,
+    bearing_radius_mm: tuple[float, float] | None = None,
 ) -> GeneralTwoJointSpec:
     """任意の法線・任意の位置の締結点ペアを1組サンプリングする。
 
@@ -518,22 +533,24 @@ def sample(
     ときに25〜28度を渡す。
     """
     if target_folds == 1:
-        return _sample_single_fold_spec(rng, thickness_range_mm, hole_diameter_range_mm)
+        return _sample_single_fold_spec(rng, thickness_range_mm, hole_diameter_range_mm,
+                                        bearing_radius_mm)
     if target_folds == 0:
-        return _sample_flat_spec(rng, thickness_range_mm, hole_diameter_range_mm)
+        return _sample_flat_spec(rng, thickness_range_mm, hole_diameter_range_mm,
+                                 bearing_radius_mm, section_distance_mm)
 
-    point1, point2 = _sample_point_pair(rng, gentle_folds)
+    point1, point2 = _sample_point_pair(rng, gentle_folds, section_distance_mm)
     if target_classes:
         for _ in range(CLASS_SEARCH_ATTEMPTS):
             if classify(point1, point2) in target_classes:
                 break
-            point1, point2 = _sample_point_pair(rng, gentle_folds)
+            point1, point2 = _sample_point_pair(rng, gentle_folds, section_distance_mm)
     p1, p2 = point1.position_xyz, point2.position_xyz
     n1, n2 = point1.normal_xyz, point2.normal_xyz
 
     thickness = rng.uniform(*thickness_range_mm)
     hole_diameter = rng.uniform(*hole_diameter_range_mm)
-    bearing_radius = rng.uniform(*MIN_BEARING_RADIUS_RANGE_MM)
+    bearing_radius = rng.uniform(*(bearing_radius_mm or MIN_BEARING_RADIUS_RANGE_MM))
     half_width = min(MAX_HALF_WIDTH_MM, bearing_radius * rng.uniform(*HALF_WIDTH_MARGIN_RATIO_RANGE))
 
     # bend_radius_mmはhalf_widthの0.9倍を超えられない(gsd_build.build_general_two_point
@@ -608,7 +625,7 @@ def resolve_bead_slacks(
     bead: BeadParams,
     *,
     slack_attempts: int = 20,
-    bead_resample_attempts: int = 20,
+    bead_resample_attempts: int = 60,
 ) -> tuple[GeneralTwoJointSpec, BeadParams] | None:
     """この締結点ペアで**ビードまで成立する**slack(必要ならビードも)を探して返す。
 
@@ -685,19 +702,14 @@ def _resolve_rib(rng: random.Random, spec: GeneralTwoJointSpec):
         return None
     if max_fold_angle_deg(plan.panel_frames) < RIB_MIN_FOLD_ANGLE_DEG:
         return None
-    _total, straights = path_length_mm(plan, candidate.bend_radius_mm)
-    index = 0 if len(straights) <= 2 else rng.randrange(len(straights) - 1)
-    # 頂点A/Bが載る2つの直線区間。座面(2×bearing半径)を侵さない範囲に収める。
-    inset = 2.0 * candidate.min_bearing_radius_mm
-    runs = (straights[index] - (inset if index == 0 else 0.0),
-            straights[index + 1] - (inset if index + 1 == len(straights) - 1 else 0.0))
-    if min(runs) <= 1.0:
-        return None
+    # 余地の大きい曲げを選ぶ(2曲げなら両方見て広いほう)。
+    folds = len(plan.panel_frames) - 1
+    best = max(range(folds), key=lambda i: min(leg_room_mm(plan, i)))
     for _ in range(8):
         rib = sample_rib(rng, half_width_mm=candidate.half_width_mm,
-                         fold_count=len(plan.panel_frames) - 1, flat_runs_mm=runs)
+                         fold_index=best, leg_room_mm=leg_room_mm(plan, best))
         if rib is not None:
-            return candidate, dataclasses.replace(rib, fold_index=index)
+            return candidate, rib
     return None
 
 
@@ -750,17 +762,22 @@ def resolve_reinforcement(
                 return candidate, None, flange, None
         # フランジ不成立 -> ビードへフォールバック(ユーザー指定の使い分け)
 
-    # ビードが第一候補。リブは**ビードが置けないときだけ**の代替で、かつ曲げが
-    # ある程度きついこと(ユーザー指定 2026-09-04)。
+    # リブを先に見る(条件は狭く、満たすならビードよりリブが正しい)。
+    if bead_room_mm(plan, spec.bend_radius_mm) < RIB_MAX_BEAD_ROOM_MM:
+        resolved_rib = _resolve_rib(rng, spec)
+        if resolved_rib is not None:
+            rib_spec, rib = resolved_rib
+            return rib_spec, None, None, rib
+
     bead = sample_bead(rng, spec.half_width_mm)
     resolved = resolve_bead_slacks(rng, spec, bead)
     if resolved is not None:
         new_spec, new_bead = resolved
         return new_spec, new_bead, None, None
 
-    # 「締結点が近すぎてビードが置けない」は**構造的に**判定する(ビード寸法の
-    # サンプリング運で決めない)。曲げの内角を補強する特徴なので折れ角の下限も要る。
-    too_close = bead_room_mm(plan, spec.bend_radius_mm) < 0.0
+    # 「締結点が近すぎてビードが置けない」は、ビード本体に使える長さで判定する
+    # (構築可否ではない — rib.py の RIB_MAX_BEAD_ROOM_MM のコメント参照)。
+    too_close = bead_room_mm(plan, spec.bend_radius_mm) < RIB_MAX_BEAD_ROOM_MM
     if too_close:
         resolved_rib = _resolve_rib(rng, spec)
         if resolved_rib is not None:

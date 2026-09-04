@@ -35,7 +35,10 @@ from OCC.Core.TopAbs import TopAbs_EDGE, TopAbs_FACE  # noqa: E402
 from OCC.Core.TopExp import topexp  # noqa: E402
 from OCC.Core.TopTools import TopTools_IndexedMapOfShape  # noqa: E402
 
-from synthetic_generator.batch_generate import DEFAULT_OUTPUT_ROOT, generate_general_batch  # noqa: E402
+from synthetic_generator.batch_generate import (  # noqa: E402
+    DEFAULT_OUTPUT_ROOT,
+    generate_recipe_batch,
+)
 from synthetic_generator.classify import classify  # noqa: E402
 from synthetic_generator.occt_build import OcctPartBuilder  # noqa: E402
 
@@ -57,22 +60,22 @@ def shape_capacity(stp_path: str) -> tuple[int, int]:
 
 
 def main() -> None:
-    family = sys.argv[1]
-    chunk = int(sys.argv[2])
-    count = int(sys.argv[3])
-    seed = int(sys.argv[4])
-    # 補強は原則すべての部品に付ける(ユーザー指定 2026-09-04)。例外は締結点が近すぎて
-    # どの補強も載らない場合だけで、それは resolve_reinforcement が None を返して表れる
-    # (実測1491件中0件なので、実質すべての部品に特徴が付く)。
-    reinforcement = float(sys.argv[5]) if len(sys.argv) > 5 else 1.0
-    flange_share = float(sys.argv[6]) if len(sys.argv) > 6 else 0.4
+    """使い方: python tools/run_occt_batch.py <レシピJSON>
+
+    レシピが「何をどれだけどんな多様性で作るか」を全部持つ(2026-09-04、族別生成)。
+    例は tools/recipes/default.json。
+    """
+    recipe_path = pathlib.Path(sys.argv[1])
+    recipe = json.loads(recipe_path.read_text(encoding="utf-8"))
+    family, chunk, seed = recipe["family"], int(recipe["chunk"]), int(recipe["seed"])
 
     out_dir = DEFAULT_OUTPUT_ROOT / family / f"chunk_{chunk:02d}"
     if out_dir.exists() and any(out_dir.iterdir()):
         raise SystemExit(f"{out_dir} は既に存在する。")
 
-    print(f"{family}/chunk_{chunk:02d}: {count}部品 / seed {seed} / backend=occt", flush=True)
-    t0 = time.time()
+    wanted = {e["kind"]: e["count"] for e in recipe["parts"]}
+    print(f"{family}/chunk_{chunk:02d}: {sum(wanted.values())}部品 {wanted} / seed {seed}",
+          flush=True)
     labels_by_part: dict[str, tuple] = {}
 
     class _Recording(OcctPartBuilder):
@@ -83,15 +86,18 @@ def main() -> None:
             labels_by_part[kwargs["part_name"]] = part.face_labels
             return part
 
-    records = generate_general_batch(
-        _Recording(), out_dir, count=count, seed=seed,
-        max_attempts_per_part=200,
-        reinforcement_probability=reinforcement,
-        flange_aim_share=flange_share,
-    )
+    attempts: collections.Counter = collections.Counter()
+    tries: collections.Counter = collections.Counter()
+
+    def on_part(kind, spec, bead, flange, rib, used):
+        attempts[kind] += 1
+        tries[kind] += used
+
+    t0 = time.time()
+    records = generate_recipe_batch(_Recording(), out_dir, recipe["parts"],
+                                    seed=seed, on_part=on_part)
     build_seconds = time.time() - t0
 
-    # --- サイドカー: params に backend を足し、features を出す ---
     features_dir = out_dir / "features"
     features_dir.mkdir(exist_ok=True)
     classes: collections.Counter = collections.Counter()
@@ -107,6 +113,7 @@ def main() -> None:
         feature = emit_feature_truth.build(meta)
         feature["schema"] = "partmaker_features/2"
         feature["backend"] = "occt"
+        feature["kind"] = meta["kind"]
         feature["faces"] = list(labels_by_part[record.part_id])
         (features_dir / f"{record.part_id}.json").write_text(
             json.dumps(feature, ensure_ascii=False), encoding="utf-8")
@@ -114,8 +121,7 @@ def main() -> None:
         n_faces, n_edges = shape_capacity(record.stp_path)
         faces_max, edges_max = max(faces_max, n_faces), max(edges_max, n_edges)
         classes[str(classify(record.spec.point1, record.spec.point2))] += 1
-        kinds["bead" if record.bead else ("flange" if record.flange
-              else ("rib" if record.rib else "plain"))] += 1
+        kinds[meta["kind"]] += 1
 
     manifest = {
         "schema": "partmaker_manifest/1",
@@ -126,6 +132,7 @@ def main() -> None:
         "seed": seed,
         "complete": True,
         "n_parts": len(records),
+        "recipe": recipe["parts"],
         "fastener_count": {"min": 2, "max": 2},
         "capacity": {"faces_max": faces_max, "edges_max": edges_max, "loops_max": 1},
         "config_classes": dict(classes),
@@ -144,7 +151,9 @@ def main() -> None:
     total = time.time() - t0
     print(f"\nCHUNK DONE: {len(records)}部品 / {total / 60:.1f}分 "
           f"(生成 {build_seconds / max(1, len(records)):.2f}秒/部品)", flush=True)
-    print(f"  補強: {dict(kinds)}")
+    print(f"  族: {dict(kinds)}")
+    print(f"  族ごとの平均試行: " +
+          ", ".join(f"{k} {tries[k] / max(1, attempts[k]):.1f}回" for k in sorted(attempts)))
     print(f"  配置クラス: {dict(classes.most_common())}")
     print(f"  容量: 面 最大{faces_max} / エッジ 最大{edges_max}")
     print(f"  出力: {out_dir}")

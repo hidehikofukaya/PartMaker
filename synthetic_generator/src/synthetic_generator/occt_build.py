@@ -53,6 +53,7 @@ import os
 from OCC.Core.BRep import BRep_Tool
 from OCC.Core.BRepAdaptor import BRepAdaptor_Curve, BRepAdaptor_Surface
 from OCC.Core.BRepAlgoAPI import BRepAlgoAPI_Cut
+from OCC.Core.BRepFilletAPI import BRepFilletAPI_MakeFillet
 from OCC.Core.BRepGProp import brepgprop
 from OCC.Core.BRepBuilderAPI import (
     BRepBuilderAPI_MakeEdge,
@@ -73,7 +74,8 @@ from OCC.Core.TDataStd import TDataStd_Name
 from OCC.Core.TDocStd import TDocStd_Document
 from OCC.Core.GCPnts import GCPnts_AbscissaPoint
 from OCC.Core.TopAbs import TopAbs_EDGE, TopAbs_FACE
-from OCC.Core.TopExp import TopExp_Explorer
+from OCC.Core.TopExp import TopExp_Explorer, topexp
+from OCC.Core.TopTools import TopTools_IndexedDataMapOfShapeListOfShape
 from OCC.Core.TopoDS import topods
 from OCC.Core.XCAFApp import XCAFApp_Application
 from OCC.Core.XCAFDoc import XCAFDoc_DocumentTool
@@ -83,7 +85,11 @@ from OCC.Core.gp import gp_Ax1, gp_Dir, gp_Pnt, gp_Trsf, gp_Vec
 from synthetic_generator.bead import BeadParams
 from synthetic_generator.classify import MIN_NEUTRAL_PLANE_RADIUS_MM, FasteningPoint, Vec3
 from synthetic_generator.flange import FLANGE_CONCAVE_CLEARANCE_MM, FlangeParams
-from synthetic_generator.general_geometry import plan_general_two_point
+from synthetic_generator.general_geometry import (
+    BEAD_MIN_RUNOUT_MM,
+    bead_placement,
+    plan_general_two_point,
+)
 from synthetic_generator.rib import RibParams
 
 SEW_TOLERANCE_MM = 0.01
@@ -559,6 +565,10 @@ class OcctPartBuilder:
             self._sweep_uniform(path, frame, w, section, faces)
 
         shape, faces = self._sew(faces)
+        # NOTE(2026-09-04): リブの稜線を最小Rで丸める要望があるが、OCCTの
+        # `BRepFilletAPI_MakeFillet` はこの開いたシェルに対して**1本のエッジ・半径2mm
+        # でも 0/6 成功**で使えない(`_fillet_rib_edges` に実装は残してある)。
+        # 丸めるなら構築で作るしかないので、形状の作り直しを待ってから繋ぎ直す。
         shape, faces = self._apply_corner_relief(
             shape, faces, path, start, ey, normal0, w,
             half_width_mm=half_width_mm,
@@ -601,38 +611,36 @@ class OcctPartBuilder:
     def _sweep_with_bead(self, path, frame: _Frame, w: Vec3, bead_section, flat_section,
                          bead: BeadParams, min_bearing_radius_mm: float, faces) -> None:
         """平地 -> ランアウト -> ビード -> ランアウト -> 平地 の順に掃引する。"""
-        total = sum(s.length if isinstance(s, _Straight) else abs(s.angle) * s.radius for s in path)
+        # 区間を s で並べ、ランアウトが収まる直線区間を探す(`general_geometry` と
+        # 同じ規則。開始位置を端パネルに固定しない — 固定すると折れ目が締結点の
+        # 近くにある構成が全部ビード不可になる)。
+        spans, total, cursor = [], 0.0, 0.0
+        for step in path:
+            span = step.length if isinstance(step, _Straight) else abs(step.angle) * step.radius
+            spans.append((cursor, cursor + span, isinstance(step, _Straight)))
+            cursor += span
+        total = cursor
         inset = 2.0 * min_bearing_radius_mm
-        first, last = path[0], path[-1]
-        if not isinstance(first, _Straight) or not isinstance(last, _Straight):
-            raise ValueError("path must start and end with a straight segment")
-        # ランアウトは平坦区間の中に収める必要がある(曲げの上で断面を変えると
-        # 織り面が曲げ円筒に接せず折れる)。空きが足りなければ短くする。
-        room = min(first.length - inset, last.length - inset) - 1.0
-        runout = min(RUNOUT_DEPTH_RATIO * bead.depth_mm, room)
-        if runout < MIN_RUNOUT_MM:
+        placed = bead_placement(spans, total, inset)
+        if placed is None:
             raise ValueError(
-                f"only {room:.1f}mm of flat run is left for the bead run-out "
-                f"(need >= {MIN_RUNOUT_MM:.1f}mm). Infeasible; not attempting construction."
+                "no place on the centreline for a bead (bearing areas and run-outs do not "
+                "fit). Infeasible; not attempting construction."
             )
-        s0, s1 = inset, inset + runout
-        s3, s2 = total - inset, total - inset - runout
+        s0, s3 = placed
+        head = next(s1 for a, s1, straight in spans if straight and a <= s0 < s1)
+        tail = next(a for a, s1, straight in reversed(spans) if straight and a < s3 <= s1)
+        runout = min(RUNOUT_DEPTH_RATIO * bead.depth_mm, head - s0 - 0.5, s3 - tail - 0.5)
+        if runout < BEAD_MIN_RUNOUT_MM:
+            raise ValueError(
+                f"only {runout:.1f}mm is left for the bead run-out "
+                f"(need >= {BEAD_MIN_RUNOUT_MM:.1f}mm). Infeasible."
+            )
+        s1, s2 = s0 + runout, s3 - runout
         if s2 - s1 < 5.0:
             raise ValueError(
                 f"bead run ({s2 - s1:.1f}mm of full section) is too short between the "
                 f"{runout:.1f}mm run-outs. Infeasible; not attempting construction."
-            )
-
-        if s1 > first.length - 1.0:
-            raise ValueError(
-                f"the start run-out ends at {s1:.1f}mm but panel 0's flat run is only "
-                f"{first.length:.1f}mm. Infeasible; not attempting construction."
-            )
-        if s2 < total - last.length + 1.0:
-            raise ValueError(
-                f"the end run-out starts at {s2:.1f}mm, inside a bend fillet "
-                f"(last flat run starts at {total - last.length:.1f}mm). "
-                "Infeasible; not attempting construction."
             )
 
         cursor = 0.0
@@ -870,6 +878,52 @@ class OcctPartBuilder:
             sewn = sewing.Modified(face) if sewing.IsModified(face) else face
             renamed[topods.Face(sewn)] = name
         return shape, renamed
+
+    @staticmethod
+    def _fillet_rib_edges(shape, faces):
+        """リブの稜線(V1A/V2A/V1B/V2B と稜AB)を中立面R最小で丸める。
+
+        ユーザー指定(2026-09-04)。基準面の曲げは自前で厳密に張っているが、リブの
+        稜線は3辺が1点に集まる頂点ブレンドを伴うので、ここだけは OCCT の
+        `BRepFilletAPI_MakeFillet` に任せる。落ちたらその部品は捨てて引き直す
+        (混ぜるより安い)。
+        """
+        rib_faces = {face for face, name in faces.items() if name.startswith("rib_")}
+        if not rib_faces:
+            return shape, faces
+        edge_faces = TopTools_IndexedDataMapOfShapeListOfShape()
+        topexp.MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, edge_faces)
+        builder = BRepFilletAPI_MakeFillet(shape)
+        added = 0
+        for i in range(1, edge_faces.Size() + 1):
+            edge = topods.Edge(edge_faces.FindKey(i))
+            if BRep_Tool.Degenerated(edge):
+                continue
+            if any(topods.Face(f) in rib_faces for f in edge_faces.FindFromIndex(i)):
+                builder.Add(MIN_NEUTRAL_PLANE_RADIUS_MM, edge)
+                added += 1
+        if added == 0:
+            return shape, faces
+        builder.Build()
+        if not builder.IsDone():
+            raise ValueError("filleting the rib ridges failed. Infeasible; resample.")
+        result = builder.Shape()
+        renamed = {}
+        for face, name in faces.items():
+            for target in (list(builder.Modified(face)) or [face]):
+                renamed.setdefault(topods.Face(target), name)
+        sources = [(face_centroid(f), n) for f, n in faces.items()]
+        final = {}
+        explorer = TopExp_Explorer(result, TopAbs_FACE)
+        while explorer.More():
+            face = topods.Face(explorer.Current())
+            name = renamed.get(face)
+            if name is None:      # フィレットが生んだ面(稜線ブレンド)
+                centre = face_centroid(face)
+                name = "rib_fillet_" + min(sources, key=lambda i: math.dist(i[0], centre))[1]
+            final[face] = name
+            explorer.Next()
+        return result, final
 
     @staticmethod
     def _unify(shape, faces):

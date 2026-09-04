@@ -419,19 +419,67 @@ def path_length_mm(plan: GeneralTwoPointPlan, bend_radius_mm: float) -> tuple[fl
     return total, straights
 
 
+def path_spans(plan: GeneralTwoPointPlan, bend_radius_mm: float):
+    """中心線を区間に分けて [(s0, s1, 直線か), ...] と全長を返す。"""
+    frames, tangents = plan.panel_frames, plan.fold_tangents
+    spans, cursor = [], 0.0
+    for k, frame in enumerate(frames):
+        near_cut, far_cut = tangents[k]
+        length = (frame.far_run_mm - far_cut) - (frame.near_run_mm + near_cut)
+        spans.append((cursor, cursor + length, True))
+        cursor += length
+        if k < len(frames) - 1:
+            a = _normalize(_cross(frame.u, frame.v))
+            b = _normalize(_cross(frames[k + 1].u, frames[k + 1].v))
+            arc = bend_radius_mm * math.acos(max(-1.0, min(1.0, _dot(a, b))))
+            spans.append((cursor, cursor + arc, False))
+            cursor += arc
+    return spans, cursor
+
+
+def bead_placement(spans, total: float, inset: float,
+                   runout_mm: float = BEAD_MIN_RUNOUT_MM):
+    """ビードの開始/終了位置(中心線の弧長)を返す。置けなければ None。
+
+    条件は3つだけ: 締結点まわりの座面 `inset` を侵さない / ランアウトが直線区間に
+    収まる(曲げの上で断面を変えると織り面が円筒に接せず折れる) / 本体が残る。
+
+    **開始位置を端パネルに固定しない**のが要点。固定すると、端パネルの平坦区間が
+    座面径より短い部品(折れ目が締結点の近くにある構成)が全部「ビード不可」になり、
+    185mm離れた大きい部品まで無補強になっていた(2026-09-04に実測)。
+    """
+    start = end = None
+    for s0, s1, straight in spans:
+        if not straight:
+            continue
+        low = max(s0, inset)
+        if s1 - low >= runout_mm:
+            start = low
+            break
+    for s0, s1, straight in reversed(spans):
+        if not straight:
+            continue
+        high = min(s1, total - inset)
+        if high - s0 >= runout_mm:
+            end = high
+            break
+    if start is None or end is None or end - start < 2.0 * runout_mm + BEAD_MIN_BODY_MM:
+        return None
+    return start, end
+
+
 def bead_room_mm(plan: GeneralTwoPointPlan, bend_radius_mm: float) -> float:
     """ビード本体に使える中心線の長さ[mm]。負なら**構造的に**ビードが置けない。
 
-    ビードは両端に 2×座面半径 の平地(座面)と、その内側にランアウトを要求する。
     「締結点が近すぎてビードが置けない」の判定はここ一箇所で行う(リブを作る条件、
     ユーザー指定 2026-09-04)。ビード寸法のサンプリング運によらない構造的な判定。
     """
-    total, straights = path_length_mm(plan, bend_radius_mm)
-    inset = 2.0 * plan.min_bearing_radius_mm
-    room_for_runout = min(straights[0], straights[-1]) - inset - 1.0
-    if room_for_runout < BEAD_MIN_RUNOUT_MM:
+    spans, total = path_spans(plan, bend_radius_mm)
+    placed = bead_placement(spans, total, 2.0 * plan.min_bearing_radius_mm)
+    if placed is None:
         return -1.0
-    return total - 2.0 * inset - 2.0 * BEAD_MIN_RUNOUT_MM - BEAD_MIN_BODY_MM
+    start, end = placed
+    return end - start - 2.0 * BEAD_MIN_RUNOUT_MM - BEAD_MIN_BODY_MM
 
 
 def check_bead_feasible_occt(plan: GeneralTwoPointPlan, bead: BeadParams,

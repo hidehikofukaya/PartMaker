@@ -29,6 +29,7 @@ from synthetic_generator.annotation_schema import AnnotationDocument, PartEntry
 from synthetic_generator.reinforcement import ReinforcementParams, sample_reinforcement
 from synthetic_generator.classify import classify
 from synthetic_generator.flange import FlangeParams, chirality_candidates
+from synthetic_generator.families import FAMILIES, Knobs, kind_of
 from synthetic_generator.rib import RibParams
 from synthetic_generator.general_geometry import plan_for
 from synthetic_generator.templates.general_two_point import (
@@ -360,6 +361,111 @@ def generate_general_batch(
                 rib=rib,
             )
         )
+
+    doc.save()
+    return records
+
+
+def generate_recipe_batch(
+    builder,
+    out_dir: pathlib.Path,
+    recipe: list[dict],
+    *,
+    seed: int,
+    on_part=None,
+) -> list[GeneratedGeneralPartRecord]:
+    """レシピどおりに部品を作る(2026-09-04、ユーザー提案の族別生成)。
+
+    `recipe` は `[{"kind": "bead", "count": 180, "knobs": {...}}, ...]`。
+    **何をどれだけどんな多様性で作るかは、ここではなく呼び出し側が決める。**
+    族ごとに独立した生成器(`families.FAMILIES`)が「その特徴が成立する配置を狙って」
+    引くので、族どうしが干渉しない(1つの決定論で振り分けていた頃は、ビードの
+    置き場所探索を改善するとリブが0%になる、といった往復が起きた)。
+
+    ビルドが落ちた部品はその族の中で引き直す。族ごとの試行回数と成功数は
+    `on_part(kind, spec, bead, flange, rib, attempts)` で観測できる。
+    """
+    rng = random.Random(seed)
+    out_dir = pathlib.Path(out_dir)
+    doc = AnnotationDocument(assembly_dir=out_dir, full_assembly_stp="synthetic")
+    records: list[GeneratedGeneralPartRecord] = []
+    index = 0
+
+    for entry in recipe:
+        kind = entry["kind"]
+        generator = FAMILIES[kind]
+        knobs = Knobs.from_dict(entry.get("knobs", {}))
+        wanted = int(entry["count"])
+        made = 0
+        while made < wanted:
+            for attempt in range(entry.get("max_attempts", 400)):
+                drawn = generator(rng, knobs)
+                if drawn is None:
+                    continue
+                spec, bead, flange, rib = drawn
+                index += 1
+                part_id = f"SYN_general_two_point_{index:04d}"
+                try:
+                    generated, flange = build_general_part(
+                        builder, spec, bead, flange, str(out_dir / "mid"), part_id, rib=rib
+                    )
+                except ValueError:
+                    index -= 1
+                    continue
+                break
+            else:
+                raise RuntimeError(
+                    f"{kind}: {entry.get('max_attempts', 400)}回試しても1件も作れなかった。"
+                    "レシピのつまみが実行可能範囲を外している。"
+                )
+            made += 1
+
+            plan = plan_for(spec)
+            params_dir = out_dir / "params"
+            params_dir.mkdir(parents=True, exist_ok=True)
+            (params_dir / f"{part_id}.json").write_text(
+                json.dumps(
+                    {
+                        "part_id": part_id,
+                        "kind": kind_of(bead, flange, rib),
+                        "attempts_used": attempt + 1,
+                        "geometry_label": plan.geometry_label,
+                        "folds": len(plan.panel_frames) - 1,
+                        "fold_tilts_deg": [
+                            [math.degrees(a), math.degrees(b)] for a, b in plan.fold_tilts
+                        ],
+                        "spec": dataclasses.asdict(spec),
+                        "bead": dataclasses.asdict(bead) if bead is not None else None,
+                        "flange": dataclasses.asdict(flange) if flange is not None else None,
+                        "rib": dataclasses.asdict(rib) if rib is not None else None,
+                    },
+                    ensure_ascii=False,
+                    indent=1,
+                ),
+                encoding="utf-8",
+            )
+            doc.parts[part_id] = PartEntry(
+                part_id=part_id,
+                stp_file=f"mid/{part_id}_mid.stp",
+                vtp_file="",
+                tag="sheet_metal",
+                thickness_mm=spec.thickness_mm,
+                thickness_source="synthetic_generator",
+            )
+            for joint in build_two_joint_pair(part_id, spec.point1, spec.point2,
+                                              spec.hole_diameter_mm):
+                doc.add_joint(joint)
+            if len(records) % 25 == 0:
+                doc.save()
+            if on_part is not None:
+                on_part(kind, spec, bead, flange, rib, attempt + 1)
+            records.append(
+                GeneratedGeneralPartRecord(
+                    part_id=part_id, spec=spec,
+                    stp_path=generated.stp_path, catpart_path=generated.catpart_path,
+                    bead=bead, flange=flange, rib=rib,
+                )
+            )
 
     doc.save()
     return records
