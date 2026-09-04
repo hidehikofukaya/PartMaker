@@ -391,13 +391,17 @@ def generate_recipe_batch(
     records: list[GeneratedGeneralPartRecord] = []
     index = 0
 
-    for entry in recipe:
+    # **族を混ぜる。**レシピ順にまとめて作ると part_id が族ごとに連続し、
+    # IDで train/val を切ると片方が1族だけになる(2026-09-04にユーザー指摘)。
+    order = [entry for entry in recipe for _ in range(int(entry["count"]))]
+    rng.shuffle(order)
+
+    for entry in order:
         kind = entry["kind"]
         generator = FAMILIES[kind]
         knobs = Knobs.from_dict(entry.get("knobs", {}))
-        wanted = int(entry["count"])
         made = 0
-        while made < wanted:
+        while made < 1:
             for attempt in range(entry.get("max_attempts", 400)):
                 drawn = generator(rng, knobs)
                 if drawn is None:
