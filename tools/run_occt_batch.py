@@ -96,6 +96,11 @@ def main() -> None:
             labels_by_part[kwargs["part_name"]] = part.face_labels
             return part
 
+        def build_channel_seat(self, *args, **kwargs):
+            part = super().build_channel_seat(*args, **kwargs)
+            labels_by_part[kwargs["part_name"]] = part.face_labels
+            return part
+
     attempts: collections.Counter = collections.Counter()
     tries: collections.Counter = collections.Counter()
 

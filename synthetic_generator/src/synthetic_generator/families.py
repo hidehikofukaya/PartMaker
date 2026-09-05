@@ -24,7 +24,7 @@ import random
 
 from synthetic_generator.bead import BeadParams, sample_bead
 from synthetic_generator.classify import FasteningPoint, classify
-from synthetic_generator.occt_build import ARM_TIP_RELIEF_MM, branch_frames
+from synthetic_generator.occt_build import ARM_TIP_RELIEF_MM, branch_frames, channel_seat_frames
 from synthetic_generator.flange import (
     FLANGE_MAX_FOLD_ANGLE_DEG,
     FlangeParams,
@@ -852,6 +852,98 @@ def branch_part(rng: random.Random, knobs: Knobs) -> Result | None:
     return None
 
 
+# ---------------------------------------------------------------- 実車144型(チャンネル + 座面)
+# ウェブ(台の平面)の両長辺に壁、壁の下辺は斜め、そこから座面を外へ折る。BIWと外装の接点。
+# 実車: ウェブ 66.8x31.5、壁 88.0度 R3.4、斜辺 43.5度、座面 44.8x31 (86.1度 R2.6)、t=0.6。
+CHANNEL_THICKNESS_MM = 0.6
+CHANNEL_MIN_R_MM = 4.0                     # この族の最小R(指示: 4)
+CHANNEL_BEARING_MM = (12.5, 15.0)
+CHANNEL_WEB_LENGTH_MM = (55.0, 90.0)       # 実車 66.8
+CHANNEL_WEB_WIDTH_MM = (28.0, 45.0)        # 実車 31.5
+CHANNEL_WALL_FOLD_DEG = (60.0, 88.0)       # 上限88: 壁は常に外へ開く(座面側が長辺の台形)
+CHANNEL_WALL_R_MM = (4.0, 8.0)
+CHANNEL_WALL_DEPTH0_MM = (25.0, 50.0)      # 斜辺の浅い側の深さ(実車 45)
+CHANNEL_DIAG_DEG = (20.0, 60.0)            # 斜辺の角度(実車 43.5)
+CHANNEL_DIAG_OVERHANG_MM = 8.0             # 斜辺の浅い端がウェブ端より外に出てよい量(実車 9.5)
+CHANNEL_SEAT_WIDTH_MM = (45.0, 70.0)       # 斜辺の長さ = 座面の幅(実車 44.8)
+CHANNEL_SEAT_DEPTH_MM = (28.0, 45.0)       # 実車 31
+CHANNEL_SEAT_R_MM = (4.0, 6.0)
+CHANNEL_SEAT_FOLD_RANGE_DEG = (55.0, 100.0)  # 解いた γ がここを外れたら引き直す
+CHANNEL_SEAT_POINT_GAP_MM = 20.0           # 座面2点の間隔(実車 31)
+
+
+def channel_seat_part(rng: random.Random, knobs: Knobs) -> Result | None:
+    """実車144型: 座面(同一法線)各1〜2点 + ウェブ1点(必須)。"""
+    for _ in range(knobs.attempts):
+        try:
+            spec = _draw_spec(rng, knobs, folds=0)      # 向きだけ借りる
+        except ValueError:
+            continue
+        bearing = rng.uniform(*(knobs.bearing_radius_mm or CHANNEL_BEARING_MM))
+        normal = spec.point1.normal_xyz
+        u, v = _plane_basis(normal)
+        origin = spec.point1.position_xyz
+
+        length = rng.uniform(*CHANNEL_WEB_LENGTH_MM)
+        width = rng.uniform(*CHANNEL_WEB_WIDTH_MM)
+        beta = math.radians(rng.uniform(*CHANNEL_DIAG_DEG))
+        seat_w = rng.uniform(*CHANNEL_SEAT_WIDTH_MM)
+        run = seat_w * math.cos(beta)
+        if run > length + CHANNEL_DIAG_OVERHANG_MM - 2.0:
+            continue
+        diag_start = rng.uniform(-CHANNEL_DIAG_OVERHANG_MM, length - run - 2.0)
+        depth0 = rng.uniform(*CHANNEL_WALL_DEPTH0_MM)
+        geom = {
+            "origin": list(origin), "hub_u": list(u), "hub_v": list(v),
+            "length_mm": length, "width_mm": width,
+            "wall_fold_deg": rng.uniform(*CHANNEL_WALL_FOLD_DEG),
+            "wall_radius_mm": rng.uniform(*CHANNEL_WALL_R_MM),
+            "wall_depth0_mm": depth0, "wall_depth1_mm": depth0 + seat_w * math.sin(beta),
+            "diag_start_mm": diag_start, "diag_end_mm": diag_start + run,
+            "seat_fold_deg": None,
+            "seat_radius_mm": rng.uniform(*CHANNEL_SEAT_R_MM),
+        }
+        lay = channel_seat_frames(**geom)
+        wall = lay["walls"]["A"]
+        gamma = wall["seat_fold_deg"]
+        if not CHANNEL_SEAT_FOLD_RANGE_DEG[0] <= gamma <= CHANNEL_SEAT_FOLD_RANGE_DEG[1]:
+            continue
+        geom["seat_fold_deg"] = gamma
+        seat_d = rng.uniform(*CHANNEL_SEAT_DEPTH_MM)
+        if seat_d < 2.0 * bearing + 1.0 or width < 2.0 * bearing + 1.0:
+            continue
+
+        # 座面: 幅が許せば2点(実車)、無理なら1点。両座面で同じ局所座標 = 鏡像配置。
+        two = seat_w >= 2.0 * bearing + CHANNEL_SEAT_POINT_GAP_MM + 1.0
+        across = rng.uniform(bearing, seat_d - bearing)
+        if two:
+            gap = rng.uniform(CHANNEL_SEAT_POINT_GAP_MM, seat_w - 2.0 * bearing)
+            centre = rng.uniform(bearing + gap / 2.0, seat_w - bearing - gap / 2.0)
+            along = [centre - gap / 2.0, centre + gap / 2.0]
+        else:
+            along = [rng.uniform(bearing, seat_w - bearing)]
+        points: list = []
+        for key in ("A", "B"):
+            w = lay["walls"][key]
+            for s_ in along:
+                position = tuple(w["seat_a"][i] + s_ * w["diag"][i] + across * w["seat_out"][i]
+                                 for i in range(3))
+                points.append(FasteningPoint(position_xyz=position, normal_xyz=w["seat_normal"]))
+        # ウェブ: 1点必須
+        wx = rng.uniform(bearing, length - bearing)
+        wy = rng.uniform(bearing, width - bearing)
+        points.append(FasteningPoint(position_xyz=lay["at"](wx, wy), normal_xyz=lay["normal"]))
+
+        channel = dict(geom, seat_depth_mm=seat_d, seat_corner_mm=CHANNEL_MIN_R_MM,
+                       diag_deg=math.degrees(beta), seat_width_mm=seat_w)
+        return (dataclasses.replace(spec, point1=points[0], point2=points[1], extra_points=(),
+                                    annotated_points=tuple(points), channel=channel,
+                                    target_folds=None, thickness_mm=CHANNEL_THICKNESS_MM,
+                                    min_bearing_radius_mm=bearing),
+                None, None, None)
+    return None
+
+
 FAMILIES = {
     "bead": bead_part,
     "flange": flange_part,
@@ -862,6 +954,7 @@ FAMILIES = {
     "three_point_span": three_point_span_part,
     "flat_plate": flat_plate_part,
     "branch": branch_part,
+    "channel_seat": channel_seat_part,
 }
 
 

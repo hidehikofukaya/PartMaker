@@ -437,6 +437,77 @@ def branch_frames(hub_xy, arms, *, origin: Vec3, hub_u: Vec3, hub_v: Vec3,
             "to_space": to_space}
 
 
+def channel_seat_frames(*, origin: Vec3, hub_u: Vec3, hub_v: Vec3, length_mm: float,
+                        width_mm: float, wall_fold_deg: float, wall_radius_mm: float,
+                        wall_depth0_mm: float, wall_depth1_mm: float, diag_start_mm: float,
+                        diag_end_mm: float, seat_fold_deg: float | None, seat_radius_mm: float):
+    """実車144型の幾何(OCCTを呼ばない。族の締結点配置とビルダーが共有する)。
+
+    ウェブ(台の平面)= 長さ length(u方向) x 幅 width(v方向) の矩形。両長辺に壁を
+    折り角 wall_fold で折り出す(裏側 = -法線側)。壁の下辺は u=diag_start..diag_end の
+    範囲で深さ depth0 -> depth1 の**斜辺**。その斜辺から座面を seat_fold で外側へ折る。
+    両壁は v=width/2 の面で鏡像。座面2枚の法線が**一致**するのは法線が鏡映面に乗るとき
+    だけなので、seat_fold_deg=None なら「座面法線の v 成分 = 0」になる γ を解いて使う
+    (α=88, β=43.5 の実車では γ≈88.5。実車の 86.1 は座面同士が 5 度ずれる)。
+    """
+    normal = _normalize(_cross(hub_u, hub_v))
+
+    def at(x, y):
+        return _add(origin, _add(_scale(hub_u, x), _scale(hub_v, y)))
+
+    walls = {}
+    for key, a_xy, b_xy in (("A", (0.0, 0.0), (length_mm, 0.0)),
+                            ("B", (length_mm, width_mm), (0.0, width_mm))):
+        a, b = at(*a_xy), at(*b_xy)
+        axis = _normalize(_add(b, _scale(a, -1.0)))
+        alpha = math.radians(wall_fold_deg)
+        centre = _add(a, _scale(normal, -wall_radius_mm))
+        outward = _normalize(_cross(axis, normal))
+        tip = _normalize(_add(_scale(outward, math.cos(alpha)), _scale(normal, -math.sin(alpha))))
+        a2 = _rotate_about(a, centre, axis, alpha)
+        b2 = _rotate_about(b, centre, axis, alpha)
+        wall_normal = _normalize(_cross(tip, axis))
+        # 斜辺の端点をウェブの u 座標で指定する(両壁で同じ x に来るよう鏡像にする)。
+        # 壁A の axis は +u、壁B は -u なので、B は a2 から測る距離を反転する。
+        if key == "A":
+            s_lo, s_hi, d_lo, d_hi = diag_start_mm, diag_end_mm, wall_depth0_mm, wall_depth1_mm
+        else:
+            s_lo, s_hi = length_mm - diag_end_mm, length_mm - diag_start_mm
+            d_lo, d_hi = wall_depth1_mm, wall_depth0_mm
+        q_a = _add(a2, _add(_scale(axis, s_lo), _scale(tip, d_lo)))
+        q_b = _add(a2, _add(_scale(axis, s_hi), _scale(tip, d_hi)))
+        d = _normalize(_add(q_b, _scale(q_a, -1.0)))
+        # 座面は壁の**外側**(壁の法線側)へ折る。e0 = 壁面内で斜辺に直交しウェブから離れる向き。
+        e0 = _normalize(_add(tip, _scale(d, -_dot(tip, d))))
+        sign = 1.0 if _dot(_cross(d, e0), wall_normal) > 0.0 else -1.0
+        if seat_fold_deg is None:
+            # 座面法線 n(θ) = n0 cosθ + (d x n0) sinθ (n0 ⊥ d)。v成分 = 0 を解く。
+            n0_v = _dot(wall_normal, hub_v)
+            k_v = _dot(_cross(d, wall_normal), hub_v)
+            theta = math.atan2(-n0_v, k_v)
+            if theta * sign < 0.0:
+                theta += math.pi if sign > 0 else -math.pi
+            gamma = abs(theta)
+        else:
+            gamma = math.radians(seat_fold_deg)
+            theta = sign * gamma
+        seat_centre = _add(q_a, _scale(wall_normal, seat_radius_mm))
+        qa2 = _rotate_about(q_a, seat_centre, d, theta)
+        qb2 = _rotate_about(q_b, seat_centre, d, theta)
+        e = _normalize(_add(_scale(e0, math.cos(gamma)), _scale(wall_normal, math.sin(gamma))))
+        walls[key] = {
+            "root_a": a, "root_b": b, "axis": axis, "centre": centre, "angle": alpha,
+            "a2": a2, "b2": b2, "tip": tip, "normal": wall_normal,
+            "q_a": q_a, "q_b": q_b, "diag": d, "diag_len": math.dist(q_a, q_b),
+            "seat_centre": seat_centre, "seat_theta": theta,
+            "seat_a": qa2, "seat_b": qb2, "seat_out": e,
+            "seat_fold_deg": math.degrees(gamma),
+            # γ=0 で壁の法線に連続する向き(分岐族の腕と同じ約束)
+            "seat_normal": _normalize(_cross(d, e)) if sign > 0 else _normalize(_cross(e, d)),
+        }
+    return {"normal": normal, "at": at, "walls": walls}
+
+
 def _hub_outline(xy, arm_edges, corner_radius):
     """分岐部品のハブ輪郭と、辺ごとの腕の根本エッジを返す。
 
@@ -1150,6 +1221,73 @@ class OcctPartBuilder:
             raise
         return GeneratedPart(stp_path=stp_path, catpart_path="",
                              face_labels=tuple(describe_faces(named)))
+
+    def build_channel_seat(self, *, out_dir: str, part_name: str, seat_depth_mm: float,
+                           seat_corner_mm: float, check_points=(), **geom) -> GeneratedPart:
+        """実車144型: チャンネル(ウェブ + 斜めに切った壁2枚) + 壁から外へ折った座面2枚。
+
+        ウェブをハブ、壁を対辺の腕、座面を壁の斜辺から折る腕、の**2段**折り。
+        トポロジは固定(ハブ + 壁2 + 座面2)なので専用ビルダー。平面と円筒しか作らないので
+        展開可能で、既存の全ゲートがそのまま効く。
+        """
+        lay = channel_seat_frames(**geom)
+        normal, at = lay["normal"], lay["at"]
+        L, W = geom["length_mm"], geom["width_mm"]
+
+        wire = BRepBuilderAPI_MakeWire()
+        corners = [at(0.0, 0.0), at(L, 0.0), at(L, W), at(0.0, W)]
+        for i in range(4):
+            wire.Add(BRepBuilderAPI_MakeEdge(gp_Pnt(*corners[i]),
+                                             gp_Pnt(*corners[(i + 1) % 4])).Edge())
+        hub = BRepBuilderAPI_MakeFace(gp_Pln(gp_Pnt(*geom["origin"]), gp_Dir(*normal)), wire.Wire())
+        if not hub.IsDone():
+            raise ValueError("web face failed. Infeasible.")
+        faces: dict = {hub.Face(): "web"}
+        groups: dict = {}
+
+        for key, w in lay["walls"].items():
+            root = BRepBuilderAPI_MakeEdge(gp_Pnt(*w["root_a"]), gp_Pnt(*w["root_b"])).Edge()
+            bend = BRepPrimAPI_MakeRevol(
+                root, gp_Ax1(gp_Pnt(*w["centre"]), gp_Dir(*w["axis"])), w["angle"]).Shape()
+            faces[topods.Face(bend)] = f"wall_bend_{key}"
+            # 壁 = 四角形 a2 -> b2 -> q_b -> q_a (下辺 q_a-q_b が座面の根本エッジ)
+            wall = self._quad_face([w["a2"], w["b2"], w["q_b"], w["q_a"]], w["normal"])
+            faces[wall] = f"wall_{key}"
+            diag = BRepBuilderAPI_MakeEdge(gp_Pnt(*w["q_a"]), gp_Pnt(*w["q_b"])).Edge()
+            theta = w["seat_theta"]
+            axis_dir = w["diag"] if theta > 0 else _scale(w["diag"], -1.0)
+            seat_bend = BRepPrimAPI_MakeRevol(
+                diag, gp_Ax1(gp_Pnt(*w["seat_centre"]), gp_Dir(*axis_dir)), abs(theta)).Shape()
+            faces[topods.Face(seat_bend)] = f"seat_bend_{key}"
+            seat = self._arm_face(w["seat_a"], w["seat_b"], w["seat_out"], w["diag"],
+                                  seat_depth_mm, seat_corner_mm)
+            faces[seat] = f"seat_{key}"
+            groups[key] = [topods.Face(bend), wall, topods.Face(seat_bend), seat]
+
+        shape, named = self._sew(faces)
+        self._check_arm_clearance(groups)
+        os.makedirs(out_dir, exist_ok=True)
+        stp_path = os.path.abspath(os.path.join(out_dir, part_name + "_mid.stp"))
+        _export_step(shape, named, stp_path)
+        try:
+            check_shape(_read_step(stp_path), tuple(p.position_xyz for p in check_points))
+        except ValueError:
+            os.remove(stp_path)
+            raise
+        return GeneratedPart(stp_path=stp_path, catpart_path="",
+                             face_labels=tuple(describe_faces(named)))
+
+    @staticmethod
+    def _quad_face(pts, normal: Vec3):
+        wire = BRepBuilderAPI_MakeWire()
+        for i in range(4):
+            if math.dist(pts[i], pts[(i + 1) % 4]) < MIN_EDGE_LENGTH_MM:
+                raise ValueError("wall quad has a degenerate edge. Infeasible.")
+            wire.Add(BRepBuilderAPI_MakeEdge(gp_Pnt(*pts[i]), gp_Pnt(*pts[(i + 1) % 4])).Edge())
+        face = BRepBuilderAPI_MakeFace(gp_Pln(gp_Pnt(*pts[0]), gp_Dir(*normal)), wire.Wire())
+        if not face.IsDone():
+            raise ValueError("wall quad is not planar. Infeasible.")
+        return face.Face()
 
     @staticmethod
     def _gusset_faces(layout, by_edge, corner: int, count: int):

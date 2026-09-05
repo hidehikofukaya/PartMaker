@@ -163,6 +163,13 @@ def build_general_part(builder, spec, bead, flange, out_dir: str, part_name: str
     (側x方向)の反転候補で再試行する(SS14.6: 成立性はキラリティ依存で、失敗7件の
     全てが反転で成立した)。戻り値は(GeneratedPart, 実際に使ったflange)。"""
 
+    # チャンネル + 座面(実車144)。
+    channel = getattr(spec, "channel", None)
+    if channel is not None:
+        geom = {k: (tuple(v) if isinstance(v, list) else v) for k, v in channel.items()
+                if k not in ("diag_deg", "seat_width_mm")}
+        return builder.build_channel_seat(out_dir=out_dir, part_name=part_name,
+                                          check_points=spec.annotated_points, **geom), None
     # 分岐はハブ + 腕(実車026)。
     branch = getattr(spec, "branch", None)
     if branch is not None:
@@ -444,7 +451,8 @@ def generate_recipe_batch(
 
             plate = getattr(spec, "plate_margin_mm", None) is not None
             branch = getattr(spec, "branch", None)
-            custom = plate or branch is not None
+            channel = getattr(spec, "channel", None)
+            custom = plate or branch is not None or channel is not None
             plan = None if custom else plan_for(spec)
             params_dir = out_dir / "params"
             params_dir.mkdir(parents=True, exist_ok=True)
@@ -460,9 +468,12 @@ def generate_recipe_batch(
                             else (f"branch, {len(branch['arms'])} arms, "
                                   f"{len(branch['gussets'])} gussets, "
                                   f"{len(spec.annotated_points)} joints") if branch
+                            else (f"channel seat, wall {channel['wall_fold_deg']:.0f} deg, "
+                                  f"seat {channel['seat_fold_deg']:.0f} deg, "
+                                  f"{len(spec.annotated_points)} joints") if channel
                             else plan.geometry_label),
                         "folds": (0 if plate else len(branch["arms"]) if branch
-                                  else len(plan.panel_frames) - 1),
+                                  else 4 if channel else len(plan.panel_frames) - 1),
                         "fold_tilts_deg": [] if custom else [
                             [math.degrees(a), math.degrees(b)] for a, b in plan.fold_tilts
                         ],
