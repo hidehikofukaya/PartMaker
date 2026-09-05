@@ -98,6 +98,38 @@ def _build_branch(meta: dict, spec: dict) -> dict:
     }
 
 
+def _build_channel(meta: dict, spec: dict) -> dict:
+    """チャンネル + 座面(実車144)。ウェブ・壁・座面のパラメータをそのまま真値にする。"""
+    ch = spec["channel"]
+    points = spec.get("annotated_points") or []
+    return {
+        "schema": SCHEMA,
+        "part_id": meta["part_id"],
+        "geometry_label": meta["geometry_label"],
+        "half_width_mm": None,
+        "min_bearing_radius_mm": spec["min_bearing_radius_mm"],
+        "thickness_mm": spec["thickness_mm"],
+        "folds": 4,
+        "panels": 5,
+        "has_inflection": False,
+        "bead": None, "flange": None, "rib": None,
+        "corner_relief": None,
+        "channel": {
+            "web_length_mm": ch["length_mm"], "web_width_mm": ch["width_mm"],
+            "wall_fold_deg": ch["wall_fold_deg"], "wall_bend_radius_mm": ch["wall_radius_mm"],
+            "wall_depth_mm": [ch["wall_depth0_mm"], ch["wall_depth1_mm"]],
+            "diag_deg": ch["diag_deg"],
+            "seat_fold_deg": ch["seat_fold_deg"], "seat_bend_radius_mm": ch["seat_radius_mm"],
+            "seat_width_mm": ch["seat_width_mm"], "seat_depth_mm": ch["seat_depth_mm"],
+            "joints": len(points),
+            "joint_positions_xyz": [list(p["position_xyz"]) for p in points],
+            "joint_normals_xyz": [list(p["normal_xyz"]) for p in points],
+        },
+        "notes": "channel seat: web hub, two walls folded about the long edges, "
+                 "seats folded outward about each wall's diagonal bottom edge",
+    }
+
+
 def _build_flat_plate(meta: dict, spec: dict) -> dict:
     """平板×多点締結(実車031 / 1285-20)。掃引の計画が無いので真値も別立てで出す。"""
     points = spec.get("annotated_points") or []
@@ -130,6 +162,8 @@ def build(meta: dict) -> dict:
         return _build_flat_plate(meta, spec)
     if spec.get("branch") is not None:
         return _build_branch(meta, spec)
+    if spec.get("channel") is not None:
+        return _build_channel(meta, spec)
     p1 = FasteningPoint(tuple(spec["point1"]["position_xyz"]), tuple(spec["point1"]["normal_xyz"]))
     p2 = FasteningPoint(tuple(spec["point2"]["position_xyz"]), tuple(spec["point2"]["normal_xyz"]))
     flange = FlangeParams(**meta["flange"]) if meta["flange"] else None

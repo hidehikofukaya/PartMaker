@@ -214,6 +214,8 @@ class GeneralTwoJointSpec:
     # 分岐部品(実車026)。ハブ多角形・腕・ガセットの全パラメータ(JSONにそのまま出る)。
     # これが入っている spec は `build_branch_part` で作る。
     branch: dict | None = None
+    # 実車144型(チャンネル + 座面)。入っていれば `build_channel_seat` で作る。
+    channel: dict | None = None
 
 
 def _random_unit_vector(rng: random.Random) -> Vec3:

@@ -35,6 +35,8 @@ from OCC.Core.TopoDS import topods
 ROOT = pathlib.Path(__file__).resolve().parent.parent / "fill_mid_surf"
 FASTENERS = ("weld", "bolt", "mounting_hole")
 PLANE, CYLINDER = 0, 1
+DONE = {("A0072600002", "007"), ("A0072600002", "011"), ("A0072600002", "014"),
+        ("A0072600002", "026"), ("A0072600002", "031"), ("A0072601285", "20")}
 BEND_RADIUS_RANGE_MM = (1.0, 60.0)   # これを外れる円筒は穴・大R曲面として除く
 PARALLEL_DEG, ORTHOGONAL_DEG = 10.0, 10.0
 
@@ -76,6 +78,23 @@ def joints_of(assembly: pathlib.Path):
             files[entry["part_id"]] = assembly / name
             thickness[entry["part_id"]] = entry.get("thickness_mm")
     return per, files, thickness
+
+
+def read_faces_for_branch(path: pathlib.Path):
+    reader = STEPControl_Reader()
+    reader.ReadFile(str(path))
+    reader.TransferRoots()
+    shape = reader.OneShape()
+    faces = []
+    props = GProp_GProps()
+    explorer = TopExp_Explorer(shape, TopAbs_FACE)
+    while explorer.More():
+        face = topods.Face(explorer.Current())
+        surface = BRepAdaptor_Surface(face)
+        brepgprop.SurfaceProperties(face, props)
+        faces.append({"face": face, "kind": surface.GetType(), "area": props.Mass()})
+        explorer.Next()
+    return shape, faces
 
 
 def measure(path: pathlib.Path, normals):
@@ -165,6 +184,66 @@ def measure(path: pathlib.Path, normals):
     }
 
 
+def branch_fit(shape, faces, min_area_ratio=0.04):
+    """分岐モデル(ハブ + 腕、1段)で作れるかを測る。
+
+    大きな平面(面積が全体の min_area_ratio 以上)を曲げでつないだグラフを作り、
+    次数が最大の平面をハブとみなす。他の大きな平面が全てハブに直接つながっていれば
+    深さ1の木 = `build_branch_part` で作れる。深さ2以上の平面は「腕の先の腕」で、
+    1段のみの現行実装では作れない。
+    """
+    import collections as _c
+    total = sum(f["area"] for f in faces) or 1.0
+    big = {i for i, f in enumerate(faces)
+           if f["kind"] == PLANE and f["area"] >= min_area_ratio * total}
+    if len(big) < 2:
+        return {"hub": None, "arms": 0, "deep": 0, "depth": 0, "big": len(big)}
+    pairs = _adjacency(shape, faces)
+    graph = _c.defaultdict(set)
+    for i, f in enumerate(faces):
+        if f["kind"] != CYLINDER:
+            continue
+        touch = sorted({j for (a, b) in pairs for j in (a, b) if i in (a, b) and j != i and j in big})
+        for a in touch:
+            for b in touch:
+                if a != b:
+                    graph[a].add(b)
+    if not graph:
+        return {"hub": None, "arms": 0, "deep": len(big), "depth": 99, "big": len(big)}
+    hub = max(graph, key=lambda k: (len(graph[k]), faces[k]["area"]))
+    # ハブからの深さ(BFS)
+    depth = {hub: 0}
+    queue = [hub]
+    while queue:
+        k = queue.pop(0)
+        for n in graph[k]:
+            if n not in depth:
+                depth[n] = depth[k] + 1
+                queue.append(n)
+    unreachable = [b for b in big if b not in depth]
+    deep = [b for b, d in depth.items() if d >= 2] + unreachable
+    return {"hub": hub, "arms": len(graph[hub]), "deep": len(deep),
+            "depth": max(depth.values()) if not unreachable else 99, "big": len(big),
+            "hub_area": faces[hub]["area"] / total}
+
+
+def _adjacency(shape, faces):
+    from OCC.Core.TopTools import TopTools_IndexedDataMapOfShapeListOfShape
+    from OCC.Core.TopExp import topexp
+    from OCC.Core.TopAbs import TopAbs_EDGE as _E, TopAbs_FACE as _F
+    index = {f["face"]: i for i, f in enumerate(faces)}
+    mapping = TopTools_IndexedDataMapOfShapeListOfShape()
+    topexp.MapShapesAndAncestors(shape, _E, _F, mapping)
+    out = set()
+    for i in range(1, mapping.Size() + 1):
+        owners = sorted(o for o in (index.get(topods.Face(f)) for f in mapping.FindFromIndex(i))
+                        if o is not None)
+        for a in range(len(owners)):
+            for b in range(a + 1, len(owners)):
+                out.add((owners[a], owners[b]))
+    return out
+
+
 def main() -> None:
     cap = int(sys.argv[1]) if len(sys.argv) > 1 else 6
     rows = []
@@ -179,7 +258,9 @@ def main() -> None:
             shape = measure(files[part_id], [j["normal"] for j in fasteners])
             if shape is None:
                 continue
+            fit = branch_fit(*read_faces_for_branch(files[part_id]))
             rows.append({
+                "branch": fit,
                 "asm": assembly.name[:11], "part": part_id,
                 "n": len(fasteners),
                 "types": "/".join(f"{k}{v}" for k, v in
@@ -210,6 +291,19 @@ def main() -> None:
     for row in rows:
         if row["fits"]:
             print(f"  {row['asm']}/{row['part']}: {row['fold_radii']}  t={row['t']}mm")
+
+    print("\n分岐モデル(ハブ + 腕、1段)での判定:")
+    header = f"{'部品':<16}{'締結':>4}{'大平面':>6}{'ハブ面積比':>9}{'腕':>4}{'深さ2以上':>9}{'自由%':>6}  判定"
+    print(header)
+    print("-" * len(header))
+    for row in sorted(rows, key=lambda r: (r["branch"]["deep"], r["free_form"])):
+        b = row["branch"]
+        ok = b["deep"] == 0 and row["free_form"] < 0.10 and b["arms"] >= 2
+        near = b["deep"] <= 1 and row["free_form"] < 0.15
+        verdict = ("済" if (row["asm"], row["part"]) in DONE else
+                   ("分岐で作れる" if ok else ("惜しい" if near else "-")))
+        print(f"{row['asm'] + '/' + row['part']:<16}{row['n']:>4}{b['big']:>6}"
+              f"{b.get('hub_area', 0):>9.0%}{b['arms']:>4}{b['deep']:>9}{row['free_form']:>6.0%}  {verdict}")
 
 
 if __name__ == "__main__":
