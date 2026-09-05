@@ -24,6 +24,7 @@ import random
 
 from synthetic_generator.bead import BeadParams, sample_bead
 from synthetic_generator.classify import FasteningPoint, classify
+from synthetic_generator.occt_build import ARM_TIP_RELIEF_MM, branch_frames
 from synthetic_generator.flange import (
     FLANGE_MAX_FOLD_ANGLE_DEG,
     FlangeParams,
@@ -725,6 +726,132 @@ def flat_plate_part(rng: random.Random, knobs: Knobs) -> Result | None:
     return None
 
 
+# --- 分岐(実車026、2026-09-05) ------------------------------------------------
+# 「締結したい面が3つ以上あるとき、それらを1枚の板でどう繋ぐか」を学習させる族。
+# 平面のハブから辺ごとに別の軸で腕を折り出す。実車026: ハブ1453mm2、腕3本
+# (折れ角 91.0 / 90.0 / 30.3度、根本幅 32〜73mm、腕長 23〜47mm、曲げR 6.8〜24.2)。
+#
+# 一枚板から作れるための条件(docs/PLAN_branch_2026-09-05.md):
+#   展開可能 = 構築上保証 / 展開図の自己交差なし = 凸ハブで構築上保証 /
+#   ハブ角のコーナー = 頂点中心の円弧で腕の側端と滑らかに繋ぐ / 腕どうしの干渉 = 実測。
+#
+# ガセット: 隣り合う2本の腕を90度に揃え、片方から折り出したタブをもう片方に重ねる。
+# 両側を曲げで留めると角の3枚の扇形角が 90+90+ハブ角 < 360 で展開できない(実車026は
+# ここを絞りで埋めている)。重ねならタブの端が自由エッジになり外形線は1本のまま。
+BRANCH_ARM_COUNT_WEIGHTS = ((3, 0.60), (4, 0.40))
+BRANCH_HUB_WIDTH_MM = (60.0, 110.0)
+BRANCH_HUB_HEIGHT_MM = (50.0, 95.0)
+BRANCH_HUB_SKEW = 0.20                    # 四角形の歪み(上辺のずれ / 幅)
+BRANCH_FOLD_DEG = (25.0, 110.0)           # 腕ごとに独立(実車 30.3 / 90.0 / 91.0)
+BRANCH_BEND_R_MM = (5.0, 25.0)            # 実車 6.8 / 7.2 / 24.2
+BRANCH_ARM_LENGTH_MM = (30.0, 70.0)       # 実車 23 / 31 / 47
+BRANCH_CORNER_R_MM = (6.0, 12.0)          # ハブ角のくぼみR
+# ガセットは無効(2026-09-05 ユーザー裁定)。タブ重ねでも角に穴が残って見えるため、
+# 生成には入れない。機構は残してあるので、埋め方が決まれば比率を戻せる。
+BRANCH_GUSSET_PROB = 0.0
+BRANCH_GUSSET_FOLD_DEG = 90.0             # ガセットを挟む2本の腕はどちらも90度
+BRANCH_ARM_POINT_WEIGHTS = ((1, 0.60), (2, 0.40))   # 腕先の締結点数
+BRANCH_HUB_POINT_PROB = 0.50              # ハブに1点置く確率
+BRANCH_POINT_ATTEMPTS = 20
+
+
+def _dist_to_segment(p, a, b) -> float:
+    ab = (b[0] - a[0], b[1] - a[1])
+    ap = (p[0] - a[0], p[1] - a[1])
+    denom = ab[0] * ab[0] + ab[1] * ab[1]
+    t = 0.0 if denom < 1e-12 else max(0.0, min(1.0, (ap[0] * ab[0] + ap[1] * ab[1]) / denom))
+    return math.hypot(ap[0] - t * ab[0], ap[1] - t * ab[1])
+
+
+def branch_part(rng: random.Random, knobs: Knobs) -> Result | None:
+    """分岐部品: 凸四角形のハブに腕3〜4本、30%でガセット、腕先1〜2点＋ハブ0〜1点。"""
+    for _ in range(knobs.attempts):
+        try:
+            spec = _draw_spec(rng, knobs, folds=0)      # 板厚・座面R・向きだけ借りる
+        except ValueError:
+            continue
+        bearing = spec.min_bearing_radius_mm
+        normal = spec.point1.normal_xyz
+        u, v = _plane_basis(normal)
+        origin = spec.point1.position_xyz
+
+        w = rng.uniform(*BRANCH_HUB_WIDTH_MM)
+        h = rng.uniform(*BRANCH_HUB_HEIGHT_MM)
+        skew = rng.uniform(-BRANCH_HUB_SKEW, BRANCH_HUB_SKEW) * w
+        hub_xy = [(0.0, 0.0), (w, 0.0), (w + skew, h), (skew * 0.5, h)]
+        edges = sorted(rng.sample(range(4), _draw_weighted(rng, BRANCH_ARM_COUNT_WEIGHTS)))
+        arms = [{"edge": e,
+                 "fold_deg": rng.uniform(*BRANCH_FOLD_DEG),
+                 "radius_mm": rng.uniform(*BRANCH_BEND_R_MM),
+                 "length_mm": rng.uniform(*BRANCH_ARM_LENGTH_MM),
+                 "relief_mm": ARM_TIP_RELIEF_MM} for e in edges]
+        corner_radius = rng.uniform(*BRANCH_CORNER_R_MM)
+
+        # ガセット: 隣り合う腕2本の角を1つ選び、両腕を90度に揃える(意図的に用意する)。
+        gussets: list = []
+        if rng.random() < BRANCH_GUSSET_PROB:
+            corners = [vtx for vtx in range(4) if (vtx - 1) % 4 in edges and vtx in edges]
+            if corners:
+                vtx = rng.choice(corners)
+                for arm in arms:
+                    if arm["edge"] in ((vtx - 1) % 4, vtx):
+                        arm["fold_deg"] = BRANCH_GUSSET_FOLD_DEG
+                gussets = [vtx]
+
+        try:
+            layout = branch_frames(hub_xy, arms, origin=origin, hub_u=u, hub_v=v,
+                                   corner_radius=corner_radius)
+        except ValueError:
+            continue
+
+        # 締結点: 腕先に1〜2点(座面ぶんの余白を四方に)、ハブに0〜1点。
+        points: list = []
+        feasible = True
+        for arm in arms:
+            fr = layout["arms"][arm["edge"]]
+            width = fr["width"]
+            length = arm["length_mm"] - ARM_TIP_RELIEF_MM
+            if width < 2.0 * bearing + 1.0 or length < 2.0 * bearing + 1.0:
+                feasible = False
+                break
+            wanted = _draw_weighted(rng, BRANCH_ARM_POINT_WEIGHTS)
+            got: list = []
+            for _ in range(BRANCH_POINT_ATTEMPTS):
+                run = rng.uniform(bearing, length - bearing)
+                across = rng.uniform(bearing, width - bearing)
+                if all(math.hypot(run - r2, across - a2) >= FLAT_PLATE_MIN_DISTANCE_MM
+                       for r2, a2 in got):
+                    got.append((run, across))
+                if len(got) == wanted:
+                    break
+            if not got:
+                feasible = False
+                break
+            for run, across in got:
+                position = tuple(fr["a"][i] + run * fr["tip"][i] + across * fr["axis"][i]
+                                 for i in range(3))
+                points.append(FasteningPoint(position_xyz=position, normal_xyz=fr["normal"]))
+        if not feasible:
+            continue
+        if rng.random() < BRANCH_HUB_POINT_PROB:
+            cx = sum(p[0] for p in hub_xy) / 4.0
+            cy = sum(p[1] for p in hub_xy) / 4.0
+            if all(_dist_to_segment((cx, cy), hub_xy[i], hub_xy[(i + 1) % 4]) >= bearing
+                   for i in range(4)):
+                points.append(FasteningPoint(position_xyz=layout["to_space"]((cx, cy)),
+                                             normal_xyz=layout["normal"]))
+        if len(points) < 3:
+            continue
+        branch = {"hub_xy": hub_xy, "arms": arms, "origin": list(origin),
+                  "hub_u": list(u), "hub_v": list(v),
+                  "corner_radius": corner_radius, "gussets": gussets}
+        return (dataclasses.replace(spec, point1=points[0], point2=points[1], extra_points=(),
+                                    annotated_points=tuple(points), branch=branch,
+                                    target_folds=None),
+                None, None, None)
+    return None
+
+
 FAMILIES = {
     "bead": bead_part,
     "flange": flange_part,
@@ -734,6 +861,7 @@ FAMILIES = {
     "three_point_tri": three_point_tri_part,
     "three_point_span": three_point_span_part,
     "flat_plate": flat_plate_part,
+    "branch": branch_part,
 }
 
 
