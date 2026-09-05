@@ -63,6 +63,14 @@ python tools/survey_real_parts.py                          # 実車が掃引モ�
 
 **合計 5,400 部品**（`synthetic_parts/` は .gitignore。STEPはローカルのみ）。
 
+## 設計等価バリアントと締結点摂動（AutoMetalSheet 依頼、2026-09-06）
+
+締結点は設計の全部を決めない。同じ締結点・座面半径・板厚・曲げRに対して、生成器が
+自由に選んだ選択（フランジの側/高さ/根本R、折り位置、帯幅、ビード断面、リブ、余白、隅R、
+腕の長さ、ウェブ長、座面奥行き）だけを変えた部品を `<chunk>/variants/` に、締結点を1つ
+面内に動かして再生成した対と面ラベルの差分を `<chunk>/perturb/` に置く
+（`docs/REPLY_variants_2026-09-06.md`、`tools/emit_variants.py`、`tools/emit_perturbations.py`）。
+
 ## 今後やるべき型
 
 ### 1. 分岐は作れた。次は角の閉じ方
@@ -133,4 +141,5 @@ python tools/survey_real_parts.py                          # 実車が掃引モ�
 | `docs/PLAN_flat_plate_2026-09-05.md` | 平板×多点締結の実測と設計 |
 | `docs/PLAN_branch_2026-09-05.md` | 分岐（ハブ＋腕）の実測・設計・ガセットの検討 |
 | `docs/PLAN_channel_seat_2026-09-05.md` | チャンネル＋座面（実車144）の実測・2段折りの設計・座面法線の一致条件 |
+| `docs/REQUEST_variants_2026-09-06.md` / `docs/REPLY_variants_2026-09-06.md` | ML側からの依頼（等価バリアント・摂動ペア）とその回答 |
 | `docs/HANDOVER_partmaker_renewal.md` | 出力契約（サイドカー・ゲート） |
