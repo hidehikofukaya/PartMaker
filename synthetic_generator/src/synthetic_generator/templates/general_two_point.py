@@ -211,6 +211,9 @@ class GeneralTwoJointSpec:
     # これが入っている spec は掃引ではなく `build_flat_plate` で作る。
     plate_margin_mm: float | None = None
     plate_corner_radius_mm: float | None = None   # 外形の隅R(実車は4.5〜8mm)
+    # 分岐部品(実車026)。ハブ多角形・腕・ガセットの全パラメータ(JSONにそのまま出る)。
+    # これが入っている spec は `build_branch_part` で作る。
+    branch: dict | None = None
 
 
 def _random_unit_vector(rng: random.Random) -> Vec3:

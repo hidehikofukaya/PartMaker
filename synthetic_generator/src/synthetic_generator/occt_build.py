@@ -111,6 +111,16 @@ FLAT_PLATE_MITER_LIMIT = 1.8
 # 隅Rどうしの間に残す直線の最小長。0.05mmまで許すと縫合後に極小の
 # ゴミエッジが出る(実測 0.0134mm)。
 FLAT_PLATE_MIN_STRAIGHT_MM = 1.0
+# 分岐部品で、折ったあとの腕どうしに要る最小すきま。
+ARM_CLEARANCE_MM = 1.0
+# 腕の根元(曲げ線の両端)の逃がしノッチ半径。応力集中を防ぐための最低R。
+# 腕の先の隅を落とす量。矩形をある程度保つため最小Rに留める。
+ARM_TIP_RELIEF_MM = MIN_NEUTRAL_PLANE_RADIUS_MM
+# ガセット(腕どうしを繋ぐ面取り壁)の曲げRと最小高さ。
+GUSSET_BEND_R_MM = MIN_NEUTRAL_PLANE_RADIUS_MM
+GUSSET_MIN_HEIGHT_MM = 10.0
+# タブの自由端と相手の腕との隙間(重ね接合。溶接前提)。
+GUSSET_LAP_GAP_MM = 1.0
 # エッジが1本の直線/円弧から外れてよい上限[mm](引継ぎ書 §3.4 ゲートA、0.25t の
 # 最も厳しい側 t=1.0mm に合わせる)。リブの稜線フィレットは頂点ブレンドの境界が
 # 解析曲線にならないことがあり、実測で最大0.797mm外れた(2026-09-04)。
@@ -389,6 +399,93 @@ def _convex_hull_2d(points):
         return out
 
     return build(pts)[:-1] + build(list(reversed(pts)))[:-1]
+
+
+def branch_frames(hub_xy, arms, *, origin: Vec3, hub_u: Vec3, hub_v: Vec3,
+                  corner_radius):
+    """分岐部品の幾何を、OCCTを呼ばずに出す(族の締結点配置とビルダーが共有する)。
+
+    戻り値: {"outline": 断面要素, "roots": {辺: (始点2D, 終点2D)},
+             "normal": ハブ法線, "arms": {辺: {"a","b","tip","axis","width","normal"}}}
+    腕の a,b は曲げ後の根本エッジ、tip は腕の伸びる向き、axis は折り軸(根本エッジの向き)、
+    normal は腕面の法線(ハブ法線と連続する向き)。
+    """
+    normal = _normalize(_cross(hub_u, hub_v))
+
+    def to_space(xy):
+        return _add(origin, _add(_scale(hub_u, xy[0]), _scale(hub_v, xy[1])))
+
+    outline, roots = _hub_outline(hub_xy, {a["edge"] for a in arms}, corner_radius)
+    frames = {}
+    for arm in arms:
+        index = arm["edge"]
+        a, b = to_space(roots[index][0]), to_space(roots[index][1])
+        axis = _normalize(_add(b, _scale(a, -1.0)))
+        radius, angle = arm["radius_mm"], math.radians(arm["fold_deg"])
+        centre = _add(a, _scale(normal, -radius))
+        outward = _normalize(_cross(axis, normal))
+        tip = _normalize(_add(_scale(outward, math.cos(angle)),
+                              _scale(normal, -math.sin(angle))))
+        frames[index] = {
+            "a": _rotate_about(a, centre, axis, angle),
+            "b": _rotate_about(b, centre, axis, angle),
+            "tip": tip, "axis": axis, "width": math.dist(a, b),
+            "normal": _normalize(_cross(tip, axis)),
+            "root_a": a, "root_b": b, "centre": centre, "angle": angle,
+        }
+    return {"outline": outline, "roots": roots, "normal": normal, "arms": frames,
+            "to_space": to_space}
+
+
+def _hub_outline(xy, arm_edges, corner_radius):
+    """分岐部品のハブ輪郭と、辺ごとの腕の根本エッジを返す。
+
+    **隣り合う2辺の両方に腕が付く角にだけ**、1つのコーナーを入れる。コーナーは
+    両方の曲げ線に接するところから始まり、ハブの内側へ**くぼむ**円弧
+    (接円の長い方の弧)。曲げ線がここで途切れると応力が集中して裂けるので、
+    実務でも角をえぐって逃がす。隣に腕が無い角はコーナーを設けず、そのまま
+    ハブのエッジに繋がる。
+
+    戻り値は (断面要素の列, {辺の番号: (根本エッジの始点, 終点)})。
+    """
+    count = len(xy)
+    corner: dict = {}
+    for i in range(count):
+        before, after = (i - 1) % count, i        # 頂点 i に入る辺 / 出る辺
+        if before not in arm_edges or after not in arm_edges:
+            continue
+        relief_mm = corner_radius[i] if isinstance(corner_radius, dict) else corner_radius
+        v, prev_v, next_v = xy[i], xy[i - 1], xy[(i + 1) % count]
+        d_in = _normalize2((v[0] - prev_v[0], v[1] - prev_v[1]))
+        d_out = _normalize2((next_v[0] - v[0], next_v[1] - v[1]))
+        cos_turn = max(-1.0, min(1.0, d_in[0] * d_out[0] + d_in[1] * d_out[1]))
+        interior = math.pi - math.acos(cos_turn)
+        if interior < math.radians(20.0):
+            raise ValueError("the hub polygon has a spike. Infeasible.")
+        inward = _normalize2((d_out[0] - d_in[0], d_out[1] - d_in[1]))
+        # コーナーは**ハブ頂点そのものを中心**とする半径 relief_mm の円弧。こうすると
+        # 両端の接線が曲げ線に直交する = **腕の側端エッジと滑らかに繋がる**。
+        # 曲げ線(ハブの辺)に接する円弧にすると、腕の側端が根元で90度に折れてしまう。
+        corner[i] = {
+            "start": (v[0] - relief_mm * d_in[0], v[1] - relief_mm * d_in[1]),
+            "end": (v[0] + relief_mm * d_out[0], v[1] + relief_mm * d_out[1]),
+            "mid": (v[0] + relief_mm * inward[0], v[1] + relief_mm * inward[1]),
+        }
+
+    section, roots = [], {}
+    for i in range(count):
+        begin = corner[i]["end"] if i in corner else xy[i]
+        finish = corner[(i + 1) % count]["start"] if (i + 1) % count in corner             else xy[(i + 1) % count]
+        if math.dist(begin, finish) < MIN_EDGE_LENGTH_MM:
+            raise ValueError(
+                f"hub edge {i} is consumed by its corner reliefs. Infeasible.")
+        section.append(("line", begin, finish, f"hub_edge_{i}"))
+        roots[i] = (begin, finish)
+        nxt = (i + 1) % count
+        if nxt in corner:
+            c = corner[nxt]
+            section.append(("arc", c["start"], c["mid"], c["end"], f"hub_corner_{nxt}"))
+    return section, roots
 
 
 def _edges_of(section: list[Elem], frame: _Frame):
@@ -688,7 +785,7 @@ def _read_step(path: str):
     return shape
 
 
-def check_shape(shape, fastening_points=()) -> None:
+def check_shape(shape, fastening_points=(), expected_loops: int = 1) -> None:
     """出来上がった形の合格判定(通らなければValueErrorで棄却)。
 
     * 0.05mm未満のゴミエッジが無い(引継ぎ書 §4.3)
@@ -702,10 +799,11 @@ def check_shape(shape, fastening_points=()) -> None:
     if not BRepCheck_Analyzer(shape).IsValid():
         raise ValueError("the shell is not valid. Infeasible; resample.")
     loops = boundary_loop_count(shape)
-    if loops != 1:
+    if loops != expected_loops:
+        # 期待値は通常1。ガセット付きの分岐部品は角に窓が開くので 1 + ガセット数。
         raise ValueError(
-            f"the outline is {loops} closed loops, not 1 -- faces did not sew "
-            "(shape collapsed). Infeasible; resample."
+            f"the outline is {loops} closed loops, not {expected_loops} -- faces did not "
+            "sew (shape collapsed). Infeasible; resample."
         )
     turn = worst_dihedral_deg(shape)
     if turn > MAX_DIHEDRAL_TURN_DEG:
@@ -982,6 +1080,214 @@ class OcctPartBuilder:
                     sec = bead_section if s1 - 1e-6 <= mid <= s2 + 1e-6 else flat_section
                     frame = self._sweep_segment(piece, frame, w, sec, faces, tag)
             cursor += step.length
+
+    def build_branch_part(self, hub_xy, arms, *, origin: Vec3, hub_u: Vec3, hub_v: Vec3,
+                          corner_radius, out_dir: str, part_name: str,
+                          check_points=(), gussets=()) -> GeneratedPart:
+        """分岐部品(実車026)。平面のハブから、辺ごとに別の軸で腕を折り出す。
+
+        既存の掃引は「全ての曲げ軸が1方向に平行」しか作れないので分岐は作れない。
+        ここではハブを平面1枚として作り、**各腕をその根本エッジを軸に回転掃引**する。
+        腕ごとに軸が違ってよいのは、軸が「その腕の根本エッジ」だから。
+
+        一枚板から作れるための条件:
+        * 展開可能 — 平面と円筒(軸は隣接平面の交線に平行)しか作らないので構築上保証。
+        * 展開図が自己交差しない — **凸ハブなら構築上保証**。
+        * ハブ頂点のコーナー — 隣り合う腕の間の角を、頂点中心の円弧でくぼませる
+          (両端の接線が腕の側端エッジに一致する)。
+        * 腕どうしが3Dで干渉しない — `_check_arm_clearance`。
+
+        `gussets` = ガセットで塞ぐ角(頂点番号)の列。その角では両方の腕が90度で、
+        腕の側端どうしを垂直な壁(面取り)で繋ぐ。ハブ側は逃がしを残すので小さな
+        **窓**が開き、境界ループが1つ増える(実車026はここを絞りで埋めているが、
+        絞りは展開不能なので我々のモデルでは作らない)。
+        """
+        layout = branch_frames(hub_xy, arms, origin=origin, hub_u=hub_u, hub_v=hub_v,
+                               corner_radius=corner_radius)
+        to_space, normal = layout["to_space"], layout["normal"]
+
+        wire = BRepBuilderAPI_MakeWire()
+        for elem in layout["outline"]:
+            if elem[0] == "line":
+                wire.Add(BRepBuilderAPI_MakeEdge(gp_Pnt(*to_space(elem[1])),
+                                                 gp_Pnt(*to_space(elem[2]))).Edge())
+            else:
+                arc = GC_MakeArcOfCircle(gp_Pnt(*to_space(elem[1])), gp_Pnt(*to_space(elem[2])),
+                                         gp_Pnt(*to_space(elem[3]))).Value()
+                wire.Add(BRepBuilderAPI_MakeEdge(arc).Edge())
+        hub = BRepBuilderAPI_MakeFace(gp_Pln(gp_Pnt(*origin), gp_Dir(*normal)), wire.Wire())
+        if not hub.IsDone():
+            raise ValueError("the hub outline does not bound a planar face. Infeasible.")
+
+        faces: dict = {hub.Face(): "hub"}
+        groups: dict = {}
+        by_edge = {arm["edge"]: arm for arm in arms}
+        for index, fr in layout["arms"].items():
+            arm = by_edge[index]
+            root = BRepBuilderAPI_MakeEdge(gp_Pnt(*fr["root_a"]), gp_Pnt(*fr["root_b"])).Edge()
+            bend = BRepPrimAPI_MakeRevol(
+                root, gp_Ax1(gp_Pnt(*fr["centre"]), gp_Dir(*fr["axis"])), fr["angle"]).Shape()
+            bend_face = topods.Face(bend)
+            faces[bend_face] = f"bend_{index}"
+            arm_face = self._arm_face(fr["a"], fr["b"], fr["tip"], fr["axis"],
+                                      arm["length_mm"], arm.get("relief_mm", ARM_TIP_RELIEF_MM))
+            faces[arm_face] = f"arm_{index}"
+            groups[index] = [bend_face, arm_face]
+
+        for corner in gussets:
+            for face, name in self._gusset_faces(layout, by_edge, corner, len(hub_xy)):
+                faces[face] = name
+
+        shape, named = self._sew(faces)
+        self._check_arm_clearance(groups)
+        os.makedirs(out_dir, exist_ok=True)
+        stp_path = os.path.abspath(os.path.join(out_dir, part_name + "_mid.stp"))
+        _export_step(shape, named, stp_path)
+        try:
+            check_shape(_read_step(stp_path), tuple(p.position_xyz for p in check_points))
+        except ValueError:
+            os.remove(stp_path)
+            raise
+        return GeneratedPart(stp_path=stp_path, catpart_path="",
+                             face_labels=tuple(describe_faces(named)))
+
+    @staticmethod
+    def _gusset_faces(layout, by_edge, corner: int, count: int):
+        """ガセット = 隣り合う2本の90度腕の側端を繋ぐ垂直な壁(面取り)。
+
+        両腕が90度なら腕の側端はどちらもハブ法線に平行なので、腕・曲げ・ガセットは
+        すべてハブ面に垂直な柱面になる。つまりハブ面上の2D問題: 腕Aの壁の線 → 曲げ
+        (円弧) → 面取りの直線 → 曲げ → 腕Bの壁の線 という折れ線を、腕の高さぶん
+        法線方向へ押し出せばよい。腕の壁は branch_frames が corner_radius で接線長ぶん
+        詰めてあるので、腕の壁の端 = 曲げの始点になる。
+        """
+        before, after = (corner - 1) % count, corner
+        fa, fb = layout["arms"][before], layout["arms"][after]
+        normal = layout["normal"]
+        for fr in (fa, fb):
+            if abs(_dot(fr["tip"], normal) + 1.0) > 0.02:
+                raise ValueError("gusset needs both arms folded 90deg. Skipped.")
+        pa0, pb0 = fa["b"], fb["a"]                                   # 曲げ出口、角側の端
+        da = _normalize(_add(fa["b"], _scale(fa["a"], -1.0)))         # 腕Aの壁の向き(角へ)
+        db = _normalize(_add(fb["b"], _scale(fb["a"], -1.0)))         # 腕Bの壁の向き(角から)
+        # 腕は -法線側へ折れる(裏側)。壁は「深い方の曲げ出口」から「浅い方の腕先」まで。
+        base = min(_dot(pa0, normal), _dot(pb0, normal))
+        top = max(_dot(_add(fa["b"], _scale(fa["tip"], by_edge[before]["length_mm"])), normal),
+                  _dot(_add(fb["a"], _scale(fb["tip"], by_edge[after]["length_mm"])), normal))
+        if base - top < GUSSET_MIN_HEIGHT_MM:
+            raise ValueError("gusset has no height between the two arms. Skipped.")
+
+        def lift(p, h):
+            return _add(p, _scale(normal, h - _dot(p, normal)))
+
+        pa, pb = lift(pa0, base), lift(pb0, base)
+        if math.dist(pa, pb) < MIN_EDGE_LENGTH_MM:
+            raise ValueError("gusset chord collapsed. Skipped.")
+        # 曲げは腕Aの壁の端 pa から**ちょうど**始まる(そこが縫合の共有エッジ、
+        # 許容0.01mm)。折れ線の角 P = pa + t*da、弦は P から pb へ向き、
+        # t = R*tan(turn/2) は弦の向きに依存する — 不動点反復で自己整合させる
+        # (1回で打ち切ると 0.18mm ずれて腕と縫えない、2026-09-05実測)。
+        t = 0.0
+        for _ in range(12):
+            corner_pt = _add(pa, _scale(da, t))
+            chord = _normalize(_add(pb, _scale(corner_pt, -1.0)))
+            turn = math.acos(max(-1.0, min(1.0, _dot(da, chord))))
+            t = GUSSET_BEND_R_MM * math.tan(turn / 2.0)
+        corner_pt = _add(pa, _scale(da, t))
+        chord = _normalize(_add(pb, _scale(corner_pt, -1.0)))
+
+        def fillet(p, d_in, d_out):
+            """点 p で向き d_in -> d_out に曲がる壁を半径 GUSSET_BEND_R_MM で丸める。
+            戻り値 (始点, 中点, 終点)。p が折れ線の角、始点/終点が接点。"""
+            cos_turn = max(-1.0, min(1.0, _dot(d_in, d_out)))
+            turn = math.acos(cos_turn)
+            if turn < math.radians(3.0):
+                return None
+            t = GUSSET_BEND_R_MM * math.tan(turn / 2.0)
+            s0 = _add(p, _scale(d_in, -t))
+            s1 = _add(p, _scale(d_out, t))
+            bis = _normalize(_add(_scale(d_in, -1.0), d_out))
+            centre = _add(p, _scale(bis, GUSSET_BEND_R_MM / math.cos(turn / 2.0)))
+            mid = _add(centre, _scale(_normalize(_add(p, _scale(centre, -1.0))), GUSSET_BEND_R_MM))
+            return (s0, mid, s1)
+
+        # 腕Aから折り出し、腕Bには**重ねる**(曲げで繋がない)。両側を曲げで留めると
+        # 面取りの両端に「ハブ・腕・ガセット」の3枚が集まり、扇形角の和が
+        # 90+90+ハブ角 < 360 になって展開できない(実車026はここを絞りで埋めている)。
+        # 重ねならタブの端が自由エッジになり、角の窓は外形線に繋がって境界ループは
+        # 1本のまま。接合は溶接前提(実物の箱の角と同じ作り)。
+        arc_a = fillet(corner_pt, da, chord)
+        height = _scale(normal, top - base)
+        out = []
+        if arc_a is not None:
+            arc = GC_MakeArcOfCircle(gp_Pnt(*arc_a[0]), gp_Pnt(*arc_a[1]),
+                                     gp_Pnt(*arc_a[2])).Value()
+            edge = BRepBuilderAPI_MakeEdge(arc).Edge()
+            out.append((topods.Face(BRepPrimAPI_MakePrism(edge, gp_Vec(*height)).Shape()),
+                        f"gusset_bend_{corner}"))
+        start_pt = arc_a[2] if arc_a else pa
+        end_pt = _add(pb, _scale(chord, -GUSSET_LAP_GAP_MM))
+        if math.dist(start_pt, end_pt) < MIN_EDGE_LENGTH_MM:
+            raise ValueError("gusset tab is shorter than its bend. Skipped.")
+        edge = BRepBuilderAPI_MakeEdge(gp_Pnt(*start_pt), gp_Pnt(*end_pt)).Edge()
+        out.append((topods.Face(BRepPrimAPI_MakePrism(edge, gp_Vec(*height)).Shape()),
+                    f"gusset_{corner}"))
+        return out
+
+    @staticmethod
+    def _arm_face(a, b, tip: Vec3, axis: Vec3, length_mm: float, relief_mm: float):
+        """腕のパネル。根本エッジ a-b はそのまま使い(縫合のため)、先端の2隅を
+        relief_mm で落とす — 実務の余肉カット。締結点の必要平面は族が長さと幅で担保する。"""
+        width = math.dist(a, b)
+        if relief_mm > 0.5 * min(width, length_mm) - 0.5:
+            raise ValueError("the arm relief eats the whole tip. Infeasible.")
+
+        def at(t, s):
+            return _add(a, _add(_scale(tip, t), _scale(axis, s)))
+
+        wire = BRepBuilderAPI_MakeWire()
+        wire.Add(BRepBuilderAPI_MakeEdge(gp_Pnt(*a), gp_Pnt(*b)).Edge())
+        pts = [(0.0, width), (length_mm - relief_mm, width)]
+        wire.Add(BRepBuilderAPI_MakeEdge(gp_Pnt(*at(*pts[0])), gp_Pnt(*at(*pts[1]))).Edge())
+        for t0, s0, tm, sm, t1, s1 in (
+            (length_mm - relief_mm, width, length_mm - relief_mm * 0.293,
+             width - relief_mm * 0.293, length_mm, width - relief_mm),
+        ):
+            arc = GC_MakeArcOfCircle(gp_Pnt(*at(t0, s0)), gp_Pnt(*at(tm, sm)),
+                                     gp_Pnt(*at(t1, s1))).Value()
+            wire.Add(BRepBuilderAPI_MakeEdge(arc).Edge())
+        wire.Add(BRepBuilderAPI_MakeEdge(gp_Pnt(*at(length_mm, width - relief_mm)),
+                                         gp_Pnt(*at(length_mm, relief_mm))).Edge())
+        arc = GC_MakeArcOfCircle(
+            gp_Pnt(*at(length_mm, relief_mm)),
+            gp_Pnt(*at(length_mm - relief_mm * 0.293, relief_mm * 0.293)),
+            gp_Pnt(*at(length_mm - relief_mm, 0.0))).Value()
+        wire.Add(BRepBuilderAPI_MakeEdge(arc).Edge())
+        wire.Add(BRepBuilderAPI_MakeEdge(gp_Pnt(*at(length_mm - relief_mm, 0.0)),
+                                         gp_Pnt(*a)).Edge())
+        if not wire.IsDone():
+            raise ValueError("the arm outline does not close into a wire. Infeasible.")
+        plane = gp_Pln(gp_Pnt(*a), gp_Dir(*_cross(tip, axis)))
+        face = BRepBuilderAPI_MakeFace(plane, wire.Wire())
+        if not face.IsDone():
+            raise ValueError("the arm outline does not bound a planar face. Infeasible.")
+        return face.Face()
+
+    @staticmethod
+    def _check_arm_clearance(groups) -> None:
+        """折ったあとの腕どうしの当たり。展開図が重ならなくても3Dでぶつかりうる。
+        既存の `check_shape` は縫合済みシェルの妥当性しか見ないので面の貫通を拾えない。"""
+        keys = sorted(groups)
+        for i, ka in enumerate(keys):
+            for kb in keys[i + 1:]:
+                for fa in groups[ka]:
+                    for fb in groups[kb]:
+                        probe = BRepExtrema_DistShapeShape(fa, fb)
+                        probe.Perform()
+                        if probe.IsDone() and probe.Value() < ARM_CLEARANCE_MM:
+                            raise ValueError(
+                                f"arms {ka} and {kb} come within {probe.Value():.2f}mm "
+                                f"(minimum {ARM_CLEARANCE_MM}mm). Infeasible.")
 
     def build_flat_plate(self, points, *, margin_mm: float, corner_radius_mm: float,
                          out_dir: str, part_name: str) -> GeneratedPart:
