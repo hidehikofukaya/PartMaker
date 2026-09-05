@@ -944,6 +944,143 @@ def channel_seat_part(rng: random.Random, knobs: Knobs) -> Result | None:
     return None
 
 
+# ---------------------------------------------------------------- 実車1285-18(タブ付きブラケット)
+# 台の平面の長辺を上へ折った低い立ち上がり(溶接タブ2つ)と、台の角を斜めに切った折り線から
+# 反対側(下)へ折ったフランジ(ボルト1点)。締結面の法線が3方向(台 / 立ち上がり / フランジ)。
+# 実車: 台 58x27、立ち上がり 88度 R3 高さ9 タブR9 x2、斜辺33度、フランジ 85度 R4.1 高さ22、
+# ボルト穴6.9、台にクリップ穴2(18.2 / 8.0)、t=1.5。ユーザー裁定(2026-09-06): 必要半径と
+# 最小Rは実車相当、台の点は1〜2点、フランジは矩形/台形。
+TAB_MIN_R_MM = 3.0                          # 実車 R3(2t) / R4.1
+TAB_BEARING_MM = (7.5, 11.0)                # 溶接相当。タブ半径 = 溶接の必要半径(実車 9)
+TAB_PLATE_LENGTH_MM = (50.0, 75.0)          # 実車 58
+TAB_PLATE_WIDTH_MM = (22.0, 35.0)           # 実車 27
+TAB_PLATE_CORNER_R_MM = (5.0, 10.0)         # 実車 8
+TAB_RELIEF_GAP_MM = (2.0, 5.0)              # 立ち上がりとフランジの折り線の間の逃げ(実車 2)
+TAB_HINGE_DEG = (20.0, 50.0)                # フランジ折り線と立ち上がりの角度(実車 33)
+TAB_UPSTAND_FOLD_DEG = (80.0, 90.0)         # 実車 88
+TAB_UPSTAND_R_MM = (3.0, 5.0)               # 実車 3
+TAB_UPSTAND_EXTRA_HEIGHT_MM = (0.0, 3.0)    # 高さ = 必要半径 + これ(実車 9 = 必要半径)
+TAB_WELD_COUNT = 2                          # 実車 2
+TAB_FLANGE_FOLD_DEG = (80.0, 90.0)          # 実車 85
+TAB_FLANGE_R_MM = (3.0, 6.0)                # 実車 4.1
+TAB_FLANGE_HEIGHT_MM = (18.0, 30.0)         # 実車 22
+TAB_FLANGE_TRAPEZOID_PROB = 0.5             # 残りは矩形
+TAB_FLANGE_SHRINK_RATIO = 0.25              # 台形の片側の縮み / 折り線長の上限
+TAB_PLATE_POINT_WEIGHTS = ((1, 0.5), (2, 0.5))
+TAB_POINT_ATTEMPTS = 80
+TAB_PLATE_MIN_DISTANCE_MM = 16.0          # 台の2点の最小間隔(実車 26)。必要半径2つ分が優先
+
+
+def _inside_convex(p, xy) -> bool:
+    n = len(xy)
+    for i in range(n):
+        a, b = xy[i], xy[(i + 1) % n]
+        if (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]) < 0.0:
+            return False
+    return True
+
+
+def tab_bracket_part(rng: random.Random, knobs: Knobs) -> Result | None:
+    """実車1285-18: 台 + 溶接タブ付き立ち上がり(上) + 斜め折り線のフランジ(下)。"""
+    for _ in range(knobs.attempts):
+        try:
+            spec = _draw_spec(rng, knobs, folds=0)      # 板厚・向きだけ借りる
+        except ValueError:
+            continue
+        bearing = rng.uniform(*(knobs.bearing_radius_mm or TAB_BEARING_MM))
+        normal = spec.point1.normal_xyz
+        u, v = _plane_basis(normal)
+        origin = spec.point1.position_xyz
+
+        length = rng.uniform(*TAB_PLATE_LENGTH_MM)
+        width = rng.uniform(max(TAB_PLATE_WIDTH_MM[0], 2.0 * bearing + 2.0), TAB_PLATE_WIDTH_MM[1])
+        gap = rng.uniform(*TAB_RELIEF_GAP_MM)
+        beta = math.radians(rng.uniform(*TAB_HINGE_DEG))
+        corner_r = rng.uniform(*TAB_PLATE_CORNER_R_MM)
+        dx = (width - gap) / math.tan(beta)
+        if dx > length - corner_r - 6.0:
+            continue                          # 上辺が残らない
+        hinge = math.hypot(dx, width - gap)
+        if hinge < 2.0 * bearing + 2.0:
+            continue
+        # 頂点(反時計回り): 0 台の左下, 1 右下, 2 逃げの上, 3 斜辺の上端, 4 左上(フィレット)
+        hub_xy = [(0.0, 0.0), (length, 0.0), (length, gap), (length - dx, width), (0.0, width)]
+
+        # 立ち上がり: 辺0 を表側(+法線)へ。高さ = 必要半径 + α、タブは半径 = 必要半径。
+        up_h = bearing + rng.uniform(*TAB_UPSTAND_EXTRA_HEIGHT_MM)
+        span = length - 2.0 * (bearing + 0.5)
+        if span < (TAB_WELD_COUNT - 1) * (2.0 * bearing + 4.0):
+            continue
+        s_first = rng.uniform(bearing + 0.5, length - bearing - 0.5 - (TAB_WELD_COUNT - 1) * (2.0 * bearing + 4.0))
+        pitch = rng.uniform(2.0 * bearing + 4.0, (length - bearing - 0.5 - s_first) / max(1, TAB_WELD_COUNT - 1))
+        tabs = [[s_first + k * pitch, bearing] for k in range(TAB_WELD_COUNT)]
+        upstand = {"edge": 0, "fold_deg": rng.uniform(*TAB_UPSTAND_FOLD_DEG),
+                   "radius_mm": rng.uniform(*TAB_UPSTAND_R_MM), "side": 1, "length_mm": up_h,
+                   "relief_mm": TAB_MIN_R_MM,
+                   "outline": {"kind": "tabs", "height_mm": up_h, "tabs": tabs}}
+        # フランジ: 辺2(斜辺)を裏側(-法線)へ。矩形 or 台形。
+        fl_h = rng.uniform(max(TAB_FLANGE_HEIGHT_MM[0], 2.0 * bearing + 2.0), TAB_FLANGE_HEIGHT_MM[1])
+        if rng.random() < TAB_FLANGE_TRAPEZOID_PROB:
+            cap = min(TAB_FLANGE_SHRINK_RATIO * hinge, (hinge - 2.0 * bearing - 2.0) / 2.0)
+            shrink = (rng.uniform(0.0, max(0.0, cap)), rng.uniform(0.0, max(0.0, cap)))
+        else:
+            shrink = (0.0, 0.0)
+        flange = {"edge": 2, "fold_deg": rng.uniform(*TAB_FLANGE_FOLD_DEG),
+                  "radius_mm": rng.uniform(*TAB_FLANGE_R_MM), "side": -1, "length_mm": fl_h,
+                  "relief_mm": TAB_MIN_R_MM,
+                  "outline": {"kind": "trapezoid", "shrink_a_mm": shrink[0], "shrink_b_mm": shrink[1]}}
+        arms = [upstand, flange]
+        fillet = {4: corner_r}
+        try:
+            layout = branch_frames(hub_xy, arms, origin=origin, hub_u=u, hub_v=v,
+                                   corner_radius=TAB_MIN_R_MM, fillet_radius=fillet)
+        except ValueError:
+            continue
+
+        points: list = []
+        fr = layout["arms"][0]
+        for s_c, _r in tabs:                  # 溶接 = タブの円の中心
+            position = tuple(fr["a"][i] + up_h * fr["tip"][i] + s_c * fr["axis"][i] for i in range(3))
+            points.append(FasteningPoint(position_xyz=position, normal_xyz=fr["normal"]))
+        fr = layout["arms"][2]
+        t = rng.uniform(bearing, fl_h - bearing)
+        # 台形の高さ t での有効幅の中央に置く
+        lo = shrink[0] * t / fl_h
+        hi = fr["width"] - shrink[1] * t / fl_h
+        if hi - lo < 2.0 * bearing:
+            continue
+        s_b = rng.uniform(lo + bearing, hi - bearing)
+        position = tuple(fr["a"][i] + t * fr["tip"][i] + s_b * fr["axis"][i] for i in range(3))
+        points.append(FasteningPoint(position_xyz=position, normal_xyz=fr["normal"]))
+        # 台の点(1〜2)
+        wanted = _draw_weighted(rng, TAB_PLATE_POINT_WEIGHTS)
+        got: list = []
+        for _ in range(TAB_POINT_ATTEMPTS):
+            cand = (rng.uniform(bearing, length - bearing), rng.uniform(bearing, width - bearing))
+            if not _inside_convex(cand, hub_xy):
+                continue
+            if any(_dist_to_segment(cand, hub_xy[i], hub_xy[(i + 1) % 5]) < bearing for i in range(5)):
+                continue
+            if all(math.dist(cand, o) >= max(TAB_PLATE_MIN_DISTANCE_MM, 2.0 * bearing) for o in got):
+                got.append(cand)
+            if len(got) == wanted:
+                break
+        if not got:
+            continue
+        for cand in got:
+            points.append(FasteningPoint(position_xyz=layout["to_space"](cand),
+                                         normal_xyz=layout["normal"]))
+        branch = {"hub_xy": hub_xy, "arms": arms, "origin": list(origin),
+                  "hub_u": list(u), "hub_v": list(v), "corner_radius": TAB_MIN_R_MM,
+                  "gussets": [], "fillet_radius": {4: corner_r},
+                  "hinge_deg": math.degrees(beta), "hinge_mm": hinge, "gap_mm": gap}
+        return (dataclasses.replace(spec, point1=points[0], point2=points[1], extra_points=(),
+                                    annotated_points=tuple(points), branch=branch,
+                                    target_folds=None, min_bearing_radius_mm=bearing),
+                None, None, None)
+    return None
+
+
 FAMILIES = {
     "bead": bead_part,
     "flange": flange_part,
@@ -955,6 +1092,7 @@ FAMILIES = {
     "flat_plate": flat_plate_part,
     "branch": branch_part,
     "channel_seat": channel_seat_part,
+    "tab_bracket": tab_bracket_part,
 }
 
 

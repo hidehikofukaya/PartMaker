@@ -158,6 +158,11 @@ def generate_batch(
     return records
 
 
+def _int_keys(d):
+    """JSON 往復で文字列になった頂点番号のキーを int に戻す。"""
+    return {int(k): v for k, v in d.items()} if d else None
+
+
 def build_general_part(builder, spec, bead, flange, out_dir: str, part_name: str, rib=None):
     """1部品をビルドする。フランジの根本フィレットが落ちた場合はキラリティ
     (側x方向)の反転候補で再試行する(SS14.6: 成立性はキラリティ依存で、失敗7件の
@@ -177,7 +182,8 @@ def build_general_part(builder, spec, bead, flange, out_dir: str, part_name: str
             branch["hub_xy"], branch["arms"], origin=tuple(branch["origin"]),
             hub_u=tuple(branch["hub_u"]), hub_v=tuple(branch["hub_v"]),
             corner_radius=branch["corner_radius"], out_dir=out_dir, part_name=part_name,
-            check_points=spec.annotated_points, gussets=branch["gussets"]), None
+            check_points=spec.annotated_points, gussets=branch["gussets"],
+            fillet_radius=_int_keys(branch.get("fillet_radius"))), None
     # 平板は掃引ではなく外形ワイヤから作る(実車031/1285-20)。
     if getattr(spec, "plate_margin_mm", None) is not None:
         return builder.build_flat_plate(

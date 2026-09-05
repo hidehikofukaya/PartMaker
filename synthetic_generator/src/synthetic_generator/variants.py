@@ -333,14 +333,18 @@ def _plate_variants(spec, count: int):
 def _branch_variants(spec, count: int):
     br = spec.branch
     out = []
-    for r in _quantile_values(*BRANCH_CORNER_R_MM, br["corner_radius"], count):
+    edges = {a["edge"] for a in br["arms"]}
+    n = len(br["hub_xy"])
+    has_corner = any((i - 1) % n in edges and i in edges for i in range(n))
+    fillet = {int(k): v for k, v in (br.get("fillet_radius") or {}).items()}
+    for r in (_quantile_values(*BRANCH_CORNER_R_MM, br["corner_radius"], count) if has_corner else []):
         alt = dict(br, corner_radius=r)
         out.append(Variant("corner_r", _fmt(r), dataclasses.replace(spec, branch=alt),
                            None, None, None, {"branch.corner_radius": [br["corner_radius"], r]}))
     # 腕の長さ: 腕上の締結点 + 座面 + 先端逃げ を含む最小値から先を振る
     lay = branch_frames(br["hub_xy"], br["arms"], origin=tuple(br["origin"]),
                         hub_u=tuple(br["hub_u"]), hub_v=tuple(br["hub_v"]),
-                        corner_radius=br["corner_radius"])
+                        corner_radius=br["corner_radius"], fillet_radius=fillet or None)
     need = {}
     for arm in br["arms"]:
         fr = lay["arms"][arm["edge"]]
@@ -350,9 +354,19 @@ def _branch_variants(spec, count: int):
                   if abs(sum((p.position_xyz[i] - fr["a"][i]) * fr["normal"][i]
                              for i in range(3))) < 0.5 and r > 0.0]
         need[arm["edge"]] = (max(on_arm) if on_arm else 0.0) + spec.min_bearing_radius_mm + ARM_TIP_RELIEF_MM
+    # 台の角の凸フィレット(実車1285-18)も自由
+    for vtx, r0 in fillet.items():
+        for r in _quantile_values(5.0, 10.0, r0, 2):
+            alt = dict(fillet); alt[vtx] = r
+            out.append(Variant("fillet_r", _fmt(r),
+                               dataclasses.replace(spec, branch=dict(br, fillet_radius=alt)),
+                               None, None, None, {f"branch.fillet_radius.{vtx}": [r0, r]}))
+    lo = BRANCH_ARM_LENGTH_MM[0] if all((a.get("outline") or {}).get("kind", "rect") == "rect"
+                                        for a in br["arms"]) else 0.0
     for delta in (0.0, 12.0, 24.0):
-        arms = [dict(a, length_mm=min(max(need[a["edge"]] + delta, BRANCH_ARM_LENGTH_MM[0]),
-                                      BRANCH_ARM_LENGTH_MM[1] + 10.0)) for a in br["arms"]]
+        arms = [a if (a.get("outline") or {}).get("kind") == "tabs" else
+                dict(a, length_mm=min(max(need[a["edge"]] + delta, lo), BRANCH_ARM_LENGTH_MM[1] + 10.0))
+                for a in br["arms"]]
         if all(abs(a["length_mm"] - o["length_mm"]) < NEAR_MM for a, o in zip(arms, br["arms"])):
             continue
         out.append(Variant("arm_len", f"d{delta:.0f}", dataclasses.replace(spec, branch=dict(br, arms=arms)),
@@ -409,11 +423,11 @@ def propose_variants(meta: dict, *, count: int = 8, rng: random.Random | None = 
         groups.append(_width_variants(kind, spec, bead, flange, rib, 3))
         groups.append(_bead_variants(kind, spec, bead, flange, rib, rng, 3))
         groups.append(_rib_variants(spec, bead, flange, rib, rng, 3))
-    elif kind == "flat_plate":
+    elif spec.plate_margin_mm is not None:        # flat_plate
         groups.append(_plate_variants(spec, 3))
-    elif kind == "branch":
+    elif spec.branch is not None:                 # branch / tab_bracket(分岐ビルダーの拡張)
         groups.append(_branch_variants(spec, 3))
-    elif kind == "channel_seat":
+    elif spec.channel is not None:                # channel_seat
         groups.append(_channel_variants(spec, 3))
     else:
         raise ValueError(f"unknown kind {kind}")
@@ -441,10 +455,12 @@ def build_variant(builder, variant: Variant, out_dir: str, name: str):
                                           check_points=spec.annotated_points, **geom)
     if spec.branch is not None:
         br = spec.branch
+        fillet = {int(k): v for k, v in (br.get("fillet_radius") or {}).items()} or None
         return builder.build_branch_part(
             br["hub_xy"], br["arms"], origin=tuple(br["origin"]), hub_u=tuple(br["hub_u"]),
             hub_v=tuple(br["hub_v"]), corner_radius=br["corner_radius"], out_dir=out_dir,
-            part_name=name, check_points=spec.annotated_points, gussets=br["gussets"])
+            part_name=name, check_points=spec.annotated_points, gussets=br["gussets"],
+            fillet_radius=fillet)
     if spec.plate_margin_mm is not None:
         return builder.build_flat_plate(spec.annotated_points, margin_mm=spec.plate_margin_mm,
                                         corner_radius_mm=spec.plate_corner_radius_mm,

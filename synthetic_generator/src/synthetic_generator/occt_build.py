@@ -402,7 +402,7 @@ def _convex_hull_2d(points):
 
 
 def branch_frames(hub_xy, arms, *, origin: Vec3, hub_u: Vec3, hub_v: Vec3,
-                  corner_radius):
+                  corner_radius, fillet_radius=None):
     """分岐部品の幾何を、OCCTを呼ばずに出す(族の締結点配置とビルダーが共有する)。
 
     戻り値: {"outline": 断面要素, "roots": {辺: (始点2D, 終点2D)},
@@ -415,23 +415,28 @@ def branch_frames(hub_xy, arms, *, origin: Vec3, hub_u: Vec3, hub_v: Vec3,
     def to_space(xy):
         return _add(origin, _add(_scale(hub_u, xy[0]), _scale(hub_v, xy[1])))
 
-    outline, roots = _hub_outline(hub_xy, {a["edge"] for a in arms}, corner_radius)
+    outline, roots = _hub_outline(hub_xy, {a["edge"] for a in arms}, corner_radius,
+                                  fillet_radius)
     frames = {}
     for arm in arms:
         index = arm["edge"]
         a, b = to_space(roots[index][0]), to_space(roots[index][1])
         axis = _normalize(_add(b, _scale(a, -1.0)))
         radius, angle = arm["radius_mm"], math.radians(arm["fold_deg"])
-        centre = _add(a, _scale(normal, -radius))
+        # side = -1: 裏側(-法線)へ折る(既定、分岐族)。+1: 表側へ折る(実車1285-18の立ち上がり)。
+        side = arm.get("side", -1)
+        centre = _add(a, _scale(normal, side * radius))
         outward = _normalize(_cross(axis, normal))
         tip = _normalize(_add(_scale(outward, math.cos(angle)),
-                              _scale(normal, -math.sin(angle))))
+                              _scale(normal, side * math.sin(angle))))
+        revolve_axis = axis if side < 0 else _scale(axis, -1.0)
         frames[index] = {
-            "a": _rotate_about(a, centre, axis, angle),
-            "b": _rotate_about(b, centre, axis, angle),
+            "a": _rotate_about(a, centre, revolve_axis, angle),
+            "b": _rotate_about(b, centre, revolve_axis, angle),
             "tip": tip, "axis": axis, "width": math.dist(a, b),
             "normal": _normalize(_cross(tip, axis)),
             "root_a": a, "root_b": b, "centre": centre, "angle": angle,
+            "revolve_axis": revolve_axis, "side": side,
         }
     return {"outline": outline, "roots": roots, "normal": normal, "arms": frames,
             "to_space": to_space}
@@ -508,8 +513,28 @@ def channel_seat_frames(*, origin: Vec3, hub_u: Vec3, hub_v: Vec3, length_mm: fl
     return {"normal": normal, "at": at, "walls": walls}
 
 
-def _hub_outline(xy, arm_edges, corner_radius):
+def _fillet_corner_2d(prev_v, v, next_v, radius):
+    """2D の凸角 v を半径 radius で丸める(両辺に接する円弧)。(start, mid, end) を返す。"""
+    d_in = _normalize2((v[0] - prev_v[0], v[1] - prev_v[1]))
+    d_out = _normalize2((next_v[0] - v[0], next_v[1] - v[1]))
+    cos_turn = max(-1.0, min(1.0, d_in[0] * d_out[0] + d_in[1] * d_out[1]))
+    interior = math.pi - math.acos(cos_turn)
+    if interior < math.radians(20.0) or interior > math.radians(178.0):
+        raise ValueError("corner too sharp or too flat to fillet. Infeasible.")
+    t = radius / math.tan(interior / 2.0)
+    inward = _normalize2((d_out[0] - d_in[0], d_out[1] - d_in[1]))
+    reach = radius / math.sin(interior / 2.0)
+    centre = (v[0] + inward[0] * reach, v[1] + inward[1] * reach)
+    return ((v[0] - t * d_in[0], v[1] - t * d_in[1]),
+            (centre[0] - inward[0] * radius, centre[1] - inward[1] * radius),
+            (v[0] + t * d_out[0], v[1] + t * d_out[1]))
+
+
+def _hub_outline(xy, arm_edges, corner_radius, fillet_radius=None):
     """分岐部品のハブ輪郭と、辺ごとの腕の根本エッジを返す。
+
+    `fillet_radius` = {頂点番号: R}。**両隣に腕が無い**頂点だけを凸に丸める
+    (実車1285-18 の台の角 R8 など)。腕の付く辺は根本エッジが短くなるので対象外。
 
     **隣り合う2辺の両方に腕が付く角にだけ**、1つのコーナーを入れる。コーナーは
     両方の曲げ線に接するところから始まり、ハブの内側へ**くぼむ**円弧
@@ -542,6 +567,13 @@ def _hub_outline(xy, arm_edges, corner_radius):
             "end": (v[0] + relief_mm * d_out[0], v[1] + relief_mm * d_out[1]),
             "mid": (v[0] + relief_mm * inward[0], v[1] + relief_mm * inward[1]),
         }
+
+    for i, radius in (fillet_radius or {}).items():
+        before, after = (i - 1) % count, i
+        if before in arm_edges or after in arm_edges or i in corner:
+            continue
+        start, mid, end = _fillet_corner_2d(xy[i - 1], xy[i], xy[(i + 1) % count], radius)
+        corner[i] = {"start": start, "mid": mid, "end": end}
 
     section, roots = [], {}
     for i in range(count):
@@ -1154,7 +1186,7 @@ class OcctPartBuilder:
 
     def build_branch_part(self, hub_xy, arms, *, origin: Vec3, hub_u: Vec3, hub_v: Vec3,
                           corner_radius, out_dir: str, part_name: str,
-                          check_points=(), gussets=()) -> GeneratedPart:
+                          check_points=(), gussets=(), fillet_radius=None) -> GeneratedPart:
         """分岐部品(実車026)。平面のハブから、辺ごとに別の軸で腕を折り出す。
 
         既存の掃引は「全ての曲げ軸が1方向に平行」しか作れないので分岐は作れない。
@@ -1174,7 +1206,7 @@ class OcctPartBuilder:
         絞りは展開不能なので我々のモデルでは作らない)。
         """
         layout = branch_frames(hub_xy, arms, origin=origin, hub_u=hub_u, hub_v=hub_v,
-                               corner_radius=corner_radius)
+                               corner_radius=corner_radius, fillet_radius=fillet_radius)
         to_space, normal = layout["to_space"], layout["normal"]
 
         wire = BRepBuilderAPI_MakeWire()
@@ -1197,11 +1229,23 @@ class OcctPartBuilder:
             arm = by_edge[index]
             root = BRepBuilderAPI_MakeEdge(gp_Pnt(*fr["root_a"]), gp_Pnt(*fr["root_b"])).Edge()
             bend = BRepPrimAPI_MakeRevol(
-                root, gp_Ax1(gp_Pnt(*fr["centre"]), gp_Dir(*fr["axis"])), fr["angle"]).Shape()
+                root, gp_Ax1(gp_Pnt(*fr["centre"]), gp_Dir(*fr["revolve_axis"])),
+                fr["angle"]).Shape()
             bend_face = topods.Face(bend)
             faces[bend_face] = f"bend_{index}"
-            arm_face = self._arm_face(fr["a"], fr["b"], fr["tip"], fr["axis"],
-                                      arm["length_mm"], arm.get("relief_mm", ARM_TIP_RELIEF_MM))
+            outline = arm.get("outline") or {"kind": "rect"}
+            if outline["kind"] == "tabs":
+                arm_face = self._tab_arm_face(fr["a"], fr["b"], fr["tip"], fr["axis"],
+                                              outline["height_mm"], outline["tabs"])
+            elif outline["kind"] == "trapezoid":
+                arm_face = self._trapezoid_arm_face(
+                    fr["a"], fr["b"], fr["tip"], fr["axis"], arm["length_mm"],
+                    outline["shrink_a_mm"], outline["shrink_b_mm"],
+                    arm.get("relief_mm", ARM_TIP_RELIEF_MM))
+            else:
+                arm_face = self._arm_face(fr["a"], fr["b"], fr["tip"], fr["axis"],
+                                          arm["length_mm"],
+                                          arm.get("relief_mm", ARM_TIP_RELIEF_MM))
             faces[arm_face] = f"arm_{index}"
             groups[index] = [bend_face, arm_face]
 
@@ -1288,6 +1332,68 @@ class OcctPartBuilder:
         if not face.IsDone():
             raise ValueError("wall quad is not planar. Infeasible.")
         return face.Face()
+
+    @staticmethod
+    def _outline_face(a, tip: Vec3, axis: Vec3, section):
+        """腕の平面内の (t, s) 座標で書いた断面要素列 [("line",p,q) | ("arc",p,m,q)] を面にする。"""
+        def at(ts):
+            return _add(a, _add(_scale(tip, ts[0]), _scale(axis, ts[1])))
+        wire = BRepBuilderAPI_MakeWire()
+        for elem in section:
+            if elem[0] == "line":
+                if math.dist(elem[1], elem[2]) < MIN_EDGE_LENGTH_MM:
+                    continue
+                wire.Add(BRepBuilderAPI_MakeEdge(gp_Pnt(*at(elem[1])), gp_Pnt(*at(elem[2]))).Edge())
+            else:
+                arc = GC_MakeArcOfCircle(gp_Pnt(*at(elem[1])), gp_Pnt(*at(elem[2])),
+                                         gp_Pnt(*at(elem[3]))).Value()
+                wire.Add(BRepBuilderAPI_MakeEdge(arc).Edge())
+        if not wire.IsDone():
+            raise ValueError("the arm outline does not close into a wire. Infeasible.")
+        plane = gp_Pln(gp_Pnt(*a), gp_Dir(*_cross(tip, axis)))
+        face = BRepBuilderAPI_MakeFace(plane, wire.Wire())
+        if not face.IsDone():
+            raise ValueError("the arm outline does not bound a planar face. Infeasible.")
+        return face.Face()
+
+    @classmethod
+    def _tab_arm_face(cls, a, b, tip: Vec3, axis: Vec3, height_mm: float, tabs):
+        """立ち上がり + 半円の溶接タブ(実車1285-18)。tabs = [(根本エッジ上の位置 s, 半径 r), ...]。
+        タブは高さ height の上端に載る半円で、円の中心が溶接点。"""
+        width = math.dist(a, b)
+        order = sorted(tabs, key=lambda t: -t[0])
+        for s_c, r in order:
+            if s_c - r < 0.5 or s_c + r > width - 0.5:
+                raise ValueError("a weld tab runs off the end of the upstand. Infeasible.")
+        for (s1, r1), (s2, r2) in zip(order, order[1:]):
+            if s1 - r1 < s2 + r2 + 1.0:
+                raise ValueError("weld tabs overlap. Infeasible.")
+        section = [("line", (0.0, 0.0), (0.0, width)), ("line", (0.0, width), (height_mm, width))]
+        cursor = width
+        for s_c, r in order:
+            section.append(("line", (height_mm, cursor), (height_mm, s_c + r)))
+            section.append(("arc", (height_mm, s_c + r), (height_mm + r, s_c), (height_mm, s_c - r)))
+            cursor = s_c - r
+        section.append(("line", (height_mm, cursor), (height_mm, 0.0)))
+        section.append(("line", (height_mm, 0.0), (0.0, 0.0)))
+        return cls._outline_face(a, tip, axis, section)
+
+    @classmethod
+    def _trapezoid_arm_face(cls, a, b, tip: Vec3, axis: Vec3, length_mm: float,
+                            shrink_a_mm: float, shrink_b_mm: float, relief_mm: float):
+        """先端の辺が根本より狭い台形の腕(shrink=0 で矩形)。先端の2隅は relief で丸める。"""
+        width = math.dist(a, b)
+        tip_w = width - shrink_a_mm - shrink_b_mm
+        if tip_w < 2.0 * relief_mm + 1.0 or shrink_a_mm < 0.0 or shrink_b_mm < 0.0:
+            raise ValueError("the trapezoid tip is too narrow for its reliefs. Infeasible.")
+        # (t, s) 座標。根本 a=(0,0), b=(0,width)。先端は t=length。
+        pa, pb = (0.0, 0.0), (0.0, width)
+        cb, ca = (length_mm, width - shrink_b_mm), (length_mm, shrink_a_mm)
+        fb = _fillet_corner_2d(pb, cb, ca, relief_mm)
+        fa = _fillet_corner_2d(cb, ca, pa, relief_mm)
+        section = [("line", pa, pb), ("line", pb, fb[0]), ("arc", fb[0], fb[1], fb[2]),
+                   ("line", fb[2], fa[0]), ("arc", fa[0], fa[1], fa[2]), ("line", fa[2], pa)]
+        return cls._outline_face(a, tip, axis, section)
 
     @staticmethod
     def _gusset_faces(layout, by_edge, corner: int, count: int):

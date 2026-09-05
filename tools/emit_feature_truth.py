@@ -85,10 +85,13 @@ def _build_branch(meta: dict, spec: dict) -> dict:
         "branch": {
             "hub_xy": br["hub_xy"], "hub_normal_xyz": None,
             "arms": [{"edge": a["edge"], "fold_deg": a["fold_deg"],
-                      "bend_radius_mm": a["radius_mm"], "length_mm": a["length_mm"]}
+                      "bend_radius_mm": a["radius_mm"], "length_mm": a["length_mm"],
+                      "side": a.get("side", -1), "outline": a.get("outline")}
                      for a in br["arms"]],
             "gussets": br["gussets"],
             "corner_radius_mm": br["corner_radius"],
+            "fillet_radius_mm": br.get("fillet_radius"),
+            "hinge_deg": br.get("hinge_deg"),
             "joints": len(points),
             "joint_positions_xyz": [list(p["position_xyz"]) for p in points],
             "joint_normals_xyz": [list(p["normal_xyz"]) for p in points],
