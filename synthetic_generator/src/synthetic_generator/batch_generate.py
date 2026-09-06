@@ -199,6 +199,8 @@ def build_general_part(builder, spec, bead, flange, out_dir: str, part_name: str
             corner_radius_mm=spec.plate_corner_radius_mm,
             out_dir=out_dir, part_name=part_name), None
 
+    compose = getattr(spec, "compose", None) or {}
+
     def attempt(candidate_flange):
         return builder.build_general_two_point(
             spec.point1,
@@ -218,10 +220,15 @@ def build_general_part(builder, spec, bead, flange, out_dir: str, part_name: str
             bead=bead,
             flange=candidate_flange,
             rib=rib,
+            # 合成族だけ側辺の腕・切欠き・非対称余白を渡す(他の族のビルダー呼び出しは不変)
+            **({"arms": compose.get("arms", ()), "notches": compose.get("notches", ()),
+                "side_extension_mm": tuple(compose.get("side_extension_mm", (0.0, 0.0)))}
+               if compose else {}),
         )
 
-    if flange is None:
-        return attempt(None), None
+    # 合成族はフランジの側を変えると腕の側と衝突するので、キラリティ再試行をしない。
+    if flange is None or compose:
+        return attempt(flange), flange
     plan = plan_for(spec)
     last_error: ValueError | None = None
     for candidate in chirality_candidates(flange, plan.panel_frames, spec.bend_radius_mm):

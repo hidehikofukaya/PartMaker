@@ -25,8 +25,8 @@ import random
 from synthetic_generator.bead import BeadParams, sample_bead
 from synthetic_generator.classify import FasteningPoint, classify
 from synthetic_generator.occt_build import (
-    ARM_TIP_RELIEF_MM, branch_frames, channel_seat_frames, drawn_notch_mm, drawn_tray_frames,
-    step_frame, tab_footprint_mm,
+    ARM_TIP_RELIEF_MM, branch_frames, channel_seat_frames, compose_arm_frame, drawn_notch_mm,
+    drawn_tray_frames, step_frame, sweep_steps, tab_footprint_mm,
 )
 from synthetic_generator.classify import MIN_NEUTRAL_PLANE_RADIUS_MM
 from synthetic_generator.flange import (
@@ -52,7 +52,9 @@ from synthetic_generator.rib import (
 from synthetic_generator.templates.general_two_point import (
     FOLD_SLACK_RANGE_MM,
     GeneralTwoJointSpec,
+    _flange_feasible,
     draw_fold_count,
+    resolve_bead_slacks,
 )
 from synthetic_generator.templates.general_two_point import sample as sample_spec
 
@@ -1304,6 +1306,324 @@ def _rotate3(p, centre, axis, angle):
     return tuple(centre[k] + d[k] * c + cr[k] * s_ + axis[k] * dot * (1 - c) for k in range(3))
 
 
+# ---------------------------------------------------------------- 合成族(AutoMetalSheet 依頼 2026-09-06)
+# 因子(折り数・断面・壁・腕・タブ・切欠き・締結点数)を 1 部品ごとに独立にサンプルし、族名で
+# 構造が予測できない教師にする。土台は掃引(2 点族)で、パネルの側辺に分岐族の腕を縫合し、
+# 側辺に切欠きを切る。成立しない組合せは**その因子だけ**引き直す(他の因子は保つ)。
+# 裁定(2026-09-06): 折り 3 本は見送り(0〜2)、フランジの折れ角 20 度制限は外す、
+# 構造変種は腕上に締結点の無い部品だけ、切欠きは円弧と矩形、タブ溶接は実車相当(7.5〜11)。
+COMPOSE_FOLDS = (0, 1, 2)
+COMPOSE_SECTIONS = ("none", "bead", "rib")
+COMPOSE_WALLS = ("none", "one", "both")
+COMPOSE_ARMS = (0, 1, 2, 3, 4)
+COMPOSE_TABS = (0, 1, 2)
+COMPOSE_POINTS = (2, 3, 4, 5, 6, 7, 8)
+COMPOSE_BASE_KINDS = (("convex", 0.5), ("notch", 0.3), ("asym", 0.2))
+COMPOSE_WELD_BEARING_MM = (7.5, 11.0)      # タブ溶接(実車相当)
+COMPOSE_ARM_WIDTH_MM = (20.0, 50.0)
+COMPOSE_ARM_FOLD_DEG = (60.0, 110.0)      # 依頼は 60〜120。110 超は帯の裏へ回り込んで干渉が増える
+COMPOSE_ARM_R_MM = (5.0, 15.0)
+COMPOSE_ARM_LENGTH_MM = (25.0, 60.0)
+COMPOSE_ARM_GAP_MM = 4.0                    # 同じ側辺の腕どうし・腕と切欠きの隙間
+COMPOSE_END_MARGIN_MM = 3.0                 # 曲げの接線点からの逃げ
+COMPOSE_NOTCH_ARC_R_MM = (5.0, 15.0)
+COMPOSE_NOTCH_RECT_DEPTH_MM = (5.0, 15.0)
+COMPOSE_NOTCH_RECT_LEN_MM = (10.0, 30.0)
+COMPOSE_ASYM_EXT_MM = (4.0, 15.0)
+COMPOSE_HALF_WIDTH_RATIO = (1.0, 2.4)
+COMPOSE_MAX_HALF_WIDTH_MM = 40.0
+COMPOSE_FACTOR_RETRIES = 6
+COMPOSE_PLACE_ATTEMPTS = 30
+
+
+def _compose_free_segments(steps, taken, bearing, n_panels):
+    """(panel, side) ごとの空き区間 [(lo, hi), ...]。帯の端は座面 + 角の逃げ、曲げの
+    接線点は少しだけ空ける。taken = {(panel, side): [(t0, t1), ...]}。"""
+    out = {}
+    for k, st in enumerate(steps):
+        lo = (bearing + COMPOSE_END_MARGIN_MM + 2.0) if k == 0 else COMPOSE_END_MARGIN_MM
+        hi = st["length"] - ((bearing + COMPOSE_END_MARGIN_MM + 2.0) if k == n_panels - 1
+                             else COMPOSE_END_MARGIN_MM)
+        for side in (-1, 1):
+            segs = [(lo, hi)]
+            for a, b in sorted(taken.get((k, side), [])):
+                nxt = []
+                for s0, s1 in segs:
+                    if b + COMPOSE_ARM_GAP_MM <= s0 or a - COMPOSE_ARM_GAP_MM >= s1:
+                        nxt.append((s0, s1))
+                    else:
+                        if a - COMPOSE_ARM_GAP_MM > s0:
+                            nxt.append((s0, a - COMPOSE_ARM_GAP_MM))
+                        if b + COMPOSE_ARM_GAP_MM < s1:
+                            nxt.append((b + COMPOSE_ARM_GAP_MM, s1))
+                segs = nxt
+            out[(k, side)] = [(s0, s1) for s0, s1 in segs if s1 - s0 > 1.0]
+    return out
+
+
+def compose_part(rng: random.Random, knobs: Knobs) -> Result | None:
+    """合成族: 因子を独立に引き、成立しない因子だけ引き直す。"""
+    for _ in range(knobs.attempts):
+        factors = {
+            "folds": rng.choice(COMPOSE_FOLDS),
+            "section": rng.choice(COMPOSE_SECTIONS),
+            "walls": rng.choice(COMPOSE_WALLS),
+            "arms": rng.choice(COMPOSE_ARMS),
+            "tabs": rng.choice(COMPOSE_TABS),
+            "base": _draw_weighted_label(rng, COMPOSE_BASE_KINDS),
+            "points": rng.choice(COMPOSE_POINTS),
+        }
+        realised = dict(factors)
+        # 帯は既定より広めに引く(座面半径の 1.0〜2.4 倍、上限 40)。切欠き・非対称余白・
+        # 基板上の追加点に幅方向の余地が要るため(既定の 1.0〜1.3 倍だと切欠きが 1 つも入らない)。
+        wide = dataclasses.replace(knobs, half_width_ratio=knobs.half_width_ratio or COMPOSE_HALF_WIDTH_RATIO,
+                                   max_half_width_mm=knobs.max_half_width_mm or COMPOSE_MAX_HALF_WIDTH_MM)
+        try:
+            spec = _draw_spec(rng, wide, folds=factors["folds"])
+            plan = plan_for(spec)
+        except ValueError:
+            continue
+        bearing = spec.min_bearing_radius_mm
+        weld = rng.uniform(*COMPOSE_WELD_BEARING_MM)
+
+        # ---- 断面(その因子だけ引き直す: bead -> rib -> none)
+        bead = rib = None
+        section = factors["section"]
+        for _try in range(COMPOSE_FACTOR_RETRIES):
+            if section == "bead":
+                got = resolve_bead_slacks(rng, spec, sample_bead(rng, spec.half_width_mm))
+                if got is not None:
+                    spec, bead = got
+                    break
+                section = rng.choice(("rib", "none"))
+            elif section == "rib":
+                got = _compose_rib(rng, spec) if spec.target_folds != 0 else None
+                if got is not None:
+                    spec, rib = got
+                    break
+                section = rng.choice(("bead", "none"))
+            else:
+                break
+        realised["section"] = "bead" if bead else "rib" if rib else "none"
+        try:
+            plan = plan_for(spec)
+        except ValueError:
+            continue
+
+        # ---- 壁(フランジ)。折れ角の制限は掛けない(裁定)。リブとは併存不可。
+        flange = None
+        if factors["walls"] != "none" and rib is None:
+            for _try in range(COMPOSE_FACTOR_RETRIES):
+                cand = sample_flange(rng, plan.panel_frames, plan.fold_tilts, spec.half_width_mm,
+                                     spec.bend_radius_mm, spec.point1.normal_xyz,
+                                     both_sides=(factors["walls"] == "both"))
+                if cand is not None and _flange_feasible(spec, cand):
+                    flange = cand
+                    break
+        realised["walls"] = ("both" if flange and flange.both_sides else "one" if flange else "none")
+
+        # ---- 基板の形: 非対称余白は断面・壁の無いときだけ(断面は帯幅対称で作られる)
+        ext = [0.0, 0.0]
+        base = factors["base"]
+        if base == "asym" and (bead is not None or flange is not None):
+            base = "convex"
+        if base == "asym":
+            ext[rng.choice((0, 1))] = rng.uniform(*COMPOSE_ASYM_EXT_MM)
+        realised["base"] = base
+
+        try:
+            steps, _w = sweep_steps(plan, spec.bend_radius_mm)
+        except ValueError:
+            continue                      # 掃引の経路が成立しない(ほぼ平坦な折れなど)
+        n_panels = len(steps)
+        blocked_sides = set()
+        if flange is not None:
+            blocked_sides = {-1, 1} if flange.both_sides else {flange.side}
+
+        # ---- 腕(側辺の空き区間に置く)。タブは腕に配る。
+        taken: dict = {}
+        arms: list = []
+        tab_left = min(factors["tabs"], factors["arms"])
+        for i in range(factors["arms"]):
+            placed = False
+            for _try in range(COMPOSE_PLACE_ATTEMPTS):
+                free = _compose_free_segments(steps, taken, bearing, n_panels)
+                slots = [(key, seg) for key, segs in free.items() for seg in segs
+                         if key[1] not in blocked_sides]
+                if not slots:
+                    break
+                (k, side), (s0, s1) = rng.choice(slots)
+                width = rng.uniform(*COMPOSE_ARM_WIDTH_MM)
+                if s1 - s0 < width:
+                    continue
+                t0 = rng.uniform(s0, s1 - width)
+                length = rng.uniform(*COMPOSE_ARM_LENGTH_MM)
+                with_tab = tab_left > 0 and rng.random() < 0.7
+                if with_tab:
+                    foot = tab_footprint_mm(weld, ARM_TIP_RELIEF_MM)
+                    if width < 2.0 * foot + 1.2:
+                        continue
+                    s_c = rng.uniform(foot + 0.6, width - foot - 0.6)
+                    height = weld + rng.uniform(0.0, 4.0)
+                    outline = {"kind": "tabs", "height_mm": height, "tabs": [[s_c, weld]],
+                               "root_r_mm": ARM_TIP_RELIEF_MM}
+                    length = height
+                elif rng.random() < 0.4:
+                    cap = max(0.0, (width - 2.0 * ARM_TIP_RELIEF_MM - 1.5) / 2.0)
+                    outline = {"kind": "trapezoid", "shrink_a_mm": rng.uniform(0.0, min(cap, 0.25 * width)),
+                               "shrink_b_mm": rng.uniform(0.0, min(cap, 0.25 * width))}
+                else:
+                    outline = {"kind": "rect"}
+                arms.append({"panel": k, "side": side, "t0_mm": t0, "t1_mm": t0 + width,
+                             "fold_deg": rng.uniform(*COMPOSE_ARM_FOLD_DEG),
+                             "radius_mm": rng.uniform(*COMPOSE_ARM_R_MM), "length_mm": length,
+                             "relief_mm": ARM_TIP_RELIEF_MM, "outline": outline, "points": []})
+                taken.setdefault((k, side), []).append((t0, t0 + width))
+                if with_tab:
+                    tab_left -= 1
+                placed = True
+                break
+            if not placed:
+                break
+        realised["arms"] = len(arms)
+        realised["tabs"] = sum(1 for a in arms if a["outline"]["kind"] == "tabs")
+
+        # ---- 切欠き(空き区間)。締結点からは後で避ける(基板の点は切欠きの後に置く)。
+        notches: list = []
+        if base == "notch":
+            for _n in range(rng.choice((1, 2))):
+                free = _compose_free_segments(steps, taken, bearing, n_panels)
+                slots = [(key, seg) for key, segs in free.items() for seg in segs
+                         if key[1] not in blocked_sides]
+                if not slots:
+                    break
+                (k, side), (s0, s1) = rng.choice(slots)
+                room = spec.half_width_mm - bearing - 1.0      # 座面を残して切り込める深さ
+                if room < 4.0:
+                    break
+                if rng.random() < 0.5:
+                    r = min(rng.uniform(*COMPOSE_NOTCH_ARC_R_MM), room)
+                    if s1 - s0 < 2.0 * r:
+                        continue
+                    t_c = rng.uniform(s0 + r, s1 - r)
+                    notches.append({"panel": k, "side": side, "t_mm": t_c, "kind": "arc",
+                                    "radius_mm": r, "half_span_mm": r, "depth_mm": r})
+                    taken.setdefault((k, side), []).append((t_c - r, t_c + r))
+                else:
+                    d = min(rng.uniform(*COMPOSE_NOTCH_RECT_DEPTH_MM), room)
+                    L = rng.uniform(*COMPOSE_NOTCH_RECT_LEN_MM)
+                    if s1 - s0 < L:
+                        continue
+                    t_c = rng.uniform(s0 + L / 2.0, s1 - L / 2.0)
+                    notches.append({"panel": k, "side": side, "t_mm": t_c, "kind": "rect",
+                                    "depth_mm": d, "length_mm": L, "corner_r_mm": ARM_TIP_RELIEF_MM,
+                                    "half_span_mm": L / 2.0})
+                    taken.setdefault((k, side), []).append((t_c - L / 2.0, t_c + L / 2.0))
+        if base == "notch" and not notches:
+            realised["base"] = "convex"
+        realised["notches"] = len(notches)
+
+        # ---- 締結点: アンカー 2 + 腕の上 + 基板の上
+        points = [spec.point1, spec.point2]
+        for i, arm in enumerate(arms):
+            width_side = spec.half_width_mm + (ext[1] if arm["side"] > 0 else ext[0])
+            fr = compose_arm_frame(steps[arm["panel"]], arm["side"], arm["t0_mm"], arm["t1_mm"],
+                                   width_side, arm["fold_deg"], arm["radius_mm"])
+            local = []
+            if arm["outline"]["kind"] == "tabs":
+                for s_c, r in arm["outline"]["tabs"]:
+                    local.append((arm["length_mm"], s_c, "weld"))
+            else:
+                wanted = rng.choice((0, 1, 1, 2))
+                w_a = arm["t1_mm"] - arm["t0_mm"]
+                usable_l = arm["length_mm"] - ARM_TIP_RELIEF_MM
+                for _p in range(COMPOSE_PLACE_ATTEMPTS):
+                    if len(local) >= wanted:
+                        break
+                    if usable_l < 2.0 * bearing or w_a < 2.0 * bearing:
+                        break
+                    run, across = rng.uniform(bearing, usable_l - bearing), rng.uniform(bearing, w_a - bearing)
+                    if all(math.hypot(run - r2, across - a2) >= 2.0 * bearing + 2.0 for r2, a2, _k in local):
+                        local.append((run, across, "bolt"))
+            for run, across, kind in local:
+                pos = tuple(fr["a"][j] + run * fr["tip"][j] + across * fr["axis"][j] for j in range(3))
+                points.append(FasteningPoint(position_xyz=pos, normal_xyz=fr["normal"]))
+            arm["points"] = [[run, across, kind] for run, across, kind in local]
+        n_base = max(0, factors["points"] - len(points))
+        base_points = []
+        if bead is None and rib is None:
+            frames = plan.panel_frames
+            for _p in range(COMPOSE_PLACE_ATTEMPTS * 3):
+                if len(base_points) >= n_base:
+                    break
+                k = rng.randrange(n_panels)
+                st = steps[k]
+                lo = (bearing + 2.0) if k == 0 else 0.0
+                hi = st["length"] - ((bearing + 2.0) if k == n_panels - 1 else 0.0)
+                if hi - lo < 2.0 * bearing:
+                    continue
+                t = rng.uniform(lo + bearing, hi - bearing)
+                y_max = spec.half_width_mm - bearing
+                if y_max <= 0.0:
+                    break
+                y = rng.uniform(-y_max, y_max)
+                # 切欠きから座面ぶん離す
+                clash = False
+                for nt in notches:
+                    if nt["panel"] != k:
+                        continue
+                    if abs(t - nt["t_mm"]) < nt["half_span_mm"] + bearing and \
+                            nt["side"] * y > spec.half_width_mm - nt["depth_mm"] - bearing:
+                        clash = True
+                if clash:
+                    continue
+                pos = tuple(st["origin"][j] + t * st["direction"][j] + y * st["ey"][j] for j in range(3))
+                if any(math.dist(pos, q.position_xyz) < 2.0 * bearing + 2.0 for q in points + base_points):
+                    continue
+                normal = tuple(st["ez"])
+                base_points.append(FasteningPoint(position_xyz=pos, normal_xyz=normal))
+        points.extend(base_points)
+        realised["points"] = len(points)
+        realised["base_points"] = len(base_points)
+        realised["arm_points"] = sum(len(a["points"]) for a in arms)
+
+        compose = {"factors_sampled": factors, "factors": realised, "arms": arms,
+                   "notches": notches, "side_extension_mm": ext, "weld_bearing_mm": weld,
+                   "n_panels": n_panels}
+        return (dataclasses.replace(spec, annotated_points=tuple(points), compose=compose),
+                bead, flange, rib)
+    return None
+
+
+def _compose_rib(rng: random.Random, spec):
+    """リブ付きの spec(曲げRを最小に固定)とリブ。rib_part と同じ手順。載らなければ None。"""
+    candidate = dataclasses.replace(spec, bend_radius_mm=RIB_BEND_RADIUS_MM)
+    try:
+        plan = plan_for(candidate)
+    except ValueError:
+        return None
+    folds = len(plan.panel_frames) - 1
+    if folds < 1 or max_fold_angle_deg(plan.panel_frames) < RIB_MIN_FOLD_ANGLE_DEG:
+        return None
+    best = max(range(folds), key=lambda i: min(leg_room_mm(plan, i)))
+    angle = math.radians(fold_angle_deg(plan.panel_frames, best))
+    for _ in range(8):
+        rib = sample_rib(rng, half_width_mm=candidate.half_width_mm, fold_index=best,
+                         leg_room_mm=leg_room_mm(plan, best), fold_angle_rad=angle)
+        if rib is not None:
+            return candidate, rib
+    return None
+
+
+def _draw_weighted_label(rng: random.Random, weights):
+    roll, cumulative = rng.random(), 0.0
+    for value, weight in weights:
+        cumulative += weight
+        if roll < cumulative:
+            return value
+    return weights[-1][0]
+
+
 FAMILIES = {
     "bead": bead_part,
     "flange": flange_part,
@@ -1317,6 +1637,7 @@ FAMILIES = {
     "channel_seat": channel_seat_part,
     "tab_bracket": tab_bracket_part,
     "drawn_tray": drawn_tray_part,
+    "compose": compose_part,
 }
 
 

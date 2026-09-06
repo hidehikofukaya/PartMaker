@@ -203,6 +203,21 @@ def build(meta: dict) -> dict:
         return _build_channel(meta, spec)
     if spec.get("drawn") is not None:
         return _build_drawn(meta, spec)
+    truth = _build_sweep(meta, spec)
+    if spec.get("compose") is not None:
+        cp = spec["compose"]
+        truth["compose"] = {
+            "factors": cp["factors"], "factors_sampled": cp.get("factors_sampled"),
+            "arms": cp["arms"], "notches": cp["notches"],
+            "side_extension_mm": cp["side_extension_mm"], "weld_bearing_mm": cp.get("weld_bearing_mm"),
+            "joints": len(spec.get("annotated_points") or []),
+            "joint_positions_xyz": [list(p["position_xyz"]) for p in (spec.get("annotated_points") or [])],
+            "joint_normals_xyz": [list(p["normal_xyz"]) for p in (spec.get("annotated_points") or [])],
+        }
+    return truth
+
+
+def _build_sweep(meta: dict, spec: dict) -> dict:
     p1 = FasteningPoint(tuple(spec["point1"]["position_xyz"]), tuple(spec["point1"]["normal_xyz"]))
     p2 = FasteningPoint(tuple(spec["point2"]["position_xyz"]), tuple(spec["point2"]["normal_xyz"]))
     flange = FlangeParams(**meta["flange"]) if meta["flange"] else None
