@@ -803,6 +803,40 @@ class _Bend:
     normal: Vec3      # 曲げ手前のパネル法線(曲げ中心の計算に使う)
 
 
+def _widen_section(section, y_breaks, ext_neg: float, ext_pos: float):
+    """断面の両端の平地要素を外へ広げる(非対称余白)。y_breaks も揃える。"""
+    section = list(section)
+    first, last = section[0], section[-1]
+    section[0] = (first[0], (first[1][0] - ext_neg, first[1][1]), first[2], first[3])
+    section[-1] = (last[0], last[1], (last[2][0] + ext_pos, last[2][1]), last[3])
+    y_breaks = list(y_breaks)
+    y_breaks[0] -= ext_neg
+    y_breaks[-1] += ext_pos
+    return section, y_breaks
+
+
+def _check_bearing_margin(shape, points, radii, tolerance_mm: float = 0.3) -> None:
+    """締結点から外形(自由エッジ)までの距離が座面半径以上か(ML 側の「座面比」)。
+    腕や切欠きが座面に食い込む配置を弾く(2026-09-06 夜、ML 返答: 第1期は 600 部品中 17 で
+    0.95 未満。原因は台形の腕の斜辺と、隣の腕の側辺)。"""
+    amap = TopTools_IndexedDataMapOfShapeListOfShape()
+    topexp.MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, amap)
+    free = [topods.Edge(amap.FindKey(i)) for i in range(1, amap.Size() + 1)
+            if amap.FindFromIndex(i).Size() == 1]
+    for index, (point, radius) in enumerate(zip(points, radii)):
+        vertex = BRepBuilderAPI_MakeVertex(gp_Pnt(*point.position_xyz)).Vertex()
+        worst = float("inf")
+        for edge in free:
+            dist = BRepExtrema_DistShapeShape(vertex, edge)
+            dist.Perform()
+            worst = min(worst, dist.Value())
+        if worst < radius - tolerance_mm:
+            raise ValueError(
+                f"fastening point {index + 1} is {worst:.1f}mm from the outline "
+                f"(bearing radius {radius:.1f}mm). Infeasible; resample."
+            )
+
+
 def sweep_steps(plan, bend_radius_mm: float):
     """掃引の直線区間ごとの実フレーム(合成族の腕・切欠き・追加点が使う。OCCT を呼ばない)。
 
@@ -1219,6 +1253,10 @@ class OcctPartBuilder:
         arms=(),
         notches=(),
         side_extension_mm: tuple[float, float] = (0.0, 0.0),
+        # ビードを全長ではなく区間 [s0, s3](中心線の弧長)に置く(合成族 第2期)。None なら全長。
+        bead_span: tuple[float, float] | None = None,
+        # 締結点ごとの座面半径。指定すると「点から外形までの距離 >= 半径」を最終形状で検査する。
+        check_radii: tuple = (),
     ) -> GeneratedPart:
         # 1部品1特徴が原則。例外はビード + フランジだけ(実車014型で「両側フランジ +
         # 中央ビード」が1点と2点の間の剛性を担っている。ユーザー決定 2026-09-04)。
@@ -1268,6 +1306,9 @@ class OcctPartBuilder:
         elif bead is not None:
             lift = self._bead_lift(path, bead, bend_radius_mm)
             section, y_breaks = _bead_section(bead, lift, half_width_mm)
+            if flange is None and (ext_neg > 0.0 or ext_pos > 0.0):
+                # 非対称余白: 断面の両端の平地要素だけを広げる(ビードの位置は帯の中心のまま)
+                section, y_breaks = _widen_section(section, y_breaks, ext_neg, ext_pos)
             flat = _flat_section(y_breaks)
             if flange is not None:
                 # ランアウトの loft は断面どうしの要素が1対1で対応する必要があるので、
@@ -1276,7 +1317,7 @@ class OcctPartBuilder:
                 section = _with_flange(section, flange, half_width_mm)
                 flat = _with_flange(flat, flange, half_width_mm)
             self._sweep_with_bead(path, frame, w, section, flat,
-                                  bead, min_bearing_radius_mm, faces)
+                                  bead, min_bearing_radius_mm, faces, placed=bead_span)
         elif rib is not None:
             self._build_rib_part(plan, w, ey, rib, half_width_mm, bend_radius_mm, faces)
         else:
@@ -1305,6 +1346,9 @@ class OcctPartBuilder:
             shape, faces = self._cut_side_notches(shape, faces, steps, notches,
                                                   half_width_mm, side_extension_mm)
         shape, faces = self._unify(shape, faces)
+        if check_radii:
+            wanted = check_points if check_points is not None else (point1, point2, *extra_points)
+            _check_bearing_margin(shape, wanted, check_radii)
         os.makedirs(out_dir, exist_ok=True)
         stp_path = os.path.abspath(os.path.join(out_dir, part_name + "_mid.stp"))
         _export_step(shape, faces, stp_path)
@@ -1464,8 +1508,10 @@ class OcctPartBuilder:
             frame = self._sweep_segment(step, frame, w, section, faces, tag)
 
     def _sweep_with_bead(self, path, frame: _Frame, w: Vec3, bead_section, flat_section,
-                         bead: BeadParams, min_bearing_radius_mm: float, faces) -> None:
-        """平地 -> ランアウト -> ビード -> ランアウト -> 平地 の順に掃引する。"""
+                         bead: BeadParams, min_bearing_radius_mm: float, faces,
+                         placed=None) -> None:
+        """平地 -> ランアウト -> ビード -> ランアウト -> 平地 の順に掃引する。
+        `placed=(s0, s3)` を渡すとビードをその区間に置く(合成族の区間ビード)。"""
         # 区間を s で並べ、ランアウトが収まる直線区間を探す(`general_geometry` と
         # 同じ規則。開始位置を端パネルに固定しない — 固定すると折れ目が締結点の
         # 近くにある構成が全部ビード不可になる)。
@@ -1479,7 +1525,17 @@ class OcctPartBuilder:
         # ランアウトは深さの2倍で**固定**する。空きに合わせて縮めると走り終いの壁が
         # ほぼ垂直になり、実物のビードに見えない(2026-09-04のユーザー指摘)。
         runout = max(BEAD_MIN_RUNOUT_MM, RUNOUT_DEPTH_RATIO * bead.depth_mm)
-        placed = bead_placement(spans, total, inset, runout)
+        if placed is None:
+            placed = bead_placement(spans, total, inset, runout)
+        else:
+            # 区間ビード: ランアウトは直線区間の中に完全に収まっていること
+            s0, s3 = placed
+            straights = [(a, b) for a, b, st in spans if st]
+            if not any(a - 1e-6 <= s0 and s0 + runout <= b + 1e-6 for a, b in straights) or \
+                    not any(a - 1e-6 <= s3 - runout and s3 <= b + 1e-6 for a, b in straights):
+                raise ValueError("a bead run-out would sit on a bend. Infeasible.")
+            if s0 < inset - 1e-6 or s3 > total - inset + 1e-6:
+                raise ValueError("the bead span runs into a bearing area. Infeasible.")
         if placed is None:
             raise ValueError(
                 f"a bead with {runout:.1f}mm run-outs does not fit between the bearing areas "

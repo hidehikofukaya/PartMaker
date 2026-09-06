@@ -42,7 +42,8 @@ from synthetic_generator.general_geometry import check_bead_feasible_occt, plan_
 from synthetic_generator.occt_build import (
     ARM_TIP_RELIEF_MM, branch_frames, channel_seat_frames, sweep_steps,
 )
-from synthetic_generator.flange import sample_flange
+from synthetic_generator.families import _compose_rib
+from synthetic_generator.templates.general_two_point import resolve_bead_slacks
 from synthetic_generator.rib import RibParams, leg_room_mm, sample_rib
 from synthetic_generator.templates.general_two_point import (
     FOLD_SLACK_RANGE_MM, MAX_HALF_WIDTH_MM, GeneralTwoJointSpec, _flange_feasible,
@@ -441,66 +442,50 @@ def _drawn_variants(spec, count: int):
 
 def _structure_variants(spec, bead, flange, rib, rng):
     """合成族の構造変種(依頼 原則 C)。同じ締結点に対して構造だけを変える。
-    腕の上に締結点がある部品は腕を消せないので対象外(裁定 2026-09-06)。"""
+    腕を消す変種は腕の上に締結点が無い部品だけ(裁定 2026-09-06)。切欠き・壁腕・断面の
+    付け外しは締結点に依らない(第2期、ML 返答)。"""
     cp = spec.compose
-    if any(a["points"] for a in cp["arms"]):
-        return []
+    arm_points = any(a["points"] for a in cp["arms"] if a.get("role", "arm") == "arm")
     out = []
-    base = dict(cp, arms=[], notches=[], side_extension_mm=[0.0, 0.0])
 
     def variant(label, comp, b=None, f=None, r=None, changed=None):
         c2 = dict(comp)
         c2["factors"] = dict(comp["factors"], structure_variant=label)
         return Variant("structure", label, dataclasses.replace(spec, compose=c2), b, f, r, changed or {})
 
-    # plain: 断面・壁・腕・切欠き無し
-    if bead or flange or rib or cp["arms"] or cp["notches"]:
-        out.append(variant("plain", base, changed={"structure": ["original", "plain"]}))
-    # wall: フランジ片側(無ければ足す、あれば外す)
-    if flange is None:
-        try:
-            plan = plan_for(spec)
-            cand = sample_flange(rng, plan.panel_frames, plan.fold_tilts, spec.half_width_mm,
-                                 spec.bend_radius_mm, spec.point1.normal_xyz)
-        except ValueError:
-            cand = None
-        if cand is not None and rib is None and _flange_feasible(spec, cand):
-            arms = [a for a in cp["arms"] if a["side"] != cand.side]      # フランジ側の腕は消す
-            out.append(variant("wall", dict(cp, arms=arms), bead, cand, None,
-                               {"flange": [None, dataclasses.asdict(cand)]}))
-    else:
-        out.append(variant("nowall", cp, bead, None, rib, {"flange": [dataclasses.asdict(flange), None]}))
-    # arms: 腕が無ければ締結点の無い腕を 1〜2 本足す、あれば外す
-    if not cp["arms"]:
-        try:
-            plan = plan_for(spec)
-            steps, _w = sweep_steps(plan, spec.bend_radius_mm)
-        except ValueError:
-            steps = []
-        arms = []
-        blocked = set() if flange is None else ({-1, 1} if flange.both_sides else {flange.side})
-        for k, st in enumerate(steps):
-            for side in (-1, 1):
-                if side in blocked or len(arms) >= 2:
-                    continue
-                lo = spec.min_bearing_radius_mm + 5.0 if k == 0 else 3.0
-                hi = st["length"] - (spec.min_bearing_radius_mm + 5.0 if k == len(steps) - 1 else 3.0)
-                if hi - lo < 24.0:
-                    continue
-                width = min(40.0, hi - lo)
-                t0 = lo + (hi - lo - width) / 2.0
-                arms.append({"panel": k, "side": side, "t0_mm": t0, "t1_mm": t0 + width,
-                             "fold_deg": 90.0, "radius_mm": 8.0, "length_mm": 30.0,
-                             "relief_mm": ARM_TIP_RELIEF_MM, "outline": {"kind": "rect"}, "points": []})
-        if arms:
-            out.append(variant("arms", dict(cp, arms=arms), bead, flange, rib, {"arms": [0, len(arms)]}))
-    else:
-        out.append(variant("noarms", dict(cp, arms=[]), bead, flange, rib, {"arms": [len(cp["arms"]), 0]}))
-    # notch: 切欠きを外す(あれば)
+    walls = [a for a in cp["arms"] if a.get("role") == "wall"]
+    real_arms = [a for a in cp["arms"] if a.get("role", "arm") == "arm"]
+    # plain: 断面・壁・腕・切欠き無し(腕上に点が無いときだけ)
+    if not arm_points and (bead or rib or cp["arms"] or cp["notches"]):
+        out.append(variant("plain", dict(cp, arms=[], notches=[], side_extension_mm=[0.0, 0.0]),
+                           changed={"structure": ["original", "plain"]}))
+    # 切欠き
     if cp["notches"]:
-        out.append(variant("nonotch", dict(cp, notches=[]), bead, flange, rib, {"notches": [len(cp["notches"]), 0]}))
+        out.append(variant("nonotch", dict(cp, notches=[]), bead, None, rib,
+                           {"notches": [len(cp["notches"]), 0]}))
+    # 壁腕
+    if walls:
+        out.append(variant("nowall", dict(cp, arms=real_arms), bead, None, rib, {"walls": [len(walls), 0]}))
+    # 腕
+    if real_arms and not arm_points:
+        out.append(variant("noarms", dict(cp, arms=walls), bead, None, rib, {"arms": [len(real_arms), 0]}))
+    # 断面の付け外し
+    if bead is not None:
+        out.append(variant("nobead", dict(cp, bead_span=None), None, None, None, {"section": ["bead", "none"]}))
+    elif rib is not None:
+        out.append(variant("norib", cp, None, None, None, {"section": ["rib", "none"]}))
+    else:
+        got = None
+        for _ in range(6):
+            got = resolve_bead_slacks(rng, spec, sample_bead(rng, spec.half_width_mm))
+            if got is not None:
+                break
+        if got is not None and got[0] == spec:            # slack を動かさずに載るビードだけ
+            out.append(variant("bead", cp, got[1], None, None, {"section": ["none", "bead"]}))
+        got = _compose_rib(rng, spec) if spec.target_folds != 0 else None
+        if got is not None and abs(got[0].bend_radius_mm - spec.bend_radius_mm) < 1e-9:
+            out.append(variant("rib", cp, None, None, got[1], {"section": ["none", "rib"]}))
     return out
-
 
 # ---------------------------------------------------------------- 入口
 
@@ -580,7 +565,9 @@ def build_variant(builder, variant: Variant, out_dir: str, name: str):
         check_points=spec.annotated_points, taper_half_width_mm=spec.taper_half_width_mm,
         out_dir=out_dir, part_name=name, bead=variant.bead, flange=variant.flange,
         rib=variant.rib, arms=cp.get("arms", ()), notches=cp.get("notches", ()),
-        side_extension_mm=tuple(cp.get("side_extension_mm", (0.0, 0.0))))
+        side_extension_mm=tuple(cp.get("side_extension_mm", (0.0, 0.0))),
+        bead_span=(tuple(cp["bead_span"]) if cp.get("bead_span") and variant.bead is not None else None),
+        check_radii=tuple(cp.get("point_radii", ())))
 
 
 def variant_meta(meta: dict, variant: Variant, name: str) -> dict:

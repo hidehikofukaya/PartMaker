@@ -222,7 +222,9 @@ def build_general_part(builder, spec, bead, flange, out_dir: str, part_name: str
             rib=rib,
             # 合成族だけ側辺の腕・切欠き・非対称余白を渡す(他の族のビルダー呼び出しは不変)
             **({"arms": compose.get("arms", ()), "notches": compose.get("notches", ()),
-                "side_extension_mm": tuple(compose.get("side_extension_mm", (0.0, 0.0)))}
+                "side_extension_mm": tuple(compose.get("side_extension_mm", (0.0, 0.0))),
+                "bead_span": (tuple(compose["bead_span"]) if compose.get("bead_span") else None),
+                "check_radii": tuple(compose.get("point_radii", ()))}
                if compose else {}),
         )
 
