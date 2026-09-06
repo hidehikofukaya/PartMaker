@@ -101,6 +101,11 @@ def main() -> None:
             labels_by_part[kwargs["part_name"]] = part.face_labels
             return part
 
+        def build_drawn_tray(self, *args, **kwargs):
+            part = super().build_drawn_tray(*args, **kwargs)
+            labels_by_part[kwargs["part_name"]] = part.face_labels
+            return part
+
     attempts: collections.Counter = collections.Counter()
     tries: collections.Counter = collections.Counter()
 

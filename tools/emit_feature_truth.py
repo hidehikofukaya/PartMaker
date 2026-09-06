@@ -133,6 +133,40 @@ def _build_channel(meta: dict, spec: dict) -> dict:
     }
 
 
+def _build_drawn(meta: dict, spec: dict) -> dict:
+    """絞りの角 + 曲げタブ(実車057の簡略版)。壁・継ぎ目・タブのパラメータをそのまま真値にする。"""
+    dr = spec["drawn"]
+    points = spec.get("annotated_points") or []
+    return {
+        "schema": SCHEMA,
+        "part_id": meta["part_id"],
+        "geometry_label": meta["geometry_label"],
+        "half_width_mm": None,
+        "min_bearing_radius_mm": spec["min_bearing_radius_mm"],
+        "thickness_mm": spec["thickness_mm"],
+        "folds": 4,
+        "panels": 5,
+        "has_inflection": False,
+        "bead": None, "flange": None, "rib": None,
+        "corner_relief": None,
+        "drawn": {
+            "hub_xy": dr["hub_xy"],
+            "walls": {k: {"fold_deg": w["fold_deg"], "height_mm": w["height_mm"],
+                          "fillet_mm": w["fillet_mm"], "tabs": w["tabs"],
+                          "taper_from_mm": w.get("taper_from_mm")} for k, w in dr["walls"].items()},
+            "seam_fillet_mm": dr["seam_fillet_mm"], "seams": dr.get("seams"),
+            "arms": [{"edge": a["edge"], "fold_deg": a["fold_deg"], "bend_radius_mm": a["radius_mm"],
+                      "length_mm": a["length_mm"], "root_mm": [a["root_from_mm"], a["root_to_mm"]],
+                      "outline": a.get("outline")} for a in dr["arms"]],
+            "joints": len(points),
+            "joint_positions_xyz": [list(p["position_xyz"]) for p in points],
+            "joint_normals_xyz": [list(p["normal_xyz"]) for p in points],
+        },
+        "notes": "drawn tray: hub + two walls sharing a drawn corner (sharp shell, then OCCT "
+                 "fillets on hub-A / hub-B / seam; the vertex blend is the draw), + two bent tabs",
+    }
+
+
 def _build_flat_plate(meta: dict, spec: dict) -> dict:
     """平板×多点締結(実車031 / 1285-20)。掃引の計画が無いので真値も別立てで出す。"""
     points = spec.get("annotated_points") or []
@@ -167,6 +201,8 @@ def build(meta: dict) -> dict:
         return _build_branch(meta, spec)
     if spec.get("channel") is not None:
         return _build_channel(meta, spec)
+    if spec.get("drawn") is not None:
+        return _build_drawn(meta, spec)
     p1 = FasteningPoint(tuple(spec["point1"]["position_xyz"]), tuple(spec["point1"]["normal_xyz"]))
     p2 = FasteningPoint(tuple(spec["point2"]["position_xyz"]), tuple(spec["point2"]["normal_xyz"]))
     flange = FlangeParams(**meta["flange"]) if meta["flange"] else None

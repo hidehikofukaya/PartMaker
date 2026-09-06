@@ -216,6 +216,8 @@ class GeneralTwoJointSpec:
     branch: dict | None = None
     # 実車144型(チャンネル + 座面)。入っていれば `build_channel_seat` で作る。
     channel: dict | None = None
+    # 実車057の簡略版(ハブ + 絞りの角 + 曲げタブ)。入っていれば `build_drawn_tray` で作る。
+    drawn: dict | None = None
 
 
 def _random_unit_vector(rng: random.Random) -> Vec3:

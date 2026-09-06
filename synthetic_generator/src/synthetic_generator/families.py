@@ -24,7 +24,11 @@ import random
 
 from synthetic_generator.bead import BeadParams, sample_bead
 from synthetic_generator.classify import FasteningPoint, classify
-from synthetic_generator.occt_build import ARM_TIP_RELIEF_MM, branch_frames, channel_seat_frames
+from synthetic_generator.occt_build import (
+    ARM_TIP_RELIEF_MM, branch_frames, channel_seat_frames, drawn_notch_mm, drawn_tray_frames,
+    step_frame, tab_footprint_mm,
+)
+from synthetic_generator.classify import MIN_NEUTRAL_PLANE_RADIUS_MM
 from synthetic_generator.flange import (
     FLANGE_MAX_FOLD_ANGLE_DEG,
     FlangeParams,
@@ -1008,16 +1012,18 @@ def tab_bracket_part(rng: random.Random, knobs: Knobs) -> Result | None:
 
         # 立ち上がり: 辺0 を表側(+法線)へ。高さ = 必要半径 + α、タブは半径 = 必要半径。
         up_h = bearing + rng.uniform(*TAB_UPSTAND_EXTRA_HEIGHT_MM)
-        span = length - 2.0 * (bearing + 0.5)
-        if span < (TAB_WELD_COUNT - 1) * (2.0 * bearing + 4.0):
+        foot = tab_footprint_mm(bearing, TAB_MIN_R_MM)      # タブ + 根元R が上端で占める片側幅
+        span = length - 2.0 * (foot + 0.6)
+        if span < (TAB_WELD_COUNT - 1) * (2.0 * foot + 2.0):
             continue
-        s_first = rng.uniform(bearing + 0.5, length - bearing - 0.5 - (TAB_WELD_COUNT - 1) * (2.0 * bearing + 4.0))
-        pitch = rng.uniform(2.0 * bearing + 4.0, (length - bearing - 0.5 - s_first) / max(1, TAB_WELD_COUNT - 1))
+        s_first = rng.uniform(foot + 0.6, length - foot - 0.6 - (TAB_WELD_COUNT - 1) * (2.0 * foot + 2.0))
+        pitch = rng.uniform(2.0 * foot + 2.0, (length - foot - 0.6 - s_first) / max(1, TAB_WELD_COUNT - 1))
         tabs = [[s_first + k * pitch, bearing] for k in range(TAB_WELD_COUNT)]
         upstand = {"edge": 0, "fold_deg": rng.uniform(*TAB_UPSTAND_FOLD_DEG),
                    "radius_mm": rng.uniform(*TAB_UPSTAND_R_MM), "side": 1, "length_mm": up_h,
                    "relief_mm": TAB_MIN_R_MM,
-                   "outline": {"kind": "tabs", "height_mm": up_h, "tabs": tabs}}
+                   "outline": {"kind": "tabs", "height_mm": up_h, "tabs": tabs,
+                               "root_r_mm": TAB_MIN_R_MM}}
         # フランジ: 辺2(斜辺)を裏側(-法線)へ。矩形 or 台形。
         fl_h = rng.uniform(max(TAB_FLANGE_HEIGHT_MM[0], 2.0 * bearing + 2.0), TAB_FLANGE_HEIGHT_MM[1])
         if rng.random() < TAB_FLANGE_TRAPEZOID_PROB:
@@ -1081,6 +1087,223 @@ def tab_bracket_part(rng: random.Random, knobs: Knobs) -> Result | None:
     return None
 
 
+# ---------------------------------------------------------------- 実車002-057(絞りの角 + 曲げタブ)
+# ユーザーの展開図(2026-09-06): 赤=外形、緑=絞り線(ハブの角から Y 字: ハブ–壁A、ハブ–壁B、
+# 壁どうしの継ぎ目)、青=曲げ線(タブ2つ)。まず緑を絞ると、ハブに対して斜めの継ぎ目で
+# つながった壁2枚ができる。次にハブが器の底になる向きにタブ2つを曲げる。
+# 3D では「つないでからフィレット」: ハブ・壁A・壁B を鋭いエッジで縫合し、3本の共有エッジに
+# フィレット(頂点はブレンド = 絞り)。壁の角度は独立、締結は絞り壁にタブ溶接・曲げタブに
+# 溶接1〜2・ハブに穴2、壁の上端は実車相当(高い方の壁が継ぎ目へ向けて細る)。裁定 2026-09-06。
+DRAWN_BEARING_MM = (7.5, 11.0)             # 溶接相当(タブ半径 = 必要半径)
+DRAWN_FRONT_MM = (60.0, 95.0)              # ハブの前辺(壁B の根本、実車 74)
+DRAWN_DEPTH_MM = (45.0, 70.0)              # ハブの奥行(壁A の根本、実車 52)
+DRAWN_RIGHT_SKEW_DEG = (0.0, 30.0)         # 壁A の根本の傾き(実車 24)
+DRAWN_WALL_FOLD_DEG = (30.0, 90.0)         # 壁A/B 独立(実車 85 / 32)
+DRAWN_WALL_HEIGHT_MM = (25.0, 45.0)        # 実車 43 / 37
+DRAWN_WALL_FILLET_STEEP_MM = (6.0, 15.0)   # 折れ角 > 60 度の壁の根本R(実車 8.7)
+DRAWN_WALL_FILLET_SHALLOW_MM = (6.0, 40.0) # 折れ角 <= 60 度の壁の根本R(実車 38.7)
+DRAWN_SEAM_FILLET_MM = (5.0, 10.0)         # 継ぎ目のR(実車 6〜9)
+DRAWN_TAPER_SHARE = (0.25, 0.5)            # 細りを始める位置(継ぎ目から壁幅の何割か)
+DRAWN_TAB_COUNT_WEIGHTS = ((2, 0.6), (3, 0.4))
+DRAWN_TAB_JITTER = 0.30
+DRAWN_ARM_FOLD_DEG = (65.0, 90.0)          # 曲げタブ(実車の後壁 72、左壁 90)
+DRAWN_ARM_R_MM = (6.0, 15.0)
+DRAWN_ARM_LENGTH_MM = (25.0, 45.0)
+DRAWN_ARM_GAP_MM = (3.0, 8.0)              # タブの根本と絞り壁・角との逃げ
+DRAWN_ARM_POINT_WEIGHTS = ((1, 0.5), (2, 0.5))
+DRAWN_HUB_POINTS = 2
+DRAWN_POINT_ATTEMPTS = 80
+
+
+def _tabs_on(rng, b, lo, hi, root_r=MIN_NEUTRAL_PLANE_RADIUS_MM):
+    """[lo, hi] の区間に半径 b のタブ(根元R root_r つき)を 2〜3(入らなければ減らす)。
+    位置は余白を弱い乱数で配る。占有幅はタブ + 根元R の片側幅 f = sqrt(b^2 + 2 b root_r)。"""
+    f = tab_footprint_mm(b, root_r)
+    usable = hi - lo
+    count = _draw_weighted(rng, DRAWN_TAB_COUNT_WEIGHTS)
+    while count > 1 and usable < count * 2.0 * f + (count - 1) * 1.0 + 1.2:
+        count -= 1
+    slack = usable - (count * 2.0 * f + (count - 1) * 1.0 + 1.2)
+    if slack < 0.0:
+        return None
+    weights = [1.0 + rng.uniform(-DRAWN_TAB_JITTER, DRAWN_TAB_JITTER) for _ in range(count + 1)]
+    total = sum(weights)
+    tabs, cursor = [], lo + 0.6
+    for k in range(count):
+        cursor += slack * weights[k] / total
+        tabs.append([cursor + f, b])
+        cursor += 2.0 * f + 1.0
+    return tabs
+
+
+def drawn_tray_part(rng: random.Random, knobs: Knobs) -> Result | None:
+    """実車002-057 の簡略版(展開図第2版): ハブ + 絞り壁3枚(前B・右A・左C、継ぎ目2本) +
+    曲げタブ1枚(後)。溶接 = 壁のタブ中心(各2〜3) + 曲げタブ 1〜2、ハブに穴2。"""
+    for _ in range(knobs.attempts):
+        try:
+            spec = _draw_spec(rng, knobs, folds=0)
+        except ValueError:
+            continue
+        b = rng.uniform(*(knobs.bearing_radius_mm or DRAWN_BEARING_MM))
+        normal = spec.point1.normal_xyz
+        u, v = _plane_basis(normal)
+        origin = spec.point1.position_xyz
+
+        depth = rng.uniform(max(DRAWN_DEPTH_MM[0], 5.0 * b + 14.0), DRAWN_DEPTH_MM[1])
+        front = rng.uniform(max(DRAWN_FRONT_MM[0], 7.0 * b + 14.0), DRAWN_FRONT_MM[1])
+        skew = depth * math.tan(math.radians(rng.uniform(*DRAWN_RIGHT_SKEW_DEG)))
+        if front - skew < 4.0 * b + 10.0:
+            continue
+        hub_xy = [(0.0, 0.0), (front, 0.0), (front - skew, depth), (0.0, depth)]
+
+        # 3本のフィレットは同じ半径にする: 半径が違うと頂点のブレンドの縁が自由曲線になり、
+        # 「エッジは直線と円弧だけ」の出力契約(ゲートA)を破る(2026-09-06 実測)。
+        fillet = rng.uniform(*DRAWN_WALL_FILLET_STEEP_MM)
+        walls = {}
+        for key in ("A", "B", "C"):
+            fold = rng.uniform(*DRAWN_WALL_FOLD_DEG)
+            tangent = fillet * math.tan(math.radians(fold) / 2.0)
+            height = rng.uniform(max(DRAWN_WALL_HEIGHT_MM[0], tangent + b + 4.0), DRAWN_WALL_HEIGHT_MM[1])
+            walls[key] = {"fold_deg": fold, "height_mm": height, "fillet_mm": fillet,
+                          "tangent_mm": tangent, "tabs": [], "taper_from_mm": {},
+                          "corner_square_mm": tangent + 2.0,
+                          "tab_root_r_mm": MIN_NEUTRAL_PLANE_RADIUS_MM}
+        try:
+            lay = drawn_tray_frames(hub_xy, walls, origin=origin, hub_u=u, hub_v=v)
+        except ValueError:
+            continue
+        # 細りの始点(継ぎ目側)と、タブを置ける区間 = 根本の上で、細りとノッチを避けた部分
+        ok = True
+        for key, fr in lay["walls"].items():
+            w = fr["width"]
+            lo, hi = 0.0, w
+            for side in ("left", "right"):
+                end = fr["ends"][side]
+                if end is None:
+                    continue
+                notch = drawn_notch_mm(fillet, end["turn"])
+                perp_s = end["dt"] if side == "left" else -end["dt"]
+                q_s = end["s"] + notch * perp_s
+                share = rng.uniform(*DRAWN_TAPER_SHARE)
+                if end["tapers"]:
+                    s_taper = end["s"] + (share * w if side == "left" else -share * w)
+                    # ノッチの先より内側に始点を置く
+                    s_taper = max(s_taper, q_s + 0.5) if side == "left" else min(s_taper, q_s - 0.5)
+                    walls[key]["taper_from_mm"][side] = s_taper
+                else:
+                    s_taper = q_s
+                if side == "left":
+                    lo = max(lo, s_taper)
+                else:
+                    hi = min(hi, s_taper)
+            tabs = _tabs_on(rng, b, lo, hi)
+            if tabs is None or len(tabs) < 2:        # 裁定: 各壁のタブは 2〜3
+                ok = False
+                break
+            walls[key]["tabs"] = tabs
+        if not ok:
+            continue
+
+        # 曲げタブ: 辺2(後、v2->v3)。根本は壁A/C のフィレット帯と v2 の直角短辺を避ける。
+        edge_len = math.dist(hub_xy[2], hub_xy[3])
+        root_from = walls["A"]["tangent_mm"] + walls["A"]["corner_square_mm"] * math.sin(math.atan2(skew, depth)) + 3.0
+        root_to = edge_len - walls["C"]["tangent_mm"] - 3.0
+        width = root_to - root_from
+        if width < 2.0 * b + 2.0:
+            continue
+        length = rng.uniform(max(DRAWN_ARM_LENGTH_MM[0], 2.0 * b + 2.0), DRAWN_ARM_LENGTH_MM[1])
+        cap = max(0.0, (width - 2.0 * b - 2.0) / 2.0)
+        outline = ({"kind": "trapezoid", "shrink_a_mm": rng.uniform(0.0, min(cap, 0.25 * width)),
+                    "shrink_b_mm": rng.uniform(0.0, min(cap, 0.25 * width))}
+                   if rng.random() < 0.5 else {"kind": "rect"})
+        arms = [{"edge": 2, "fold_deg": rng.uniform(*DRAWN_ARM_FOLD_DEG),
+                 "radius_mm": rng.uniform(*DRAWN_ARM_R_MM), "length_mm": length,
+                 "relief_mm": ARM_TIP_RELIEF_MM, "root_from_mm": root_from,
+                 "root_to_mm": root_to, "outline": outline}]
+
+        # ---- 締結点
+        points: list = []
+        for key, fr in lay["walls"].items():          # 絞り壁の溶接 = タブの円の中心
+            for s_c, _r in walls[key]["tabs"]:
+                pos = tuple(fr["a"][i] + fr["height"] * fr["tip"][i] + s_c * fr["axis"][i] for i in range(3))
+                points.append(FasteningPoint(position_xyz=pos, normal_xyz=fr["normal"]))
+        for arm in arms:                              # 曲げタブの溶接 1〜2
+            i0, i1 = arm["edge"], (arm["edge"] + 1) % 4
+            a_xy, b_xy = hub_xy[i0], hub_xy[i1]
+            d2 = _unit((b_xy[0] - a_xy[0], b_xy[1] - a_xy[1]))
+            a = lay["to_space"]((a_xy[0] + d2[0] * arm["root_from_mm"], a_xy[1] + d2[1] * arm["root_from_mm"]))
+            bpt = lay["to_space"]((a_xy[0] + d2[0] * arm["root_to_mm"], a_xy[1] + d2[1] * arm["root_to_mm"]))
+            axis = tuple((bpt[i] - a[i]) / math.dist(a, bpt) for i in range(3))
+            angle = math.radians(arm["fold_deg"])
+            outward = _unit(_cross3(axis, normal))
+            tip = tuple(outward[i] * math.cos(angle) - normal[i] * math.sin(angle) for i in range(3))
+            centre = tuple(a[i] - normal[i] * arm["radius_mm"] for i in range(3))
+            a2 = _rotate3(a, centre, axis, angle)
+            arm_normal = _unit(_cross3(tip, axis))
+            wanted = _draw_weighted(rng, DRAWN_ARM_POINT_WEIGHTS)
+            t = rng.uniform(b, arm["length_mm"] - b)
+            sh_a = arm["outline"].get("shrink_a_mm", 0.0) * t / arm["length_mm"]
+            sh_b = arm["outline"].get("shrink_b_mm", 0.0) * t / arm["length_mm"]
+            lo, hi = sh_a + b, width - sh_b - b
+            if hi - lo < 0.0:
+                ok = False
+                break
+            if wanted == 2 and hi - lo >= 2.0 * b + 2.0:
+                svals = [lo + rng.uniform(0.0, 0.2) * (hi - lo), hi - rng.uniform(0.0, 0.2) * (hi - lo)]
+            else:
+                svals = [rng.uniform(lo, hi)]
+            for s_ in svals:
+                pos = tuple(a2[i] + t * tip[i] + s_ * axis[i] for i in range(3))
+                points.append(FasteningPoint(position_xyz=pos, normal_xyz=arm_normal))
+        if not ok:
+            continue
+        # ハブの穴2: 絞り壁側はフィレット帯 + 座面、タブ側は座面 + 逃げ
+        margin = {0: walls["B"]["tangent_mm"] + b + 1.0, 1: walls["A"]["tangent_mm"] + b + 1.0,
+                  2: b + 2.0, 3: walls["C"]["tangent_mm"] + b + 1.0}
+        got: list = []
+        for _ in range(DRAWN_POINT_ATTEMPTS):
+            cand = (rng.uniform(0.0, front), rng.uniform(0.0, depth))
+            if not _inside_convex(cand, hub_xy):
+                continue
+            if any(_dist_to_segment(cand, hub_xy[i], hub_xy[(i + 1) % 4]) < margin[i] for i in range(4)):
+                continue
+            if all(math.dist(cand, o) >= 2.0 * b + 2.0 for o in got):
+                got.append(cand)
+            if len(got) == DRAWN_HUB_POINTS:
+                break
+        if len(got) < DRAWN_HUB_POINTS:
+            continue
+        for cand in got:
+            points.append(FasteningPoint(position_xyz=lay["to_space"](cand), normal_xyz=lay["normal"]))
+
+        drawn = {"hub_xy": hub_xy, "walls": walls, "arms": arms, "origin": list(origin),
+                 "hub_u": list(u), "hub_v": list(v), "seam_fillet_mm": fillet,
+                 "corner_radius": ARM_TIP_RELIEF_MM, "skew_mm": skew,
+                 "seams": {k: {"end": list(sm["end"]), "turn_deg": sm["turn_deg"]}
+                           for k, sm in lay["seams"].items()}}
+        return (dataclasses.replace(spec, point1=points[0], point2=points[1], extra_points=(),
+                                    annotated_points=tuple(points), drawn=drawn,
+                                    target_folds=None, min_bearing_radius_mm=b),
+                None, None, None)
+    return None
+
+def _cross3(a, b):
+    return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0])
+
+
+def _unit(a):
+    k = math.sqrt(sum(c * c for c in a)) or 1.0
+    return tuple(c / k for c in a)
+
+
+def _rotate3(p, centre, axis, angle):
+    d = tuple(p[k] - centre[k] for k in range(3))
+    c, s_ = math.cos(angle), math.sin(angle)
+    dot = sum(d[k] * axis[k] for k in range(3))
+    cr = _cross3(axis, d)
+    return tuple(centre[k] + d[k] * c + cr[k] * s_ + axis[k] * dot * (1 - c) for k in range(3))
+
+
 FAMILIES = {
     "bead": bead_part,
     "flange": flange_part,
@@ -1093,6 +1316,7 @@ FAMILIES = {
     "branch": branch_part,
     "channel_seat": channel_seat_part,
     "tab_bracket": tab_bracket_part,
+    "drawn_tray": drawn_tray_part,
 }
 
 

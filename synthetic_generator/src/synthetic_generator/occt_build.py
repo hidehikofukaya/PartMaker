@@ -442,6 +442,168 @@ def branch_frames(hub_xy, arms, *, origin: Vec3, hub_u: Vec3, hub_v: Vec3,
             "to_space": to_space}
 
 
+def _rotate_vec(v: Vec3, axis: Vec3, angle: float) -> Vec3:
+    return _rotate_about(v, (0.0, 0.0, 0.0), axis, angle)
+
+
+def step_frame(fr: dict, outline: dict, hub_normal: Vec3) -> dict:
+    """段差腕(実車057の前側): 根本で rise 度上がった斜面を run だけ進み、根本と平行な軸で
+    (rise - ledge_tilt) 度戻して、ハブとほぼ平行な棚を作る。棚の座標系を返す。
+
+    戻り値: {"a2","b2"(斜面の先), "a3","b3"(棚の根本), "tip2"(棚の伸びる向き),
+             "centre2","axis2","angle2"(2本目の曲げ: 回転軸の向きと正の角), "normal2"}
+    """
+    axis, tip, a, b = fr["axis"], fr["tip"], fr["a"], fr["b"]
+    run, radius = outline["run_mm"], outline["ledge_radius_mm"]
+    angle = math.radians(fr_deg(fr) - outline["ledge_tilt_deg"])
+    a2 = _add(a, _scale(tip, run))
+    b2 = _add(b, _scale(tip, run))
+    outward = _normalize(_cross(axis, hub_normal))
+    n_s = fr["normal"]
+    best = None
+    for sign in (1.0, -1.0):
+        tip2 = _rotate_vec(tip, axis, sign * angle)
+        if _dot(tip2, outward) <= _dot(tip, outward):
+            continue                       # 戻す向きでない
+        for m in (n_s, _scale(n_s, -1.0)):
+            centre = _add(a2, _scale(m, radius))
+            a3 = _rotate_about(a2, centre, axis, sign * angle)
+            step = _add(a3, _scale(a2, -1.0))
+            if _dot(step, tip) > 0.0 and _dot(step, tip2) > 0.0:
+                best = (sign, centre, a3, tip2)
+    if best is None:
+        raise ValueError("no consistent second bend for the step arm. Infeasible.")
+    sign, centre, a3, tip2 = best
+    b3 = _rotate_about(b2, centre, axis, sign * angle)
+    return {"a2": a2, "b2": b2, "a3": a3, "b3": b3, "tip2": tip2, "centre2": centre,
+            "axis2": axis if sign > 0 else _scale(axis, -1.0), "angle2": angle,
+            "normal2": _normalize(_cross(tip2, axis))}
+
+
+def fr_deg(fr: dict) -> float:
+    return math.degrees(fr["angle"])
+
+
+# ---------------------------------------------------------------- 絞りの角(実車057の簡略版)
+
+def tab_footprint_mm(radius_mm: float, root_r_mm: float) -> float:
+    """半円タブ(半径 r)の根元に凹R(ρ)を付けたときの、タブが上端の辺で占める片側の幅。
+    根元の円は上端の直線と外接し、タブの円とも外接するので、中心の s オフセットは
+    sqrt((r+ρ)^2 - ρ^2) = sqrt(r^2 + 2 r ρ)。"""
+    return math.sqrt(radius_mm * radius_mm + 2.0 * radius_mm * root_r_mm)
+
+
+def tab_top_section(height_mm: float, tabs, s_hi: float, s_lo: float, root_r_mm: float):
+    """壁の上端(t = height)を s_hi から s_lo へ向かって辿る断面要素列。途中に半円の溶接タブ
+    (中心 (height, s_c)、半径 r)を、根元の凹R(root_r)つきで入れる。
+
+    タブの根元を直角に落とすと応力集中で裂けるので、実務どおり最小Rの逃げを付ける
+    (ユーザー指示 2026-09-06)。凹Rの中心は上端の外側 (height + ρ, s_c ± sqrt(r^2+2rρ))。
+    """
+    order = sorted(tabs, key=lambda t: -t[0])
+    for s_c, r in order:
+        f = tab_footprint_mm(r, root_r_mm)
+        if s_c - f < s_lo + 0.5 or s_c + f > s_hi - 0.5:
+            raise ValueError("a weld tab (with its root radius) runs off the wall. Infeasible.")
+    for (s1, r1), (s2, r2) in zip(order, order[1:]):
+        if s1 - tab_footprint_mm(r1, root_r_mm) < s2 + tab_footprint_mm(r2, root_r_mm) + 1.0:
+            raise ValueError("weld tabs overlap. Infeasible.")
+    h, rho = height_mm, root_r_mm
+    section = []
+    cursor = s_hi
+    for s_c, r in order:
+        f = tab_footprint_mm(r, rho)
+        # 根元Rの中心(上端の外側)と、タブの円との接点
+        k = r / (r + rho)
+        t_touch = h + rho * k              # 接点の t (中心同士を結ぶ線上、タブ中心から r)
+        s_touch = f * k
+        # 右側の根元R: 直線の接点 (h, s_c+f) -> タブ円の接点 (t_touch, s_c + s_touch)
+        c_r = (h + rho, s_c + f)
+        m_r = _arc_mid_2d(c_r, rho, (h, s_c + f), (t_touch, s_c + s_touch))
+        c_l = (h + rho, s_c - f)
+        m_l = _arc_mid_2d(c_l, rho, (t_touch, s_c - s_touch), (h, s_c - f))
+        section.append(("line", (h, cursor), (h, s_c + f)))
+        section.append(("arc", (h, s_c + f), m_r, (t_touch, s_c + s_touch)))
+        section.append(("arc", (t_touch, s_c + s_touch), (h + r, s_c), (t_touch, s_c - s_touch)))
+        section.append(("arc", (t_touch, s_c - s_touch), m_l, (h, s_c - f)))
+        cursor = s_c - f
+    section.append(("line", (h, cursor), (h, s_lo)))
+    return [e for e in section if e[0] != "line" or math.dist(e[1], e[2]) >= MIN_EDGE_LENGTH_MM]
+
+
+def _arc_mid_2d(centre, radius, p, q):
+    """中心 centre、半径 radius の円上で p と q の間(短い方)の中点。"""
+    u = ((p[0] + q[0]) / 2.0 - centre[0], (p[1] + q[1]) / 2.0 - centre[1])
+    k = math.hypot(*u)
+    if k < 1e-9:
+        raise ValueError("degenerate arc. Infeasible.")
+    return (centre[0] + u[0] / k * radius, centre[1] + u[1] / k * radius)
+
+
+def drawn_notch_mm(fillet_mm: float, turn_rad: float) -> float:
+    """継ぎ目の端のノッチ長。フィレットの接線長 R tan(θ/2) の 2 倍 + 4。
+    接線長 + 2 だとフィレットの帯がノッチの角に触れて OCCT が収束しない(2026-09-06 実測:
+    失敗12件のうち 2 倍にすると 12 件とも収束)。"""
+    return 2.0 * fillet_mm * math.tan(turn_rad / 2.0) + 4.0
+
+
+def drawn_tray_frames(hub_xy, walls: dict, *, origin: Vec3, hub_u: Vec3, hub_v: Vec3):
+    """ハブ(凸四角形 v0..v3)の辺0(v0->v1)に壁B、辺1(v1->v2)に壁A、辺3(v3->v0)に壁C を立てる。
+    A–B は頂点 v1 から、C–B は頂点 v0 から出る**平面の交線**(継ぎ目)で互いにトリムする。
+    壁は裏側(-法線)へ折る。walls = {"A"|"B"|"C": {"fold_deg", "height_mm"}}(C は任意)。
+
+    戻り値: {"normal", "to_space", "vertices", "walls": {key: {a, b, tip, axis, normal, width,
+             height, ends: {"left"|"right": None | {"t","s","dt","ds","turn","P"}}}},
+             "seams": {"AB": {...}, "CB": {...}}}
+    継ぎ目の端 P は「2枚の壁の上端のうち低い方」に置き、高い方は上端を P へ向けて細らせる。
+    """
+    normal = _normalize(_cross(hub_u, hub_v))
+
+    def to_space(xy):
+        return _add(origin, _add(_scale(hub_u, xy[0]), _scale(hub_v, xy[1])))
+
+    v = [to_space(q) for q in hub_xy]
+    edges = {"B": (v[0], v[1]), "A": (v[1], v[2]), "C": (v[3], v[0])}
+    frames = {}
+    for key, spec in walls.items():
+        a, b = edges[key]
+        axis = _normalize(_add(b, _scale(a, -1.0)))
+        angle = math.radians(spec["fold_deg"])
+        outward = _normalize(_cross(axis, normal))
+        tip = _normalize(_add(_scale(outward, math.cos(angle)), _scale(normal, -math.sin(angle))))
+        frames[key] = {"a": a, "b": b, "axis": axis, "tip": tip, "angle": angle,
+                       "normal": _normalize(_cross(tip, axis)), "width": math.dist(a, b),
+                       "height": spec["height_mm"], "ends": {"left": None, "right": None}}
+    seams = {}
+    # (継ぎ目名, 壁X, Xのどちら側の端か, 壁Y, Yのどちら側の端か, 頂点)
+    for name, kx, side_x, ky, side_y, vertex in (("AB", "A", "left", "B", "right", v[1]),
+                                                  ("CB", "C", "right", "B", "left", v[0])):
+        if kx not in frames or ky not in frames:
+            continue
+        fx, fy = frames[kx], frames[ky]
+        d = _cross(fx["normal"], fy["normal"])
+        if math.sqrt(_dot(d, d)) < 1e-6:
+            raise ValueError("two walls are coplanar. Infeasible.")
+        d = _normalize(d)
+        if _dot(d, _add(fx["tip"], fy["tip"])) < 0.0:
+            d = _scale(d, -1.0)
+        turn = math.acos(max(-1.0, min(1.0, _dot(fx["normal"], fy["normal"]))))
+        info = {}
+        for key, fr, side in ((kx, fx, side_x), (ky, fy, side_y)):
+            dt, ds = _dot(d, fr["tip"]), _dot(d, fr["axis"])
+            if dt < 0.2:
+                raise ValueError("the seam runs almost along the hub. Infeasible.")
+            info[key] = (dt, ds, side)
+        lam = min(fr["height"] / info[key][0] for key, fr in ((kx, fx), (ky, fy)))
+        P = _add(vertex, _scale(d, lam))
+        for key, fr in ((kx, fx), (ky, fy)):
+            dt, ds, side = info[key]
+            s0 = 0.0 if side == "left" else fr["width"]
+            fr["ends"][side] = {"t": lam * dt, "s": s0 + lam * ds, "dt": dt, "ds": ds,
+                                "turn": turn, "P": P, "tapers": lam * dt < fr["height"] - 1e-6}
+        seams[name] = {"dir": d, "end": P, "turn_deg": math.degrees(turn), "vertex": vertex}
+    return {"normal": normal, "to_space": to_space, "vertices": v, "walls": frames, "seams": seams}
+
 def channel_seat_frames(*, origin: Vec3, hub_u: Vec3, hub_v: Vec3, length_mm: float,
                         width_mm: float, wall_fold_deg: float, wall_radius_mm: float,
                         wall_depth0_mm: float, wall_depth1_mm: float, diag_start_mm: float,
@@ -1234,9 +1396,16 @@ class OcctPartBuilder:
             bend_face = topods.Face(bend)
             faces[bend_face] = f"bend_{index}"
             outline = arm.get("outline") or {"kind": "rect"}
+            if outline["kind"] == "step":
+                step_faces = self._step_arm_faces(fr, outline, normal)
+                for face, suffix in step_faces:
+                    faces[face] = f"arm_{index}{suffix}"
+                groups[index] = [bend_face] + [f for f, _ in step_faces]
+                continue
             if outline["kind"] == "tabs":
                 arm_face = self._tab_arm_face(fr["a"], fr["b"], fr["tip"], fr["axis"],
-                                              outline["height_mm"], outline["tabs"])
+                                              outline["height_mm"], outline["tabs"],
+                                              outline.get("root_r_mm", MIN_NEUTRAL_PLANE_RADIUS_MM))
             elif outline["kind"] == "trapezoid":
                 arm_face = self._trapezoid_arm_face(
                     fr["a"], fr["b"], fr["tip"], fr["axis"], arm["length_mm"],
@@ -1265,6 +1434,221 @@ class OcctPartBuilder:
             raise
         return GeneratedPart(stp_path=stp_path, catpart_path="",
                              face_labels=tuple(describe_faces(named)))
+
+    def build_drawn_tray(self, hub_xy, walls: dict, arms, *, origin: Vec3, hub_u: Vec3,
+                         hub_v: Vec3, seam_fillet_mm: float, corner_radius: float,
+                         out_dir: str, part_name: str, check_points=()) -> GeneratedPart:
+        """実車057の簡略版: ハブ + 絞りの角(壁A/B) + 曲げタブ(arms、辺2・3)。
+
+        1. ハブ・壁A・壁B を鋭いエッジで作って縫合(3面が頂点 v1 で出会う)。
+        2. ハブ–A、ハブ–B、継ぎ目 A–B の3本に OCCT のフィレット(頂点はブレンド面 = 絞り)。
+        3. タブ(腕)は辺2・3の根本エッジから回転掃引で曲げ、最後に全部縫合。
+
+        walls[key] = {"fold_deg", "height_mm", "fillet_mm", "tabs": [(s, r)...],
+                      "taper_from_mm": 継ぎ目側の細りを始める根本座標(任意)}
+        """
+        lay = drawn_tray_frames(hub_xy, walls, origin=origin, hub_u=hub_u, hub_v=hub_v)
+        normal, to_space, v = lay["normal"], lay["to_space"], lay["vertices"]
+        by_edge = {arm["edge"]: arm for arm in arms}
+        if set(by_edge) - {2, 3} or (3 in by_edge and "C" in walls):
+            raise ValueError("drawn tray arms must sit on free hub edges (2, and 3 without wall C).")
+
+        # --- ハブ: 辺2・3 には腕の根本の頂点を入れておく(フィレット後もそのまま残る)
+        roots = {}
+        pts = []
+        square = walls["A"].get("corner_square_mm", 0.0)
+        for i in range(4):
+            a_xy, b_xy = hub_xy[i], hub_xy[(i + 1) % 4]
+            pts.append(a_xy)
+            if i == 2 and square > 0.0:
+                # v2 から辺1 の内向き法線方向へ square だけ進んだ点を挟む(凸は保たれる)
+                e1 = _normalize2((hub_xy[2][0] - hub_xy[1][0], hub_xy[2][1] - hub_xy[1][1]))
+                inward = (-e1[1], e1[0])
+                pts.append((a_xy[0] + inward[0] * square, a_xy[1] + inward[1] * square))
+            if i in by_edge:
+                d = _normalize2((b_xy[0] - a_xy[0], b_xy[1] - a_xy[1]))
+                s0, s1 = by_edge[i]["root_from_mm"], by_edge[i]["root_to_mm"]
+                r0 = (a_xy[0] + d[0] * s0, a_xy[1] + d[1] * s0)
+                r1 = (a_xy[0] + d[0] * s1, a_xy[1] + d[1] * s1)
+                roots[i] = (to_space(r0), to_space(r1))
+                pts.extend([r0, r1])
+        wire = BRepBuilderAPI_MakeWire()
+        for i in range(len(pts)):
+            p0, p1 = pts[i], pts[(i + 1) % len(pts)]
+            if math.dist(p0, p1) < MIN_EDGE_LENGTH_MM:
+                raise ValueError("hub outline has a degenerate edge. Infeasible.")
+            wire.Add(BRepBuilderAPI_MakeEdge(gp_Pnt(*to_space(p0)), gp_Pnt(*to_space(p1))).Edge())
+        hub = BRepBuilderAPI_MakeFace(gp_Pln(gp_Pnt(*origin), gp_Dir(*normal)), wire.Wire())
+        if not hub.IsDone():
+            raise ValueError("the hub outline does not bound a planar face. Infeasible.")
+
+        # --- 壁A/B(鋭い): 根本、遠い端、上端(タブ + 継ぎ目へ向けた細り)、継ぎ目
+        wall_faces = {}
+        for key, fr in lay["walls"].items():
+            wall_faces[key] = self._drawn_wall_face(fr, walls[key], key)
+        sew = BRepBuilderAPI_Sewing(SEW_TOLERANCE_MM)
+        sew.Add(hub.Face())
+        for f in wall_faces.values():
+            sew.Add(f)
+        sew.Perform()
+        shell = sew.SewedShape()
+        if sew.NbMultipleEdges() > 0:
+            raise ValueError("the drawn corner does not sew cleanly. Infeasible.")
+
+        # --- フィレット: 2面に共有されるエッジ = ハブ–A、ハブ–B、継ぎ目
+        amap = TopTools_IndexedDataMapOfShapeListOfShape()
+        topexp.MapShapesAndAncestors(shell, TopAbs_EDGE, TopAbs_FACE, amap)
+        fillet = BRepFilletAPI_MakeFillet(shell)
+        expected = 2 * len(lay["seams"]) + len(lay["walls"]) - len(lay["seams"])
+        added = 0
+        for i in range(1, amap.Size() + 1):
+            if amap.FindFromIndex(i).Size() != 2:
+                continue
+            edge = topods.Edge(amap.FindKey(i))
+            curve = BRepAdaptor_Curve(edge)
+            p0, p1 = curve.Value(curve.FirstParameter()), curve.Value(curve.LastParameter())
+            ends = ((p0.X(), p0.Y(), p0.Z()), (p1.X(), p1.Y(), p1.Z()))
+
+            def near(q):
+                return any(math.dist(e, q) < 1e-3 for e in ends)
+            radius = None
+            for name, seam in lay["seams"].items():
+                if near(seam["end"]) and near(seam["vertex"]):
+                    radius = seam_fillet_mm
+            for key, (a, b) in (("B", (v[0], v[1])), ("A", (v[1], v[2])), ("C", (v[3], v[0]))):
+                if key in walls and near(a) and near(b):
+                    radius = walls[key]["fillet_mm"]
+            if radius is None:
+                continue
+            fillet.Add(radius, edge)
+            added += 1
+        if added != expected:
+            raise ValueError(f"expected {expected} shared edges at the drawn corners, found {added}. Infeasible.")
+        try:
+            fillet.Build()
+        except Exception as exc:        # OCCT が例外で落ちる組み合わせもある
+            raise ValueError(f"the corner fillet failed: {exc}. Infeasible.")
+        if not fillet.IsDone():
+            raise ValueError("the corner fillet did not converge. Infeasible.")
+        blended = fillet.Shape()
+
+        # --- 面に名前を付ける(フィレット後の面は種類で判別)
+        faces: dict = {}
+        explorer = TopExp_Explorer(blended, TopAbs_FACE)
+        counts: dict = {}
+        while explorer.More():
+            face = topods.Face(explorer.Current())
+            kind = BRepAdaptor_Surface(face).GetType()
+            props = GProp_GProps()
+            brepgprop.SurfaceProperties(face, props)
+            c = props.CentreOfMass()
+            centre = (c.X(), c.Y(), c.Z())
+            if kind == 0:   # 平面: ハブ / 壁A / 壁B を法線で判別
+                n = BRepAdaptor_Surface(face).Plane().Axis().Direction()
+                nv = (n.X(), n.Y(), n.Z())
+                best = max([("hub", normal)] + [(f"wall_{k}", fr["normal"])
+                                                 for k, fr in lay["walls"].items()],
+                           key=lambda kv: abs(_dot(kv[1], nv)))
+                name = best[0]
+            elif kind == 1:
+                name = "draw_fillet"
+            else:
+                name = "draw_corner"
+            counts[name] = counts.get(name, 0) + 1
+            faces[face] = name if counts[name] == 1 else f"{name}_{counts[name]}"
+            explorer.Next()
+
+        # --- タブ(腕)
+        groups: dict = {}
+        for index, arm in by_edge.items():
+            a, b = roots[index]
+            axis = _normalize(_add(b, _scale(a, -1.0)))
+            angle = math.radians(arm["fold_deg"])
+            centre = _add(a, _scale(normal, -arm["radius_mm"]))
+            outward = _normalize(_cross(axis, normal))
+            tip = _normalize(_add(_scale(outward, math.cos(angle)), _scale(normal, -math.sin(angle))))
+            root = BRepBuilderAPI_MakeEdge(gp_Pnt(*a), gp_Pnt(*b)).Edge()
+            bend = topods.Face(BRepPrimAPI_MakeRevol(
+                root, gp_Ax1(gp_Pnt(*centre), gp_Dir(*axis)), angle).Shape())
+            a2, b2 = _rotate_about(a, centre, axis, angle), _rotate_about(b, centre, axis, angle)
+            outline = arm.get("outline") or {"kind": "rect"}
+            if outline["kind"] == "trapezoid":
+                arm_face = self._trapezoid_arm_face(a2, b2, tip, axis, arm["length_mm"],
+                                                    outline["shrink_a_mm"], outline["shrink_b_mm"],
+                                                    arm.get("relief_mm", ARM_TIP_RELIEF_MM))
+            else:
+                arm_face = self._arm_face(a2, b2, tip, axis, arm["length_mm"],
+                                          arm.get("relief_mm", ARM_TIP_RELIEF_MM))
+            faces[bend] = f"bend_{index}"
+            faces[arm_face] = f"arm_{index}"
+            groups[index] = [bend, arm_face]
+        groups[99] = list(wall_faces.values())     # 絞り壁(整数キー: 干渉判定はキーを比較する)
+
+        shape, named = self._sew(faces)
+        self._check_arm_clearance(groups)     # 腕どうし + 腕と絞り壁(フィレット前の壁で保守的に)
+        os.makedirs(out_dir, exist_ok=True)
+        stp_path = os.path.abspath(os.path.join(out_dir, part_name + "_mid.stp"))
+        _export_step(shape, named, stp_path)
+        try:
+            check_shape(_read_step(stp_path), tuple(p.position_xyz for p in check_points))
+        except ValueError:
+            os.remove(stp_path)
+            raise
+        return GeneratedPart(stp_path=stp_path, catpart_path="",
+                             face_labels=tuple(describe_faces(named)))
+
+    @classmethod
+    def _drawn_wall_face(cls, fr: dict, spec: dict, key: str):
+        """絞り壁の輪郭(壁座標 t=高さ方向, s=根本方向、根本は s=0..w)。
+
+        両端はそれぞれ「自由端」(根本に直交する縦の辺)か「継ぎ目」(継ぎ目の端 P ->
+        継ぎ目に直交するノッチ -> 細り -> 上端)。上端(高さ h)に半円の溶接タブ。
+        ノッチ長はフィレットの接線長 + 2(フィレットの終端が直交平面で切れて円弧になる)。
+        """
+        w, h = fr["width"], fr["height"]
+        tabs = sorted(spec.get("tabs", ()), key=lambda t: -t[0])
+        fillet = spec.get("fillet_mm", 0.0)
+        taper = spec.get("taper_from_mm", {})
+
+        def seam_piece(end, side):
+            """継ぎ目側の (P, Q, 細りの始点 s) を返す。"""
+            t_p, s_p, dt, ds = end["t"], end["s"], end["dt"], end["ds"]
+            notch = spec.get("notch_mm", drawn_notch_mm(fillet, end["turn"]))
+            perp = (-ds, dt) if side == "left" else (ds, -dt)     # 材料側へ向く直交方向
+            q = (t_p + notch * perp[0], s_p + notch * perp[1])
+            default = s_p + (0.35 * w if side == "left" else -0.35 * w)
+            s_taper = taper.get(side, default) if end["tapers"] else q[1]
+            return (t_p, s_p), q, s_taper
+
+        left, right = fr["ends"]["left"], fr["ends"]["right"]
+        section = [("line", (0.0, 0.0), (0.0, w))]
+        # 右端(s=w 側)
+        if right is None:
+            section.append(("line", (0.0, w), (h, w)))
+            top_hi = w
+        else:
+            P, Q, s_taper = seam_piece(right, "right")
+            section.append(("line", (0.0, w), P))
+            section.append(("line", P, Q))
+            section.append(("line", Q, (h, s_taper)))
+            top_hi = s_taper
+        # 左端の細り始点
+        if left is None:
+            top_lo = 0.0
+        else:
+            P_l, Q_l, s_taper_l = seam_piece(left, "left")
+            top_lo = s_taper_l
+        # 上端(s 減少方向)にタブ(根元に凹R)
+        section += tab_top_section(h, tabs, top_hi, top_lo,
+                                   spec.get("tab_root_r_mm", MIN_NEUTRAL_PLANE_RADIUS_MM))
+        # 左端
+        if left is None:
+            section.append(("line", (h, 0.0), (0.0, 0.0)))
+        else:
+            section.append(("line", (h, top_lo), Q_l))
+            section.append(("line", Q_l, P_l))
+            section.append(("line", P_l, (0.0, 0.0)))
+        return cls._outline_face(fr["a"], fr["tip"], fr["axis"], section)
 
     def build_channel_seat(self, *, out_dir: str, part_name: str, seat_depth_mm: float,
                            seat_corner_mm: float, check_points=(), **geom) -> GeneratedPart:
@@ -1357,24 +1741,54 @@ class OcctPartBuilder:
         return face.Face()
 
     @classmethod
-    def _tab_arm_face(cls, a, b, tip: Vec3, axis: Vec3, height_mm: float, tabs):
+    def _step_arm_faces(cls, fr: dict, outline: dict, hub_normal: Vec3):
+        """段差腕: 斜面(平面) + 2本目の曲げ(円筒) + 棚(平面、舌つき)。[(face, 名前の接尾辞)]。"""
+        sf = step_frame(fr, outline, hub_normal)
+        width = fr["width"]
+        run = outline["run_mm"]
+        slope = cls._outline_face(fr["a"], fr["tip"], fr["axis"], [
+            ("line", (0.0, 0.0), (0.0, width)), ("line", (0.0, width), (run, width)),
+            ("line", (run, width), (run, 0.0)), ("line", (run, 0.0), (0.0, 0.0))])
+        edge = BRepBuilderAPI_MakeEdge(gp_Pnt(*sf["a2"]), gp_Pnt(*sf["b2"])).Edge()
+        bend2 = topods.Face(BRepPrimAPI_MakeRevol(
+            edge, gp_Ax1(gp_Pnt(*sf["centre2"]), gp_Dir(*sf["axis2"])), sf["angle2"]).Shape())
+        depth, relief = outline["ledge_mm"], outline.get("relief_mm", ARM_TIP_RELIEF_MM)
+        tongue = outline.get("tongue")
+        pa, pb = (0.0, 0.0), (0.0, width)
+        if tongue:
+            # 棚の先端辺の s=[s0,s1] から長さ l の舌を出す。舌の先の2隅を丸める。
+            s_c, w_t, l_t = tongue["s_mm"], tongue["width_mm"], tongue["length_mm"]
+            s0, s1 = s_c - w_t / 2.0, s_c + w_t / 2.0
+            if s0 < relief + 0.5 or s1 > width - relief - 0.5:
+                raise ValueError("the tongue runs off the ledge. Infeasible.")
+            r_t = min(relief, w_t / 2.0 - 0.5)
+            c_far_b, c_far_a = (depth + l_t, s1), (depth + l_t, s0)
+            fb = _fillet_corner_2d((depth, s1), c_far_b, c_far_a, r_t)
+            fa = _fillet_corner_2d(c_far_b, c_far_a, (depth, s0), r_t)
+            cb = _fillet_corner_2d(pb, (depth, width), (depth, s1), relief)
+            ca = _fillet_corner_2d((depth, s0), (depth, 0.0), pa, relief)
+            section = [("line", pa, pb), ("line", pb, cb[0]), ("arc", cb[0], cb[1], cb[2]),
+                       ("line", cb[2], (depth, s1)), ("line", (depth, s1), fb[0]),
+                       ("arc", fb[0], fb[1], fb[2]), ("line", fb[2], fa[0]),
+                       ("arc", fa[0], fa[1], fa[2]), ("line", fa[2], (depth, s0)),
+                       ("line", (depth, s0), ca[0]), ("arc", ca[0], ca[1], ca[2]),
+                       ("line", ca[2], pa)]
+        else:
+            cb = _fillet_corner_2d(pb, (depth, width), (depth, 0.0), relief)
+            ca = _fillet_corner_2d((depth, width), (depth, 0.0), pa, relief)
+            section = [("line", pa, pb), ("line", pb, cb[0]), ("arc", cb[0], cb[1], cb[2]),
+                       ("line", cb[2], ca[0]), ("arc", ca[0], ca[1], ca[2]), ("line", ca[2], pa)]
+        ledge = cls._outline_face(sf["a3"], sf["tip2"], fr["axis"], section)
+        return [(slope, ""), (bend2, "_step"), (ledge, "_ledge")]
+
+    @classmethod
+    def _tab_arm_face(cls, a, b, tip: Vec3, axis: Vec3, height_mm: float, tabs,
+                      root_r_mm: float = MIN_NEUTRAL_PLANE_RADIUS_MM):
         """立ち上がり + 半円の溶接タブ(実車1285-18)。tabs = [(根本エッジ上の位置 s, 半径 r), ...]。
-        タブは高さ height の上端に載る半円で、円の中心が溶接点。"""
+        タブは高さ height の上端に載る半円で、円の中心が溶接点。根元に凹R(root_r)。"""
         width = math.dist(a, b)
-        order = sorted(tabs, key=lambda t: -t[0])
-        for s_c, r in order:
-            if s_c - r < 0.5 or s_c + r > width - 0.5:
-                raise ValueError("a weld tab runs off the end of the upstand. Infeasible.")
-        for (s1, r1), (s2, r2) in zip(order, order[1:]):
-            if s1 - r1 < s2 + r2 + 1.0:
-                raise ValueError("weld tabs overlap. Infeasible.")
         section = [("line", (0.0, 0.0), (0.0, width)), ("line", (0.0, width), (height_mm, width))]
-        cursor = width
-        for s_c, r in order:
-            section.append(("line", (height_mm, cursor), (height_mm, s_c + r)))
-            section.append(("arc", (height_mm, s_c + r), (height_mm + r, s_c), (height_mm, s_c - r)))
-            cursor = s_c - r
-        section.append(("line", (height_mm, cursor), (height_mm, 0.0)))
+        section += tab_top_section(height_mm, tabs, width, 0.0, root_r_mm)
         section.append(("line", (height_mm, 0.0), (0.0, 0.0)))
         return cls._outline_face(a, tip, axis, section)
 

@@ -408,6 +408,34 @@ def _channel_variants(spec, count: int):
     return out
 
 
+def _drawn_variants(spec, count: int):
+    """絞りトレイ: 曲げタブの長さ(締結点 + 座面を含む最小値から)と継ぎ目のR。"""
+    dr = spec.drawn
+    b = spec.min_bearing_radius_mm
+    out = []
+    # フィレットは3本(継ぎ目と壁の根本)を同じ半径で振る(半径が違うと縁が自由曲線になる)。
+    # 大きくするとハブの点がフィレット帯に掛かりうるので、小さい側だけ振る。
+    for r in _quantile_values(6.0, dr["seam_fillet_mm"], dr["seam_fillet_mm"], count):
+        walls = {k: dict(w, fillet_mm=r, tangent_mm=r * math.tan(math.radians(w["fold_deg"]) / 2.0))
+                 for k, w in dr["walls"].items()}
+        out.append(Variant("fillet_r", _fmt(r),
+                           dataclasses.replace(spec, drawn=dict(dr, seam_fillet_mm=r, walls=walls)),
+                           None, None, None, {"drawn.fillet_mm": [dr["seam_fillet_mm"], r]}))
+    need = {}
+    for arm in dr["arms"]:
+        # 腕上の点: 腕面の法線と一致する点の、根本からの高さの最大 + 座面 + 先端逃げ
+        need[arm["edge"]] = 2.0 * b + 2.0
+    for delta in (0.0, 10.0, 20.0):
+        arms = [dict(a, length_mm=min(max(need[a["edge"]] + delta, 25.0), 55.0)) for a in dr["arms"]]
+        if all(abs(a["length_mm"] - o["length_mm"]) < NEAR_MM for a, o in zip(arms, dr["arms"])):
+            continue
+        out.append(Variant("arm_len", f"d{delta:.0f}", dataclasses.replace(spec, drawn=dict(dr, arms=arms)),
+                           None, None, None,
+                           {"drawn.arms.length_mm": [[a["length_mm"] for a in dr["arms"]],
+                                                     [a["length_mm"] for a in arms]]}))
+    return out
+
+
 # ---------------------------------------------------------------- 入口
 
 def propose_variants(meta: dict, *, count: int = 8, rng: random.Random | None = None):
@@ -429,6 +457,8 @@ def propose_variants(meta: dict, *, count: int = 8, rng: random.Random | None = 
         groups.append(_branch_variants(spec, 3))
     elif spec.channel is not None:                # channel_seat
         groups.append(_channel_variants(spec, 3))
+    elif spec.drawn is not None:                  # drawn_tray
+        groups.append(_drawn_variants(spec, 3))
     else:
         raise ValueError(f"unknown kind {kind}")
     # 交互に取る(側 -> slack -> 幅 -> ビード -> リブ -> 側の2つ目 ...)
@@ -448,6 +478,13 @@ def build_variant(builder, variant: Variant, out_dir: str, name: str):
     """バリアントをビルドする。フランジのキラリティ再試行(`build_general_part`)は
     knob を勝手に変えるので**使わない** — 指定した設計がそのまま成立するかだけを見る。"""
     spec = variant.spec
+    if spec.drawn is not None:
+        dr = spec.drawn
+        return builder.build_drawn_tray(
+            dr["hub_xy"], dr["walls"], dr["arms"], origin=tuple(dr["origin"]),
+            hub_u=tuple(dr["hub_u"]), hub_v=tuple(dr["hub_v"]), seam_fillet_mm=dr["seam_fillet_mm"],
+            corner_radius=dr["corner_radius"], out_dir=out_dir, part_name=name,
+            check_points=spec.annotated_points)
     if spec.channel is not None:
         geom = {k: (tuple(v) if isinstance(v, list) else v) for k, v in spec.channel.items()
                 if k not in ("diag_deg", "seat_width_mm")}
