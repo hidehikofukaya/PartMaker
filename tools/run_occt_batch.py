@@ -73,7 +73,9 @@ def main() -> None:
     if out_dir.exists() and any(out_dir.iterdir()):
         raise SystemExit(f"{out_dir} は既に存在する。")
 
-    wanted = {e["kind"]: e["count"] for e in recipe["parts"]}
+    wanted: collections.Counter = collections.Counter()   # 同じ kind の複数エントリを足す
+    for e in recipe["parts"]:
+        wanted[e["kind"]] += int(e["count"])
     print(f"{family}/chunk_{chunk:02d}: {sum(wanted.values())}部品 {wanted} / seed {seed}",
           flush=True)
     labels_by_part: dict[str, tuple] = {}
