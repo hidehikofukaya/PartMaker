@@ -9,16 +9,17 @@ import math
 import random
 
 from synthetic_generator.families import (
-    BOX_MAX_POINTS, BOX_WALL_FOLD_DEG, BOX_WALL_HEIGHT_MM, BOX_WELD_BEARING_MM, Knobs,
-    box_bracket_part,
+    BOX_CORNER_R_MM, BOX_CORNER_R_OVER_T, BOX_DRAW_RATIO, BOX_GROUPS, BOX_MAX_POINTS,
+    BOX_WALL_FOLD_DEG, BOX_WALL_HEIGHT_MM, BOX_WELD_BEARING_MM, Knobs, box_bracket_part,
 )
+from synthetic_generator.occt_build import box_frames
 
 
-def _draw(count: int = 40):
+def _draw(count: int = 40, group: str | None = None):
     rng = random.Random(20260908)
     out = []
     while len(out) < count:
-        got = box_bracket_part(rng, Knobs())
+        got = box_bracket_part(rng, Knobs(box_group=group))
         if got is not None:
             out.append(got[0])
     return out
@@ -120,3 +121,43 @@ def test_factors_span_their_ranges():
             seen[k].add(v)
     for k in ("sides", "walls", "closed", "tabs", "flanges", "arms", "points"):
         assert len(seen[k]) >= 3, (k, sorted(seen[k]))
+
+
+def test_group_targeting_gives_exactly_that_structure():
+    """plate = 壁なし+腕 / bend = 壁はあるが角の連結なし / draw = 角を連結(絞り)。"""
+    for group in BOX_GROUPS:
+        for spec in _draw(15, group=group):
+            bx = spec.box
+            assert bx["group"] == group
+            if group == "plate":
+                assert not bx["walls"] and bx["arms"]
+            elif group == "bend":
+                assert bx["walls"] and not bx["closed"]
+            else:
+                assert bx["closed"]
+
+
+def test_corner_radius_respects_the_real_floor():
+    """角のR / 板厚 の下限は実車の最小 2.4(2026-09-08 実測、002+1285 の109箇所)。"""
+    for spec in _draw(40):
+        bx = spec.box
+        assert bx["corner_r_mm"] >= BOX_CORNER_R_OVER_T * spec.thickness_mm - 1e-9
+        assert BOX_CORNER_R_MM[0] - 1e-9 <= bx["corner_r_mm"] <= BOX_CORNER_R_MM[1] + 1e-9
+        assert all(w["fillet_mm"] == bx["corner_r_mm"] for w in bx["walls"].values())
+
+
+def test_draw_depth_stays_inside_the_real_envelope():
+    """継ぎ目の長さ lam = min(h_i / dt_i) が draw_ratio * R を超えない
+    (実車の深さ/R は 最大 11.06。角の無い壁は絞りではないので対象外)。"""
+    cap = BOX_DRAW_RATIO[-1][0][1]
+    for spec in _draw(40, group="draw"):
+        bx = spec.box
+        lay = box_frames([tuple(q) for q in bx["hub_xy"]],
+                         {int(k): w for k, w in bx["walls"].items()}, set(bx["closed"]),
+                         origin=tuple(bx["origin"]), hub_u=tuple(bx["hub_u"]),
+                         hub_v=tuple(bx["hub_v"]))
+        for k, seam in lay["seams"].items():
+            kx, ky = seam["edges"]
+            lam = min(lay["walls"][kx]["ends"]["right"]["t"] / lay["walls"][kx]["ends"]["right"]["dt"],
+                      lay["walls"][ky]["ends"]["left"]["t"] / lay["walls"][ky]["ends"]["left"]["dt"])
+            assert lam <= cap * bx["corner_r_mm"] + 1e-6, (lam, bx["corner_r_mm"])
