@@ -2267,6 +2267,240 @@ def _box_points(rng, lay, hub_xy, walls, spans, flanges, arms, n, b, weld_b, nor
     return points, radii, owners
 
 
+# ---- 大型パネル族(実車002-002/017/049/062/003/088/033 ほか)。幅の広い帯に
+#      ビードを複数本並べ、側辺に壁と腕を付け、締結点を多く載せる。
+#      裁定(2026-09-08): 帯幅は実車 p75 に合わせて幅 ~120mm(半幅 60)まで、
+#      ビードは複数本・全長を走る、締結点は 20 まで。
+PANEL_HALF_WIDTH_MM = (35.0, 60.0)
+PANEL_BEARING_MM = (12.5, 17.0)   # 幅にビードを並べる余地を残す(既定の 12.5〜25 では入らない)
+PANEL_DISTANCE_MM = (180.0, 420.0)  # 実車の長さ(中央222 / p75 396)に寄せる
+PANEL_BEADS = ((1, 0.20), (2, 0.35), (3, 0.25), (4, 0.20))
+PANEL_BEAD_DEPTH_MM = (3.5, 8.0)
+PANEL_BEAD_TOP_MM = (6.0, 15.0)
+PANEL_BEAD_WALL_DEG = (50.0, 78.0)
+PANEL_BEAD_RIDGE_MM = (1.5, 4.0)
+PANEL_BEAD_GAP_MM = (4.0, 18.0)
+PANEL_WALLS = ((0, 0.30), (1, 0.35), (2, 0.35))
+PANEL_ARMS = ((0, 0.20), (1, 0.25), (2, 0.25), (3, 0.20), (4, 0.10))
+PANEL_MAX_POINTS = 20
+PANEL_POINT_ATTEMPTS = 600
+PANEL_TABS = ((0, 0.35), (1, 0.35), (2, 0.30))
+
+
+def _panel_beads(rng: random.Random, bearing_mm: float):
+    """幅方向にビードを並べる。中心は締結アンカーが載るので必ず平地で残す。
+    帯幅はビードの配置が決まってから「外側の平地」を足して決める(先に幅を引くと
+    大きなビードのときに本数が入らない)。戻り値は (配置, 片側フットプリント, 外端)。"""
+    n = _draw_weighted(rng, PANEL_BEADS)
+    # 本数が多いほど 1 本あたりの幅を詰める(帯幅が決まっている以上、当然の従属)。
+    k = n - 1
+    wall = rng.uniform(PANEL_BEAD_WALL_DEG[0] + 5.0 * k, PANEL_BEAD_WALL_DEG[1])
+    ridge = rng.uniform(PANEL_BEAD_RIDGE_MM[0], max(PANEL_BEAD_RIDGE_MM[0] + 0.5,
+                                                    PANEL_BEAD_RIDGE_MM[1] - 0.4 * k))
+    bead = BeadParams(depth_mm=rng.uniform(PANEL_BEAD_DEPTH_MM[0],
+                                           max(PANEL_BEAD_DEPTH_MM[0] + 1.0,
+                                               PANEL_BEAD_DEPTH_MM[1] - 1.2 * k)),
+                      top_width_mm=rng.uniform(PANEL_BEAD_TOP_MM[0],
+                                               max(PANEL_BEAD_TOP_MM[0] + 2.0,
+                                                   PANEL_BEAD_TOP_MM[1] - 2.0 * k)),
+                      wall_angle_deg=wall, ridge_radius_mm=ridge,
+                      corner_radius_mm=rng.uniform(3.0, 6.0))
+    theta = math.radians(wall)
+    sb = ridge * math.tan(theta / 2.0)
+    fp = bead.half_footprint_mm + sb
+    if bead.top_width_mm / 2.0 <= sb + 0.2:
+        return None
+    if bead.depth_mm - 2.0 * sb * math.sin(theta) <= 0.5:
+        return None      # 壁が稜線Rと足Rに食われて反転する
+    centre_land = bearing_mm + 2.0        # アンカーの座面
+    gap = rng.uniform(PANEL_BEAD_GAP_MM[0], max(PANEL_BEAD_GAP_MM[0] + 1.0,
+                                                PANEL_BEAD_GAP_MM[1] - 4.0 * k))
+    left = n // 2 + (n % 2 if rng.random() < 0.5 else 0)
+    counts = {-1: left, 1: n - left}
+    out = []
+    for side, k in counts.items():
+        for j in range(k):
+            out.append((side * (centre_land + fp + j * (2.0 * fp + gap)), bead))
+    outer = max(abs(y) for y, _bd in out) + fp
+    return sorted(out, key=lambda q: q[0]), fp, outer
+
+
+def _panel_lands(spans, half_width_mm: float, bearing_mm: float):
+    """ビードの間と外の平地 [(lo, hi), ...]。座面 2b が入る幅のものだけ返す。"""
+    lands, cursor = [], -half_width_mm
+    for lo, hi in sorted(spans):
+        if lo - cursor >= 2.0 * bearing_mm:
+            lands.append((cursor, lo))
+        cursor = hi
+    if half_width_mm - cursor >= 2.0 * bearing_mm:
+        lands.append((cursor, half_width_mm))
+    return lands
+
+
+def panel_part(rng: random.Random, knobs: Knobs) -> Result | None:
+    """大型パネル: 幅の広い帯 + 複数のビード + 側辺の壁と腕 + 多点締結。"""
+    for _ in range(knobs.attempts):
+        try:
+            spec = _draw_spec(rng, dataclasses.replace(
+                knobs,
+                bearing_radius_mm=knobs.bearing_radius_mm or PANEL_BEARING_MM,
+                distance_mm=knobs.distance_mm or PANEL_DISTANCE_MM))
+        except ValueError:
+            continue
+        b = spec.min_bearing_radius_mm
+        got = _panel_beads(rng, b)
+        if got is None:
+            continue
+        beads, fp, outer = got
+        # 外側の平地。1/3 は締結点が置ける幅(2b)、1/3 は隅の逃げが収まる幅(b + 2)、
+        # 1/3 は最小(4mm)。最小にするとビードを多く並べられる。
+        roll = rng.random()
+        edge_land = (2.0 * b + 2.0) if roll < 0.34 else ((b + 2.0) if roll < 0.67 else 4.0)
+        hw_lo = max(PANEL_HALF_WIDTH_MM[0], 2.0 * b + 12.0, outer + edge_land)
+        if hw_lo > PANEL_HALF_WIDTH_MM[1]:
+            continue
+        half_width = rng.uniform(hw_lo, PANEL_HALF_WIDTH_MM[1])
+        spec = dataclasses.replace(spec, half_width_mm=half_width)
+        try:
+            plan = plan_for(spec)
+            # ビードが曲げを跨ぐと頂部の半径が負になりうる(面が折り返す)。単一ビード族と
+            # 同じ判定をここでも通す — 通さないと 180 度の折り返しで 2 割が落ちる。
+            check_bead_feasible_occt(plan, beads[0][1], spec.bend_radius_mm)
+            steps, _w = sweep_steps(plan, spec.bend_radius_mm)
+        except ValueError:
+            continue
+        n_panels = len(steps)
+        spans = [(y - fp, y + fp) for y, _bd in beads]
+        lands = _panel_lands(spans, half_width, b)
+        if not lands:
+            continue
+
+        # ---- 側辺の壁と腕(合成族と同じ仕組み)
+        arms: list = []
+        taken: dict = {}
+        used_sides: set = set()
+        for _w_i in range(_draw_weighted(rng, PANEL_WALLS)):
+            free = _compose_free_segments(steps, taken, b, n_panels)
+            cands = [(k, s, seg) for (k, s), segs in free.items() for seg in segs
+                     if seg[1] - seg[0] >= 30.0 and s not in used_sides]
+            if not cands:
+                break
+            k, side, (s0, s1) = rng.choice(cands)
+            width = max(25.0, (s1 - s0) * rng.uniform(*COMPOSE_WALL_SHARE))
+            t0 = rng.uniform(s0, s1 - width)
+            height = rng.uniform(*COMPOSE_WALL_HEIGHT_MM)
+            arms.append({"panel": k, "side": side, "t0_mm": t0, "t1_mm": t0 + width,
+                         "fold_deg": rng.uniform(*COMPOSE_WALL_FOLD_DEG),
+                         "radius_mm": rng.uniform(*COMPOSE_ARM_R_MM), "length_mm": height,
+                         "relief_mm": min(ARM_TIP_RELIEF_MM, 0.5 * height - 1.0),
+                         "outline": {"kind": "rect"}, "role": "wall", "points": []})
+            taken.setdefault((k, side), []).append((t0, t0 + width))
+            used_sides.add(side)
+        tabs_left = _draw_weighted(rng, PANEL_TABS)
+        for _a_i in range(_draw_weighted(rng, PANEL_ARMS)):
+            free = _compose_free_segments(steps, taken, b, n_panels)
+            cands = [(k, s, seg) for (k, s), segs in free.items() for seg in segs
+                     if seg[1] - seg[0] >= 2.0 * b + 6.0]
+            if not cands:
+                break
+            k, side, (s0, s1) = rng.choice(cands)
+            width = rng.uniform(max(2.0 * b + 4.0, 0.4 * (s1 - s0)), s1 - s0)
+            t0 = rng.uniform(s0, s1 - width)
+            length = rng.uniform(*COMPOSE_ARM_LENGTH_MM)
+            with_tab = tabs_left > 0 and width > 4.0 * COMPOSE_WELD_BEARING_MM[1]
+            if with_tab:
+                tab_r = rng.uniform(*COMPOSE_WELD_BEARING_MM)
+                tabs = _tabs_on(rng, tab_r, 2.0, width - 2.0, count=1)
+                outline = ({"kind": "tabs", "height_mm": length, "tabs": tabs}
+                           if tabs else {"kind": "rect"})
+                if tabs:
+                    tabs_left -= 1
+            else:
+                outline = {"kind": "rect"}
+            arms.append({"panel": k, "side": side, "t0_mm": t0, "t1_mm": t0 + width,
+                         "fold_deg": rng.uniform(*COMPOSE_ARM_FOLD_DEG),
+                         "radius_mm": rng.uniform(*COMPOSE_ARM_R_MM), "length_mm": length,
+                         "relief_mm": ARM_TIP_RELIEF_MM, "outline": outline,
+                         "role": "arm", "points": []})
+            taken.setdefault((k, side), []).append((t0, t0 + width))
+
+        points, radii = _panel_points(rng, spec, steps, arms, lands, b, n_panels)
+        if points is None or len(points) < 2:
+            continue
+
+        panel = {"half_width_mm": half_width, "beads": [[y, dataclasses.asdict(bd)]
+                                                        for y, bd in beads],
+                 "bead_spans": [list(s) for s in spans], "lands": [list(s) for s in lands],
+                 "arms": arms, "point_radii": radii,
+                 "factors": {"folds": len(steps) - 1, "beads": len(beads),
+                             "walls": sum(1 for a in arms if a["role"] == "wall"),
+                             "arms": sum(1 for a in arms if a["role"] == "arm"),
+                             "tabs": sum(1 for a in arms
+                                         if a["outline"]["kind"] == "tabs"),
+                             "points": len(points),
+                             "half_width_mm": round(half_width, 1)}}
+        return (dataclasses.replace(spec, point1=points[0], point2=points[1], extra_points=(),
+                                    annotated_points=tuple(points), panel=panel),
+                None, None, None)
+    return None
+
+
+def _panel_points(rng, spec, steps, arms, lands, bearing, n_panels):
+    """締結点: 帯の両端のアンカー + 平地の上 + 腕の上。最大 20。"""
+    points: list = []
+    radii: list = []
+    # アンカー(掃引の解が置く2点)。中心線上(y=0)なので中央の平地に載る。
+    points.append(spec.point1)
+    points.append(spec.point2)
+    radii += [bearing, bearing]
+
+    for arm in arms:
+        if arm["role"] == "wall":
+            continue
+        fr = compose_arm_frame(steps[arm["panel"]], arm["side"], arm["t0_mm"], arm["t1_mm"],
+                               spec.half_width_mm, arm["fold_deg"], arm["radius_mm"])
+        width = arm["t1_mm"] - arm["t0_mm"]
+        if arm["outline"]["kind"] == "tabs":
+            for s_c, r in arm["outline"]["tabs"]:
+                pos = tuple(fr["a"][i] + arm["length_mm"] * fr["tip"][i] + s_c * fr["axis"][i]
+                            for i in range(3))
+                points.append(FasteningPoint(position_xyz=pos, normal_xyz=fr["normal"]))
+                radii.append(r)
+                arm["points"].append([arm["length_mm"], s_c, "weld"])
+            continue
+        if arm["length_mm"] < 2.0 * bearing + 2.0 or width < 2.0 * bearing + 2.0:
+            continue
+        t = rng.uniform(bearing + 1.0, arm["length_mm"] - bearing)
+        s = rng.uniform(bearing + 1.0, width - bearing - 1.0)
+        pos = tuple(fr["a"][i] + t * fr["tip"][i] + s * fr["axis"][i] for i in range(3))
+        points.append(FasteningPoint(position_xyz=pos, normal_xyz=fr["normal"]))
+        radii.append(bearing)
+        arm["points"].append([t, s, "bolt"])
+
+    # 平地の上に散らす
+    for _ in range(PANEL_POINT_ATTEMPTS):
+        if len(points) >= PANEL_MAX_POINTS:
+            break
+        k = rng.randrange(n_panels)
+        st = steps[k]
+        lo = (bearing + 2.0) if k == 0 else 0.0
+        hi = st["length"] - ((bearing + 2.0) if k == n_panels - 1 else 0.0)
+        if hi - lo < 2.0 * bearing:
+            continue
+        t = rng.uniform(lo + bearing, hi - bearing)
+        y_lo, y_hi = rng.choice(lands)
+        if y_hi - y_lo < 2.0 * bearing:
+            continue
+        y = rng.uniform(y_lo + bearing, y_hi - bearing)
+        pos = tuple(st["origin"][j] + t * st["direction"][j] + y * st["ey"][j]
+                    for j in range(3))
+        if any(math.dist(pos, q.position_xyz) < 2.0 * bearing + 2.0 for q in points):
+            continue
+        points.append(FasteningPoint(position_xyz=pos, normal_xyz=tuple(st["ez"])))
+        radii.append(bearing)
+    return points, radii
+
+
 FAMILIES = {
     "bead": bead_part,
     "flange": flange_part,
@@ -2282,6 +2516,7 @@ FAMILIES = {
     "drawn_tray": drawn_tray_part,
     "compose": compose_part,
     "box_bracket": box_bracket_part,
+    "panel": panel_part,
 }
 
 
