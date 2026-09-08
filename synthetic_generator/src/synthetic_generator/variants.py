@@ -440,6 +440,76 @@ def _drawn_variants(spec, count: int):
     return out
 
 
+def _box_variants(spec, count: int):
+    """多面ブラケット: 締結点が決めていない選択 = 角のR・腕の長さ・深さ2フランジの長さ・
+    締結点の載っていない壁の高さ。点を保持している要素は動かさない(`point_owners`)。"""
+    bx = spec.box
+    b = spec.min_bearing_radius_mm
+    owners = set(bx.get("point_owners") or ())
+    out = []
+    # 角のR: 大きくするとハブ上の点がフィレット帯に掛かりうるので小さい側だけ振る
+    for r in _quantile_values(4.0, bx["corner_r_mm"], bx["corner_r_mm"], count):
+        walls = {k: dict(w, fillet_mm=r,
+                         tangent_mm=r * math.tan(math.radians(w["fold_deg"]) / 2.0))
+                 for k, w in bx["walls"].items()}
+        out.append(Variant("corner_r", _fmt(r),
+                           dataclasses.replace(spec, box=dict(bx, corner_r_mm=r, walls=walls)),
+                           None, None, None,
+                           {"box.corner_r_mm": [bx["corner_r_mm"], r]}))
+    # 腕の長さ(点が載っていれば座面が入る最小長は保つ)
+    if bx["arms"]:
+        for delta in (0.0, 10.0, 20.0):
+            arms = []
+            for a in bx["arms"]:
+                floor = 2.0 * b + 2.0 if f"arm_{a['edge']}" in owners else 15.0
+                arms.append(dict(a, length_mm=min(max(floor + delta, 18.0), 55.0)))
+            if all(abs(a["length_mm"] - o["length_mm"]) < NEAR_MM
+                   for a, o in zip(arms, bx["arms"])):
+                continue
+            out.append(Variant("arm_len", f"d{delta:.0f}",
+                               dataclasses.replace(spec, box=dict(bx, arms=arms)),
+                               None, None, None,
+                               {"box.arms.length_mm": [[a["length_mm"] for a in bx["arms"]],
+                                                       [a["length_mm"] for a in arms]]}))
+    # 深さ2フランジの長さ
+    if bx["flanges"]:
+        for delta in (0.0, 8.0, 16.0):
+            fls = []
+            for i, f in enumerate(bx["flanges"]):
+                floor = 2.0 * b + 2.0 if f"flange_{i}" in owners else 12.0
+                fls.append(dict(f, length_mm=min(max(floor + delta, 12.0), 45.0)))
+            if all(abs(f["length_mm"] - o["length_mm"]) < NEAR_MM
+                   for f, o in zip(fls, bx["flanges"])):
+                continue
+            out.append(Variant("flange_len", f"d{delta:.0f}",
+                               dataclasses.replace(spec, box=dict(bx, flanges=fls)),
+                               None, None, None,
+                               {"box.flanges.length_mm": [[f["length_mm"] for f in bx["flanges"]],
+                                                          [f["length_mm"] for f in fls]]}))
+    # 締結点の載っていない壁の高さ(タブが載っている壁は動かせない)
+    free = [k for k, w in bx["walls"].items()
+            if f"wall_{k}" not in owners and not w["tabs"]
+            and not any(str(f["wall"]) == str(k) for f in bx["flanges"])]
+    if free:
+        for scale in (0.6, 1.4):
+            walls = dict(bx["walls"])
+            moved = False
+            for k in free:
+                w = bx["walls"][k]
+                h = min(max(w["height_mm"] * scale, w["tangent_mm"] + 8.0), 60.0)
+                if abs(h - w["height_mm"]) >= NEAR_MM:
+                    walls[k] = dict(w, height_mm=h)
+                    moved = True
+            if moved:
+                out.append(Variant("wall_h", f"x{scale:.1f}",
+                                   dataclasses.replace(spec, box=dict(bx, walls=walls)),
+                                   None, None, None,
+                                   {"box.walls.height_mm": [
+                                       {k: bx["walls"][k]["height_mm"] for k in free},
+                                       {k: walls[k]["height_mm"] for k in free}]}))
+    return out
+
+
 def _structure_variants(spec, bead, flange, rib, rng):
     """合成族の構造変種(依頼 原則 C)。同じ締結点に対して構造だけを変える。
     腕を消す変種は腕の上に締結点が無い部品だけ(裁定 2026-09-06)。切欠き・壁腕・断面の
@@ -510,6 +580,8 @@ def propose_variants(meta: dict, *, count: int = 8, rng: random.Random | None = 
         groups.append(_channel_variants(spec, 3))
     elif spec.drawn is not None:                  # drawn_tray
         groups.append(_drawn_variants(spec, 3))
+    elif spec.box is not None:                    # box_bracket(多面ブラケット)
+        groups.append(_box_variants(spec, 3))
     elif spec.compose is not None:                # 合成族: 構造レベルの変種
         groups.append(_structure_variants(spec, bead, flange, rib, rng))
     else:
@@ -531,6 +603,15 @@ def build_variant(builder, variant: Variant, out_dir: str, name: str):
     """バリアントをビルドする。フランジのキラリティ再試行(`build_general_part`)は
     knob を勝手に変えるので**使わない** — 指定した設計がそのまま成立するかだけを見る。"""
     spec = variant.spec
+    if spec.box is not None:
+        bx = spec.box
+        return builder.build_box_bracket(
+            [tuple(q) for q in bx["hub_xy"]], {int(k): w for k, w in bx["walls"].items()},
+            set(bx["closed"]), bx["arms"], origin=tuple(bx["origin"]),
+            hub_u=tuple(bx["hub_u"]), hub_v=tuple(bx["hub_v"]),
+            corner_r_mm=bx["corner_r_mm"], out_dir=out_dir, part_name=name,
+            flanges=bx["flanges"], check_points=spec.annotated_points,
+            check_radii=tuple(bx.get("point_radii", ())))
     if spec.drawn is not None:
         dr = spec.drawn
         return builder.build_drawn_tray(

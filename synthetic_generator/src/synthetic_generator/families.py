@@ -25,8 +25,8 @@ import random
 from synthetic_generator.bead import BeadParams, sample_bead
 from synthetic_generator.classify import FasteningPoint, classify
 from synthetic_generator.occt_build import (
-    ARM_TIP_RELIEF_MM, branch_frames, channel_seat_frames, compose_arm_frame, drawn_notch_mm,
-    drawn_tray_frames, step_frame, sweep_steps, tab_footprint_mm,
+    ARM_TIP_RELIEF_MM, box_frames, branch_frames, channel_seat_frames, compose_arm_frame,
+    drawn_notch_mm, drawn_tray_frames, step_frame, sweep_steps, tab_footprint_mm,
 )
 from synthetic_generator.classify import MIN_NEUTRAL_PLANE_RADIUS_MM
 from synthetic_generator.flange import (
@@ -1120,12 +1120,15 @@ DRAWN_HUB_POINTS = 2
 DRAWN_POINT_ATTEMPTS = 80
 
 
-def _tabs_on(rng, b, lo, hi, root_r=MIN_NEUTRAL_PLANE_RADIUS_MM):
+def _tabs_on(rng, b, lo, hi, root_r=MIN_NEUTRAL_PLANE_RADIUS_MM, count=None):
     """[lo, hi] の区間に半径 b のタブ(根元R root_r つき)を 2〜3(入らなければ減らす)。
-    位置は余白を弱い乱数で配る。占有幅はタブ + 根元R の片側幅 f = sqrt(b^2 + 2 b root_r)。"""
+    位置は余白を弱い乱数で配る。占有幅はタブ + 根元R の片側幅 f = sqrt(b^2 + 2 b root_r)。
+    count を渡すとその本数から始める(0 なら空)。"""
     f = tab_footprint_mm(b, root_r)
     usable = hi - lo
-    count = _draw_weighted(rng, DRAWN_TAB_COUNT_WEIGHTS)
+    if count == 0:
+        return []
+    count = _draw_weighted(rng, DRAWN_TAB_COUNT_WEIGHTS) if count is None else count
     while count > 1 and usable < count * 2.0 * f + (count - 1) * 1.0 + 1.2:
         count -= 1
     slack = usable - (count * 2.0 * f + (count - 1) * 1.0 + 1.2)
@@ -1706,6 +1709,318 @@ def _draw_weighted_label(rng: random.Random, weights):
     return weights[-1][0]
 
 
+# ---- 多面ブラケット族(実車002-024)。ハブ多角形 + 壁(隣り合えば角を連結 = 絞り) +
+#      壁の上端から折る深さ2のフランジ + 壁の無い辺の腕 + 溶接タブ。
+BOX_HUB_SIDES = ((4, 0.45), (5, 0.20), (6, 0.20), (3, 0.15))
+BOX_HUB_RADIUS_MM = (45.0, 95.0)            # 多角形(5,6角)の外接半径
+BOX_HUB_JITTER = 0.16                       # 頂点半径のばらつき(凸を保てる範囲)
+BOX_QUAD_LEN_MM = (70.0, 170.0)             # 四角形のハブ
+BOX_QUAD_WID_MM = (55.0, 130.0)
+BOX_QUAD_SKEW = (0.0, 0.28)                 # 上辺の食い込み(台形)
+BOX_TRI_R_MM = (55.0, 100.0)
+BOX_CORNER_R_MM = (4.0, 10.0)               # 角のR。1部品で全部そろえる(ゲートAの都合)
+BOX_WALL_P = (0.30, 0.90)                   # 辺に壁を立てる確率(部品ごとに引く)
+BOX_WALL_FOLD_DEG = (60.0, 115.0)
+BOX_WALL_HEIGHT_MM = (14.0, 60.0)
+BOX_WALL_TABS = ((0, 0.35), (1, 0.40), (2, 0.25))
+BOX_WELD_BEARING_MM = (7.5, 11.0)           # タブ溶接(実車相当)
+BOX_BEARING_MM = (12.5, 20.0)
+BOX_ARMS = ((0, 0.40), (1, 0.35), (2, 0.25))
+BOX_ARM_FOLD_DEG = (60.0, 110.0)
+BOX_ARM_R_MM = (5.0, 15.0)
+BOX_ARM_LENGTH_MM = (20.0, 50.0)
+BOX_FLANGES = ((0, 0.40), (1, 0.35), (2, 0.25))
+BOX_FLANGE_FOLD_DEG = (45.0, 110.0)
+BOX_FLANGE_LENGTH_MM = (14.0, 40.0)
+BOX_FLANGE_R_MM = (4.0, 10.0)
+BOX_FLANGE_MIN_ROOT_MM = 18.0
+BOX_HUB_POINTS = ((0, 0.25), (1, 0.35), (2, 0.25), (3, 0.15))
+BOX_WALL_POINT_P = 0.35                     # 壁の面に締結点を置く確率
+BOX_POINT_ATTEMPTS = 60
+BOX_MAX_POINTS = 10
+BOX_TAPER_SHARE = (0.25, 0.5)
+
+
+def _box_hub(rng: random.Random, n: int):
+    """反時計回りの凸多角形。四角形は台形、3/5/6角形は半径をばらした正多角形。"""
+    if n == 4:
+        length = rng.uniform(*BOX_QUAD_LEN_MM)
+        width = rng.uniform(*BOX_QUAD_WID_MM)
+        s0 = length * rng.uniform(*BOX_QUAD_SKEW)
+        s1 = length * rng.uniform(*BOX_QUAD_SKEW)
+        if length - s0 - s1 < 30.0:
+            return None
+        return [(0.0, 0.0), (length, 0.0), (length - s1, width), (s0, width)]
+    radius = rng.uniform(*(BOX_TRI_R_MM if n == 3 else BOX_HUB_RADIUS_MM))
+    phase = rng.uniform(0.0, 2.0 * math.pi)
+    xy = []
+    for i in range(n):
+        r = radius * (1.0 + rng.uniform(-BOX_HUB_JITTER, BOX_HUB_JITTER))
+        a = phase + 2.0 * math.pi * i / n
+        xy.append((r * math.cos(a), r * math.sin(a)))
+    for i in range(n):                       # 凸性(反時計回り)を確認する
+        o, p, q = xy[i], xy[(i + 1) % n], xy[(i + 2) % n]
+        if (p[0] - o[0]) * (q[1] - o[1]) - (p[1] - o[1]) * (q[0] - o[0]) <= 1e-6:
+            return None
+    return xy
+
+
+def _box_gaps(lo: float, hi: float, blocked):
+    """[lo, hi] から blocked の区間を除いた空き区間。"""
+    gaps, cursor = [], lo
+    for a, b in sorted(blocked):
+        if a - cursor > 0.0:
+            gaps.append((cursor, min(a, hi)))
+        cursor = max(cursor, b)
+    if hi - cursor > 0.0:
+        gaps.append((cursor, hi))
+    return [(a, b) for a, b in gaps if b - a > 0.0]
+
+
+def box_bracket_part(rng: random.Random, knobs: Knobs) -> Result | None:
+    """実車002-024 の族: 凸多角形のハブに壁を立て、隣り合う壁は角で連結(絞り)する。
+
+    因子(部品ごとに独立に引く): 辺数 3〜6 / 各辺の壁の有無 / 壁ごとの折れ角・高さ /
+    壁の上端の溶接タブ 0〜2 / 深さ2のフランジ 0〜2 / 壁の無い辺の腕 0〜2 / 締結点 2〜10。
+    """
+    for _ in range(knobs.attempts):
+        try:
+            spec = _draw_spec(rng, knobs, folds=0)
+        except ValueError:
+            continue
+        b = rng.uniform(*(knobs.bearing_radius_mm or BOX_BEARING_MM))
+        weld_b = rng.uniform(*BOX_WELD_BEARING_MM)
+        normal = spec.point1.normal_xyz
+        u, v = _plane_basis(normal)
+        origin = spec.point1.position_xyz
+
+        n = _draw_weighted(rng, BOX_HUB_SIDES)
+        hub_xy = _box_hub(rng, n)
+        if hub_xy is None:
+            continue
+        corner_r = rng.uniform(*BOX_CORNER_R_MM)
+
+        # ---- 壁(辺ごとに独立)。隣り合う壁の角は必ず継ぎ目にする。
+        p_wall = rng.uniform(*BOX_WALL_P)
+        walls: dict = {}
+        for i in range(n):
+            if rng.random() >= p_wall:
+                continue
+            fold = rng.uniform(*BOX_WALL_FOLD_DEG)
+            tangent = corner_r * math.tan(math.radians(fold) / 2.0)
+            lo_h = max(BOX_WALL_HEIGHT_MM[0], tangent + weld_b + 6.0)
+            if lo_h > BOX_WALL_HEIGHT_MM[1]:
+                continue
+            walls[i] = {"fold_deg": fold, "height_mm": rng.uniform(lo_h, BOX_WALL_HEIGHT_MM[1]),
+                        "fillet_mm": corner_r, "tangent_mm": tangent, "tabs": [],
+                        "taper_from_mm": {}, "tab_root_r_mm": MIN_NEUTRAL_PLANE_RADIUS_MM}
+        closed = {k for k in range(n) if (k - 1) % n in walls and k % n in walls}
+        try:
+            lay = box_frames(hub_xy, walls, closed, origin=origin, hub_u=u, hub_v=v)
+        except ValueError:
+            continue
+
+        # ---- 壁ごとに「上端の使える区間」= 継ぎ目の細りとノッチを避けた [lo, hi]
+        spans: dict = {}
+        for edge, fr in lay["walls"].items():
+            w = fr["width"]
+            lo, hi = 0.0, w
+            for side in ("left", "right"):
+                end = fr["ends"][side]
+                if end is None:
+                    continue
+                notch = drawn_notch_mm(corner_r, end["turn"])
+                perp_s = end["dt"] if side == "left" else -end["dt"]
+                q_s = end["s"] + notch * perp_s
+                share = rng.uniform(*BOX_TAPER_SHARE)
+                if end["tapers"]:
+                    s_taper = end["s"] + (share * w if side == "left" else -share * w)
+                    s_taper = (max(s_taper, q_s + 0.5) if side == "left"
+                               else min(s_taper, q_s - 0.5))
+                    walls[edge]["taper_from_mm"][side] = s_taper
+                else:
+                    s_taper = q_s
+                if side == "left":
+                    lo = max(lo, s_taper)
+                else:
+                    hi = min(hi, s_taper)
+            if hi - lo < 6.0:
+                lo = hi = 0.0
+            spans[edge] = (lo, hi)
+
+        # ---- 溶接タブ(壁の上端、0〜2)
+        for edge in list(lay["walls"]):
+            lo, hi = spans[edge]
+            want = _draw_weighted(rng, BOX_WALL_TABS)
+            tabs = _tabs_on(rng, weld_b, lo, hi, count=want) if want else []
+            walls[edge]["tabs"] = tabs or []
+
+        # ---- 深さ2のフランジ(壁の上端の空き区間から折る、0〜2)
+        flanges: list = []
+        want_flanges = _draw_weighted(rng, BOX_FLANGES)
+        for edge in rng.sample(sorted(lay["walls"]), len(lay["walls"])):
+            if len(flanges) >= want_flanges:
+                break
+            lo, hi = spans[edge]
+            blocked = [(s - tab_footprint_mm(r, MIN_NEUTRAL_PLANE_RADIUS_MM) - 1.5,
+                        s + tab_footprint_mm(r, MIN_NEUTRAL_PLANE_RADIUS_MM) + 1.5)
+                       for s, r in walls[edge]["tabs"]]
+            gaps = [g for g in _box_gaps(lo + 1.5, hi - 1.5, blocked)
+                    if g[1] - g[0] >= BOX_FLANGE_MIN_ROOT_MM]
+            if not gaps:
+                continue
+            g0, g1 = max(gaps, key=lambda g: g[1] - g[0])
+            root = rng.uniform(BOX_FLANGE_MIN_ROOT_MM, g1 - g0)
+            start = rng.uniform(g0, g1 - root)
+            flanges.append({"wall": edge, "from_mm": start, "to_mm": start + root,
+                            "side": rng.choice((1, -1)),
+                            "fold_deg": rng.uniform(*BOX_FLANGE_FOLD_DEG),
+                            "radius_mm": rng.uniform(*BOX_FLANGE_R_MM),
+                            "length_mm": rng.uniform(*BOX_FLANGE_LENGTH_MM),
+                            "outline": {"kind": "rect"}, "relief_mm": ARM_TIP_RELIEF_MM})
+
+        # ---- 腕(壁の無い辺、0〜2)
+        arms: list = []
+        want_arms = _draw_weighted(rng, BOX_ARMS)
+        free_edges = [i for i in range(n) if i not in walls]
+        for edge in rng.sample(free_edges, len(free_edges)):
+            if len(arms) >= want_arms:
+                break
+            length_edge = math.dist(hub_xy[edge], hub_xy[(edge + 1) % n])
+            # 両隣に壁があればそのフィレット帯を避ける
+            m0 = walls[(edge - 1) % n]["tangent_mm"] + 3.0 if (edge - 1) % n in walls else 3.0
+            m1 = walls[(edge + 1) % n]["tangent_mm"] + 3.0 if (edge + 1) % n in walls else 3.0
+            room = length_edge - m0 - m1
+            if room < 2.0 * b + 6.0:
+                continue
+            width = rng.uniform(max(2.0 * b + 4.0, 0.5 * room), room)
+            start = m0 + rng.uniform(0.0, room - width)
+            arms.append({"edge": edge, "root_from_mm": start, "root_to_mm": start + width,
+                         "fold_deg": rng.uniform(*BOX_ARM_FOLD_DEG),
+                         "radius_mm": rng.uniform(*BOX_ARM_R_MM),
+                         "length_mm": rng.uniform(*BOX_ARM_LENGTH_MM),
+                         "relief_mm": ARM_TIP_RELIEF_MM, "outline": {"kind": "rect"}})
+
+        points, radii, owners = _box_points(rng, lay, hub_xy, walls, spans, flanges, arms,
+                                            n, b, weld_b, normal)
+        if points is None or not 2 <= len(points) <= BOX_MAX_POINTS:
+            continue
+
+        box = {"hub_xy": [list(q) for q in hub_xy], "walls": {str(k): w for k, w in walls.items()},
+               "closed": sorted(closed), "arms": arms, "flanges": flanges,
+               "origin": list(origin), "hub_u": list(u), "hub_v": list(v),
+               "corner_r_mm": corner_r, "weld_bearing_mm": weld_b,
+               "point_radii": radii, "point_owners": owners,
+               "factors": {"sides": n, "walls": len(walls), "closed": len(closed),
+                           "tabs": sum(len(w["tabs"]) for w in walls.values()),
+                           "flanges": len(flanges), "arms": len(arms),
+                           "points": len(points)}}
+        return (dataclasses.replace(spec, point1=points[0], point2=points[1], extra_points=(),
+                                    annotated_points=tuple(points), box=box,
+                                    target_folds=None, min_bearing_radius_mm=b),
+                None, None, None)
+    return None
+
+
+def _box_points(rng, lay, hub_xy, walls, spans, flanges, arms, n, b, weld_b, normal):
+    """締結点: 壁の溶接タブ / 壁の面 / 深さ2フランジ / 腕 / ハブ。半径と持ち主も併せて返す。
+
+    持ち主(`owners`)は「その点を保持している要素」。設計等価バリアントで
+    「点の載っていない要素だけ動かす」ために要る。
+    """
+    points: list = []
+    radii: list = []
+    owners: list = []
+
+    def add(pos, nrm, r, owner):
+        points.append(FasteningPoint(position_xyz=tuple(pos), normal_xyz=tuple(nrm)))
+        radii.append(r)
+        owners.append(owner)
+
+    for edge, fr in sorted(lay["walls"].items()):
+        h, tangent = fr["height"], walls[edge]["tangent_mm"]
+        for s_c, _r in walls[edge]["tabs"]:                     # タブの円の中心 = 溶接
+            add([fr["a"][i] + h * fr["tip"][i] + s_c * fr["axis"][i] for i in range(3)],
+                fr["normal"], weld_b, f"wall_{edge}")
+        lo, hi = spans[edge]
+        if rng.random() < BOX_WALL_POINT_P and hi - lo > 2.0 * b + 2.0 \
+                and h - tangent - 2.0 * b > 2.0:
+            t = rng.uniform(tangent + b, h - b)
+            s = rng.uniform(lo + b, hi - b)
+            if all(abs(s - s_c) > b + tab_footprint_mm(r_, MIN_NEUTRAL_PLANE_RADIUS_MM)
+                   for s_c, r_ in walls[edge]["tabs"]):
+                add([fr["a"][i] + t * fr["tip"][i] + s * fr["axis"][i] for i in range(3)],
+                    fr["normal"], b, f"wall_{edge}")
+
+    for fl in flanges:                                          # 深さ2のフランジの上の点
+        fr = lay["walls"][fl["wall"]]
+        root = fl["to_mm"] - fl["from_mm"]
+        if root < 2.0 * b + 2.0 or fl["length_mm"] < 2.0 * b + 2.0:
+            continue
+        h, side = fr["height"], fl["side"]
+        angle = math.radians(fl["fold_deg"])
+        n_eff = [fr["normal"][i] * side for i in range(3)]
+        tip_f = _unit([fr["tip"][i] * math.cos(angle) - n_eff[i] * math.sin(angle)
+                       for i in range(3)])
+        centre = [fr["a"][i] + h * fr["tip"][i] + fl["from_mm"] * fr["axis"][i]
+                  - n_eff[i] * fl["radius_mm"] for i in range(3)]
+        p0 = [fr["a"][i] + h * fr["tip"][i] + fl["from_mm"] * fr["axis"][i] for i in range(3)]
+        rot = [fr["axis"][i] * side for i in range(3)]
+        a2 = _rotate3(p0, centre, rot, angle)
+        t = rng.uniform(b + 1.0, fl["length_mm"] - b)
+        s = rng.uniform(b + 1.0, root - b - 1.0)
+        add([a2[i] + t * tip_f[i] + s * fr["axis"][i] for i in range(3)],
+            _unit(_cross3(tip_f, fr["axis"])), b, f"flange_{flanges.index(fl)}")
+
+    for arm in arms:                                            # 腕の上の点
+        i0, i1 = arm["edge"], (arm["edge"] + 1) % n
+        a_xy, b_xy = hub_xy[i0], hub_xy[i1]
+        d2 = _unit((b_xy[0] - a_xy[0], b_xy[1] - a_xy[1]))
+        a = lay["to_space"]((a_xy[0] + d2[0] * arm["root_from_mm"],
+                             a_xy[1] + d2[1] * arm["root_from_mm"]))
+        bpt = lay["to_space"]((a_xy[0] + d2[0] * arm["root_to_mm"],
+                               a_xy[1] + d2[1] * arm["root_to_mm"]))
+        axis = _unit([bpt[i] - a[i] for i in range(3)])
+        angle = math.radians(arm["fold_deg"])
+        outward = _unit(_cross3(axis, normal))
+        tip = [outward[i] * math.cos(angle) - normal[i] * math.sin(angle) for i in range(3)]
+        centre = [a[i] - normal[i] * arm["radius_mm"] for i in range(3)]
+        a2 = _rotate3(a, centre, axis, angle)
+        width = arm["root_to_mm"] - arm["root_from_mm"]
+        if arm["length_mm"] < 2.0 * b + 2.0 or width < 2.0 * b + 2.0:
+            continue
+        t = rng.uniform(b + 1.0, arm["length_mm"] - b)
+        s = rng.uniform(b + 1.0, width - b - 1.0)
+        add([a2[i] + t * tip[i] + s * axis[i] for i in range(3)],
+            _unit(_cross3(tip, axis)), b, f"arm_{arm['edge']}")
+
+    # ---- ハブの上の点(壁のフィレット帯・腕の根本・自由端から逃げる)
+    want = _draw_weighted(rng, BOX_HUB_POINTS)
+    margin = {i: (walls[i]["tangent_mm"] + b + 1.0 if i in walls else b + 2.0) for i in range(n)}
+    lo_x = min(q[0] for q in hub_xy)
+    hi_x = max(q[0] for q in hub_xy)
+    lo_y = min(q[1] for q in hub_xy)
+    hi_y = max(q[1] for q in hub_xy)
+    got: list = []
+    for _ in range(BOX_POINT_ATTEMPTS):
+        if len(got) >= want:
+            break
+        cand = (rng.uniform(lo_x, hi_x), rng.uniform(lo_y, hi_y))
+        if not _inside_convex(cand, hub_xy):
+            continue
+        if any(_dist_to_segment(cand, hub_xy[i], hub_xy[(i + 1) % n]) < margin[i]
+               for i in range(n)):
+            continue
+        if all(math.dist(cand, o) >= 2.0 * b + 2.0 for o in got):
+            got.append(cand)
+    for cand in got:
+        add(lay["to_space"](cand), lay["normal"], b, "hub")
+
+    if len(points) < 2:
+        return None, None, None
+    return points, radii, owners
+
+
 FAMILIES = {
     "bead": bead_part,
     "flange": flange_part,
@@ -1720,6 +2035,7 @@ FAMILIES = {
     "tab_bracket": tab_bracket_part,
     "drawn_tray": drawn_tray_part,
     "compose": compose_part,
+    "box_bracket": box_bracket_part,
 }
 
 
