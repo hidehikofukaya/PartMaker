@@ -184,7 +184,8 @@ def build_general_part(builder, spec, bead, flange, out_dir: str, part_name: str
             set(box["closed"]), box["arms"], origin=tuple(box["origin"]),
             hub_u=tuple(box["hub_u"]), hub_v=tuple(box["hub_v"]),
             corner_r_mm=box["corner_r_mm"], out_dir=out_dir, part_name=part_name,
-            flanges=box["flanges"], check_points=spec.annotated_points,
+            flanges=box["flanges"], rib=box.get("rib"), deep=box.get("deep", ()),
+            check_points=spec.annotated_points,
             check_radii=box.get("point_radii", ())), None
     # チャンネル + 座面(実車144)。
     channel = getattr(spec, "channel", None)

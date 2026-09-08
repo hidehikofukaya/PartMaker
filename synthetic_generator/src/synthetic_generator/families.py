@@ -1744,7 +1744,19 @@ BOX_FLANGE_MIN_ROOT_MM = 18.0
 BOX_DRAW_RATIO = (((1.0, 2.4), 0.50), ((2.4, 4.4), 0.25), ((4.4, 8.0), 0.15),
                   ((8.0, 11.0), 0.10))
 BOX_CORNER_R_OVER_T = 2.4                   # 角のR / 板厚 の下限(実車の最小 2.4)
-BOX_GROUPS = ("plate", "bend", "draw")      # 壁なし+腕 / 壁はあるが角の連結なし / 角を連結
+BOX_GROUPS = ("plate", "bend", "draw")      # 壁なし+腕 / 角は逃げ(曲げ) / 角を連結(絞り)
+BOX_RELIEF_MM = (8.0, 20.0)                 # 角の逃げ(壁の辺に直交するノッチ)の大きさ
+BOX_SEW_P = 0.55                            # 隣り合う壁の角を継ぎ目にする確率(既定)
+# ハブを横切るリブ(帯を台形に折る)。折り線に直交する境界が要るので四角形のハブ限定で、
+# 辺0・辺2 に壁も腕も置かないときだけ。実車002-033 のような「平板 + ビード」に対応する。
+BOX_RIB_P = 0.40
+BOX_RIB_HEIGHT_MM = (6.0, 18.0)
+BOX_RIB_FOLD_DEG = (45.0, 80.0)
+BOX_RIB_MARGIN_MM = 8.0
+BOX_DEEP_P = 0.35                           # 深さ2フランジの先端からさらに折る確率
+BOX_DEEP_FOLD_DEG = (50.0, 105.0)
+BOX_DEEP_LENGTH_MM = (12.0, 32.0)
+BOX_DEEP_MIN_ROOT_MM = 16.0
 BOX_WALLSET_TRIES = 12
 BOX_HUB_POINTS = ((0, 0.25), (1, 0.35), (2, 0.25), (3, 0.15))
 BOX_WALL_POINT_P = 0.35                     # 壁の面に締結点を置く確率
@@ -1777,6 +1789,71 @@ def _box_hub(rng: random.Random, n: int):
     return xy
 
 
+def _box_relief(xy, corners, gap_mm: float):
+    """頂点 k を「両隣の辺に直交する 2 辺の逃げ」P1 -> Q -> P2 に置き換える。
+
+    45 度の面取りだと根本フィレットの切り口が**楕円**になり、半径が大きいほど
+    「直線と円弧だけ」のゲートAを破る(R8 で 0.27mm、2026-09-08 実測)。辺に直交させると
+    切り口が円弧になり偏差 0.000mm。実車の角の逃げ(ベンドリリーフ)そのものでもある。
+
+    戻り値: (新しい多角形, 元の辺番号 -> 新しい辺番号, 残った頂点番号 -> 新しい頂点番号,
+             逃げの辺番号の集合)。逃げを入れた頂点は多角形が凹になる。
+    """
+    n = len(xy)
+    out: list = []
+    edge_map: dict = {}
+    vertex_map: dict = {}
+    notch: set = set()
+    for k in range(n):
+        prev, cur, nxt = xy[(k - 1) % n], xy[k], xy[(k + 1) % n]
+        if k not in corners:
+            vertex_map[k] = len(out)
+            out.append(cur)
+            continue
+        d0 = _unit((cur[0] - prev[0], cur[1] - prev[1]))
+        d1 = _unit((nxt[0] - cur[0], nxt[1] - cur[1]))
+        in0, in1 = (-d0[1], d0[0]), (-d1[1], d1[0])       # 反時計回りの内向き法線
+        p1 = (cur[0] - d0[0] * gap_mm, cur[1] - d0[1] * gap_mm)
+        p2 = (cur[0] + d1[0] * gap_mm, cur[1] + d1[1] * gap_mm)
+        det = in0[0] * (-in1[1]) - in0[1] * (-in1[0])
+        if abs(det) < 1e-9:
+            return None
+        rhs = (p2[0] - p1[0], p2[1] - p1[1])
+        s = (rhs[0] * (-in1[1]) - rhs[1] * (-in1[0])) / det
+        q = (p1[0] + in0[0] * s, p1[1] + in0[1] * s)
+        if not _inside_convex(q, xy):
+            return None                                   # 逃げが深すぎて外へ出る
+        notch |= {len(out), len(out) + 1}
+        out += [p1, q, p2]
+    for i in range(n):
+        edge_map[i] = _box_block_last(out, xy, corners, i)   # 元の辺 i の始点 = ブロック i の末尾
+    return out, edge_map, vertex_map, notch
+
+
+def _box_block_last(out, xy, corners, k: int) -> int:
+    """新しい多角形で、元の頂点 k のブロックの最後の点の番号(= 元の辺 k の始点)。"""
+    idx = 0
+    for j in range(len(xy)):
+        size = 3 if j in corners else 1
+        if j == k:
+            return idx + size - 1
+        idx += size
+    raise AssertionError
+
+
+def _inside_polygon(p, xy) -> bool:
+    """凹んだ多角形でも効く内外判定(レイキャスト)。"""
+    inside = False
+    n = len(xy)
+    for i in range(n):
+        a, b = xy[i], xy[(i + 1) % n]
+        if (a[1] > p[1]) != (b[1] > p[1]):
+            x = a[0] + (p[1] - a[1]) * (b[0] - a[0]) / (b[1] - a[1])
+            if p[0] < x:
+                inside = not inside
+    return inside
+
+
 def _box_draw_ratio(rng: random.Random) -> float:
     """絞りの深さ / 角のR。実車の分布(§BOX_DRAW_RATIO)から引く。"""
     roll, acc = rng.random(), 0.0
@@ -1790,19 +1867,13 @@ def _box_draw_ratio(rng: random.Random) -> float:
 def _box_wall_edges(rng: random.Random, n: int, p_wall: float, group: str | None):
     """壁を立てる辺の集合。group が指定されていればその構造になるものだけ返す。
 
-    plate = 壁なし / bend = どの2枚も隣り合わない(角の連結が起きない) / draw = 隣り合う対が1組以上。
+    plate = 壁なし / bend = 壁あり(隣り合う角は逃げで開ける) / draw = 隣り合う対が1組以上。
     """
     if group == "plate":
         return set()
     for _ in range(BOX_WALLSET_TRIES):
         if group == "bend":
-            edges, chosen = list(range(n)), set()
-            rng.shuffle(edges)
-            for e in edges:
-                if (e - 1) % n in chosen or (e + 1) % n in chosen:
-                    continue
-                if not chosen or rng.random() < p_wall:
-                    chosen.add(e)
+            chosen = {e for e in range(n) if rng.random() < p_wall}
             if chosen:
                 return chosen
             continue
@@ -1846,7 +1917,11 @@ def box_bracket_part(rng: random.Random, knobs: Knobs) -> Result | None:
         u, v = _plane_basis(normal)
         origin = spec.point1.position_xyz
 
-        n = _draw_weighted(rng, BOX_HUB_SIDES)
+        # リブは「折り線に直交する境界」が要るので四角形のハブ限定で、辺0・辺2 を空ける。
+        # 残る辺1・辺3 は向かい合っていて隣り合わないので、リブと絞りの角は同居しない。
+        want_rib = knobs.box_group != "draw" and rng.random() < BOX_RIB_P
+        n = 4 if want_rib else _draw_weighted(rng, BOX_HUB_SIDES)
+        base_sides = n
         hub_xy = _box_hub(rng, n)
         if hub_xy is None:
             continue
@@ -1856,22 +1931,58 @@ def box_bracket_part(rng: random.Random, knobs: Knobs) -> Result | None:
             continue
         corner_r = rng.uniform(r_lo, BOX_CORNER_R_MM[1])
 
-        # ---- 壁(辺ごとに独立)。隣り合う壁の角は必ず継ぎ目にする。
+        # ---- 壁(辺ごとに独立)。隣り合う壁の角は「継ぎ目(絞り)」か「逃げ(曲げ)」のどちらか。
         p_wall = rng.uniform(*BOX_WALL_P)
-        edges = _box_wall_edges(rng, n, p_wall, knobs.box_group)
+        if want_rib and knobs.box_group != "plate":
+            edges = {e for e in (1, 3) if rng.random() < p_wall}
+            if knobs.box_group == "bend" and not edges:
+                edges = {rng.choice((1, 3))}
+        else:
+            edges = _box_wall_edges(rng, n, p_wall, knobs.box_group)
         if edges is None:
             continue
-        walls: dict = {}
+        base: dict = {}
         for i in sorted(edges):
             fold = rng.uniform(*BOX_WALL_FOLD_DEG)
             tangent = corner_r * math.tan(math.radians(fold) / 2.0)
             lo_h = max(BOX_WALL_HEIGHT_MM[0], tangent + weld_b + 6.0)
             if lo_h > BOX_WALL_HEIGHT_MM[1]:
                 continue
-            walls[i] = {"fold_deg": fold, "height_mm": rng.uniform(lo_h, BOX_WALL_HEIGHT_MM[1]),
-                        "fillet_mm": corner_r, "tangent_mm": tangent, "tabs": [],
-                        "taper_from_mm": {}, "tab_root_r_mm": MIN_NEUTRAL_PLANE_RADIUS_MM}
-        closed = {k for k in range(n) if (k - 1) % n in walls and k % n in walls}
+            base[i] = {"fold_deg": fold, "height_mm": rng.uniform(lo_h, BOX_WALL_HEIGHT_MM[1]),
+                       "fillet_mm": corner_r, "tangent_mm": tangent, "tabs": [],
+                       "taper_from_mm": {}, "tab_root_r_mm": MIN_NEUTRAL_PLANE_RADIUS_MM}
+        meeting = [k for k in range(n) if (k - 1) % n in base and k % n in base]
+        if knobs.box_group == "draw" and not meeting:
+            continue
+        if knobs.box_group == "bend":
+            sew = set()
+        elif knobs.box_group == "draw":
+            sew = {k for k in meeting if rng.random() < BOX_SEW_P}
+            if not sew:
+                sew = {rng.choice(meeting)}
+        else:
+            sew = {k for k in meeting if rng.random() < BOX_SEW_P}
+        relieved = [k for k in meeting if k not in sew]
+
+        # 逃げを入れる = ハブの輪郭に、両隣の辺に直交する 2 辺のノッチを掘る
+        notch_edges: set = set()
+        if relieved:
+            gap = rng.uniform(*BOX_RELIEF_MM)
+            for k in relieved:
+                gap = min(gap, 0.35 * math.dist(hub_xy[(k - 1) % n], hub_xy[k]),
+                          0.35 * math.dist(hub_xy[k], hub_xy[(k + 1) % n]))
+            if gap < BOX_RELIEF_MM[0] * 0.5:
+                continue
+            got = _box_relief(hub_xy, set(relieved), gap)
+            if got is None:
+                continue
+            hub_xy, edge_map, vertex_map, notch_edges = got
+            n = len(hub_xy)
+            walls = {edge_map[i]: w for i, w in base.items()}
+            closed = {vertex_map[k] for k in sew}
+        else:
+            walls = dict(base)
+            closed = set(sew)
         if knobs.box_group == "bend" and closed:
             continue
         if knobs.box_group == "draw" and not closed:
@@ -1967,12 +2078,44 @@ def box_bracket_part(rng: random.Random, knobs: Knobs) -> Result | None:
                             "length_mm": rng.uniform(*BOX_FLANGE_LENGTH_MM),
                             "outline": {"kind": "rect"}, "relief_mm": ARM_TIP_RELIEF_MM})
 
+        # ---- 深さ3のパネル(深さ2フランジの先端から折る)
+        deep: list = []
+        for j, fl in enumerate(flanges):
+            if fl["outline"]["kind"] != "rect" or rng.random() >= BOX_DEEP_P:
+                continue
+            width = fl["to_mm"] - fl["from_mm"]
+            lo, hi = ARM_TIP_RELIEF_MM + 1.5, width - ARM_TIP_RELIEF_MM - 1.5
+            if hi - lo < BOX_DEEP_MIN_ROOT_MM or fl["length_mm"] < 18.0:
+                continue
+            root = rng.uniform(BOX_DEEP_MIN_ROOT_MM, hi - lo)
+            start = rng.uniform(lo, hi - root)
+            deep.append({"flange": j, "from_mm": start, "to_mm": start + root,
+                         "side": rng.choice((1, -1)),
+                         "fold_deg": rng.uniform(*BOX_DEEP_FOLD_DEG),
+                         "radius_mm": rng.uniform(*BOX_FLANGE_R_MM),
+                         "length_mm": rng.uniform(*BOX_DEEP_LENGTH_MM),
+                         "relief_mm": ARM_TIP_RELIEF_MM})
+
+        # ---- ハブを横切るリブ(四角形・逃げ無し・辺0と辺2が空いているときだけ)
+        rib = None
+        if want_rib and n == 4 and not relieved and 0 not in walls and 2 not in walls:
+            lo = hub_xy[3][0] + BOX_RIB_MARGIN_MM
+            hi = hub_xy[2][0] - BOX_RIB_MARGIN_MM
+            height = rng.uniform(*BOX_RIB_HEIGHT_MM)
+            fold = rng.uniform(*BOX_RIB_FOLD_DEG)
+            need = 2.0 * height / math.tan(math.radians(fold)) + 6.0
+            if hi - lo > need + 10.0:
+                band = rng.uniform(need, min(hi - lo - 4.0, need + 40.0))
+                t0 = rng.uniform(lo, hi - band)
+                rib = {"t0_mm": t0, "t1_mm": t0 + band, "height_mm": height, "fold_deg": fold}
+
         # ---- 腕(壁の無い辺、0〜2)
         arms: list = []
         want_arms = _draw_weighted(rng, BOX_ARMS)
         if knobs.box_group == "plate":
             want_arms = max(1, want_arms)      # 壁なし群は「平板 + 曲げタブ」
-        free_edges = [i for i in range(n) if i not in walls]
+        free_edges = [i for i in range(n) if i not in walls and i not in notch_edges
+                      and not (rib is not None and i in (0, 2))]
         for edge in rng.sample(free_edges, len(free_edges)):
             if len(arms) >= want_arms:
                 break
@@ -1995,18 +2138,21 @@ def box_bracket_part(rng: random.Random, knobs: Knobs) -> Result | None:
             continue
         group = ("plate" if not walls else "draw" if closed else "bend")
         points, radii, owners = _box_points(rng, lay, hub_xy, walls, spans, flanges, arms,
-                                            n, b, weld_b, normal)
+                                            n, b, weld_b, normal, notch_edges, rib, corner_r)
         if points is None or not 2 <= len(points) <= BOX_MAX_POINTS:
             continue
 
         box = {"hub_xy": [list(q) for q in hub_xy], "walls": {str(k): w for k, w in walls.items()},
-               "closed": sorted(closed), "arms": arms, "flanges": flanges,
+               "closed": sorted(closed), "arms": arms, "flanges": flanges, "deep": deep,
                "origin": list(origin), "hub_u": list(u), "hub_v": list(v),
                "corner_r_mm": corner_r, "weld_bearing_mm": weld_b,
                "draw_ratio": draw_ratio if closed else None, "group": group,
+               "notch_edges": sorted(notch_edges), "relief_corners": len(relieved),
+               "rib": rib,
                "point_radii": radii, "point_owners": owners,
-               "factors": {"group": group, "sides": n, "walls": len(walls),
-                           "closed": len(closed),
+               "factors": {"group": group, "sides": base_sides, "walls": len(walls),
+                           "closed": len(closed), "relief": len(relieved),
+                           "rib": 1 if rib else 0, "deep": len(deep),
                            "tabs": sum(len(w["tabs"]) for w in walls.values()),
                            "flanges": len(flanges), "arms": len(arms),
                            "points": len(points)}}
@@ -2017,7 +2163,8 @@ def box_bracket_part(rng: random.Random, knobs: Knobs) -> Result | None:
     return None
 
 
-def _box_points(rng, lay, hub_xy, walls, spans, flanges, arms, n, b, weld_b, normal):
+def _box_points(rng, lay, hub_xy, walls, spans, flanges, arms, n, b, weld_b, normal,
+                notch_edges=(), rib=None, corner_r=0.0):
     """締結点: 壁の溶接タブ / 壁の面 / 深さ2フランジ / 腕 / ハブ。半径と持ち主も併せて返す。
 
     持ち主(`owners`)は「その点を保持している要素」。設計等価バリアントで
@@ -2092,6 +2239,8 @@ def _box_points(rng, lay, hub_xy, walls, spans, flanges, arms, n, b, weld_b, nor
     # ---- ハブの上の点(壁のフィレット帯・腕の根本・自由端から逃げる)
     want = _draw_weighted(rng, BOX_HUB_POINTS)
     margin = {i: (walls[i]["tangent_mm"] + b + 1.0 if i in walls else b + 2.0) for i in range(n)}
+    for i in notch_edges:
+        margin[i] = b + 2.0
     lo_x = min(q[0] for q in hub_xy)
     hi_x = max(q[0] for q in hub_xy)
     lo_y = min(q[1] for q in hub_xy)
@@ -2101,10 +2250,12 @@ def _box_points(rng, lay, hub_xy, walls, spans, flanges, arms, n, b, weld_b, nor
         if len(got) >= want:
             break
         cand = (rng.uniform(lo_x, hi_x), rng.uniform(lo_y, hi_y))
-        if not _inside_convex(cand, hub_xy):
+        if not _inside_polygon(cand, hub_xy):
             continue
         if any(_dist_to_segment(cand, hub_xy[i], hub_xy[(i + 1) % n]) < margin[i]
                for i in range(n)):
+            continue
+        if rib is not None and rib["t0_mm"] - b - corner_r <= cand[0] <= rib["t1_mm"] + b + corner_r:
             continue
         if all(math.dist(cand, o) >= 2.0 * b + 2.0 for o in got):
             got.append(cand)

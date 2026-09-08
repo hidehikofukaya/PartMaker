@@ -179,9 +179,11 @@ def _build_box(meta: dict, spec: dict) -> dict:
         "half_width_mm": None,
         "min_bearing_radius_mm": spec["min_bearing_radius_mm"],
         "thickness_mm": spec["thickness_mm"],
-        # 折り = 壁の根本 + 腕の根本 + 深さ2フランジの根本。パネル = ハブ + 壁 + 腕 + フランジ。
-        "folds": len(walls) + len(bx["arms"]) + len(bx["flanges"]),
-        "panels": 1 + len(walls) + len(bx["arms"]) + len(bx["flanges"]),
+        # 折り = 壁 + 腕 + 深さ2フランジ + 深さ3パネル + リブ(4本)。
+        "folds": (len(walls) + len(bx["arms"]) + len(bx["flanges"])
+                  + len(bx.get("deep", ())) + (4 if bx.get("rib") else 0)),
+        "panels": (1 + len(walls) + len(bx["arms"]) + len(bx["flanges"])
+                   + len(bx.get("deep", ())) + (4 if bx.get("rib") else 0)),
         "has_inflection": False,
         "bead": None, "flange": None, "rib": None,
         "corner_relief": None,
@@ -200,15 +202,25 @@ def _build_box(meta: dict, spec: dict) -> dict:
                       "bend_radius_mm": a["radius_mm"], "length_mm": a["length_mm"],
                       "root_mm": [a["root_from_mm"], a["root_to_mm"]],
                       "outline": a.get("outline")} for a in bx["arms"]],
+            "rib": bx.get("rib"),
+            "deep": [{"flange": d["flange"], "root_mm": [d["from_mm"], d["to_mm"]],
+                      "side": d["side"], "fold_deg": d["fold_deg"],
+                      "bend_radius_mm": d["radius_mm"], "length_mm": d["length_mm"]}
+                     for d in bx.get("deep", ())],
+            "relief_corners": bx.get("relief_corners"),
+            "notch_edges": bx.get("notch_edges"),
             "factors": bx.get("factors"),
             "point_radii": bx.get("point_radii"),
+            "point_owners": bx.get("point_owners"),
             "joints": len(points),
             "joint_positions_xyz": [list(p["position_xyz"]) for p in points],
             "joint_normals_xyz": [list(p["normal_xyz"]) for p in points],
         },
-        "notes": "box bracket: a convex polygon hub with walls on any of its edges; adjacent "
-                 "walls are sewn sharp at the corner and filleted (the vertex blend is the "
-                 "draw), plus depth-2 flanges on wall tops and arms on wall-free edges",
+        "notes": "box bracket: a polygon hub with walls on any of its edges. Adjacent walls "
+                 "either meet at a sewn corner (filleted; the vertex blend is the draw) or "
+                 "are separated by a relief notch cut perpendicular to both wall edges "
+                 "(pure bending). Plus depth-2 flanges on wall tops, depth-3 panels on "
+                 "flange tips, arms on wall-free edges, and a trapezoidal rib across the hub",
     }
 
 
