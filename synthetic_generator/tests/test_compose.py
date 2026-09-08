@@ -8,7 +8,7 @@ import collections
 import random
 
 from synthetic_generator.families import (
-    COMPOSE_ARMS, COMPOSE_FOLDS, COMPOSE_POINTS, COMPOSE_WELD_BEARING_MM, Knobs, compose_part,
+    COMPOSE_ARMS, COMPOSE_FOLDS, COMPOSE_POINTS, Knobs, compose_part,
 )
 
 
@@ -25,6 +25,7 @@ def _draw(count: int = 40):
 def test_factors_are_recorded_and_realised_within_ranges():
     seen = collections.defaultdict(set)
     for spec, bead, flange, rib in _draw():
+        b = spec.min_bearing_radius_mm
         assert flange is None, "第2期: 壁はフランジではなく短い壁腕"
         cp = spec.compose
         f = cp["factors"]
@@ -50,18 +51,18 @@ def test_factors_are_recorded_and_realised_within_ranges():
         assert len(seen[k]) >= 2, k
 
 
-def test_tabs_use_weld_bearing_and_radii_follow_point_kinds():
+def test_tab_circles_are_larger_than_the_seat_and_radii_are_uniform():
+    """裁定 2026-09-09: 1部品1半径。タブ円だけは座面より大きくする。"""
     for spec, bead, flange, rib in _draw():
         cp = spec.compose
         b = spec.min_bearing_radius_mm
         radii = list(cp["point_radii"])
-        assert radii[0] == b and radii[1] == b
+        assert all(r == b for r in radii), "1部品1半径"
         k = 2
         for a in cp["arms"]:
-            for run, across, kind in a["points"]:
-                assert radii[k] == (cp["weld_bearing_mm"] if kind == "weld" else b)
-                k += 1
+            k += len(a["points"])
             if a["outline"]["kind"] == "tabs":
                 for _s, r in a["outline"]["tabs"]:
-                    assert COMPOSE_WELD_BEARING_MM[0] <= r <= COMPOSE_WELD_BEARING_MM[1]
-        assert all(r == b for r in radii[k:]), "基板の点は既定の座面半径"
+                    # 裁定 2026-09-09: タブ円は座面半径より大きい
+                    assert r > b
+        assert cp["weld_bearing_mm"] == b

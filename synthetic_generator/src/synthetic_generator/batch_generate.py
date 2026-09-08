@@ -158,6 +158,60 @@ def generate_batch(
     return records
 
 
+def structure_of(spec, plan, kind: str) -> dict:
+    """params に入れる**機械可読の構造因子**(AMS 依頼 7 §3、2026-09-09)。
+
+    `geometry_label` の自由文からの復元は壊れやすいので、族に依らず同じキーで出す。
+    値が無い因子は 0(または None)にする。
+    """
+    ann = getattr(spec, "annotated_points", None)
+    joints = len(ann) if ann else 2 + len(getattr(spec, "extra_points", ()) or ())
+    out = {"family": kind, "joints": joints, "hub_gon": 0, "walls": 0, "sewn": 0,
+           "relief": 0, "flanges": 0, "deep": 0, "arms": 0, "tabs": 0, "beads": 0,
+           "rib": 0, "notches": 0, "folds": 0, "panels": 0}
+    box = getattr(spec, "box", None)
+    panel = getattr(spec, "panel", None)
+    compose = getattr(spec, "compose", None)
+    branch = getattr(spec, "branch", None)
+    drawn = getattr(spec, "drawn", None)
+    channel = getattr(spec, "channel", None)
+    if box is not None:
+        f = box["factors"]
+        out.update(hub_gon=f["sides"], walls=f["walls"], sewn=f["closed"],
+                   relief=f["relief"], flanges=f["flanges"], deep=f["deep"],
+                   arms=f["arms"], tabs=f["tabs"], rib=f["rib"],
+                   folds=f["walls"] + f["arms"] + f["flanges"] + f["deep"] + 4 * f["rib"],
+                   panels=1 + f["walls"] + f["arms"] + f["flanges"] + f["deep"],
+                   group=box.get("group"))
+    elif panel is not None:
+        f = panel["factors"]
+        out.update(beads=f["beads"], walls=f["walls"], arms=f["arms"], tabs=f["tabs"],
+                   folds=f["folds"], panels=f["folds"] + 1 + f["walls"] + f["arms"])
+    elif compose is not None:
+        f = compose["factors"]
+        out.update(walls=sum(1 for a in compose["arms"] if a.get("role") == "wall"),
+                   arms=f["arms"], tabs=f["tabs"], notches=f["notches"], folds=f["folds"],
+                   beads=1 if f["section"] == "bead" else 0,
+                   rib=1 if f["section"] == "rib" else 0,
+                   panels=f["folds"] + 1)
+    elif branch is not None:
+        out.update(hub_gon=len(branch["hub_xy"]), arms=len(branch["arms"]),
+                   folds=len(branch["arms"]), panels=1 + len(branch["arms"]))
+    elif drawn is not None:
+        out.update(hub_gon=len(drawn["hub_xy"]), walls=len(drawn["walls"]),
+                   sewn=len(drawn.get("seams") or {}), arms=len(drawn["arms"]),
+                   tabs=sum(len(w["tabs"]) for w in drawn["walls"].values()),
+                   folds=len(drawn["walls"]) + len(drawn["arms"]),
+                   panels=1 + len(drawn["walls"]) + len(drawn["arms"]))
+    elif channel is not None:
+        out.update(walls=2, arms=2, folds=4, panels=5)
+    elif getattr(spec, "plate_margin_mm", None) is not None:
+        out.update(panels=1)
+    elif plan is not None:
+        out.update(folds=len(plan.panel_frames) - 1, panels=len(plan.panel_frames))
+    return out
+
+
 def _int_keys(d):
     """JSON 往復で文字列になった頂点番号のキーを int に戻す。"""
     return {int(k): v for k, v in d.items()} if d else None
@@ -175,7 +229,8 @@ def build_general_part(builder, spec, bead, flange, out_dir: str, part_name: str
             drawn["hub_xy"], drawn["walls"], drawn["arms"], origin=tuple(drawn["origin"]),
             hub_u=tuple(drawn["hub_u"]), hub_v=tuple(drawn["hub_v"]),
             seam_fillet_mm=drawn["seam_fillet_mm"], corner_radius=drawn["corner_radius"],
-            out_dir=out_dir, part_name=part_name, check_points=spec.annotated_points), None
+            out_dir=out_dir, part_name=part_name, check_points=spec.annotated_points,
+            check_radii=(spec.min_bearing_radius_mm,) * len(spec.annotated_points)), None
     # 多面ブラケット(実車002-024): ハブ多角形 + 壁 + 角の連結 + 深さ2フランジ。
     box = getattr(spec, "box", None)
     if box is not None:
@@ -528,6 +583,7 @@ def generate_recipe_batch(
                         "fold_tilts_deg": [] if custom else [
                             [math.degrees(a), math.degrees(b)] for a, b in plan.fold_tilts
                         ],
+                        "structure": structure_of(spec, plan, kind),
                         "spec": dataclasses.asdict(spec),
                         "bead": dataclasses.asdict(bead) if bead is not None else None,
                         "flange": dataclasses.asdict(flange) if flange is not None else None,

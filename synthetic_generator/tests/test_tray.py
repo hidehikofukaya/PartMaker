@@ -7,6 +7,7 @@ from __future__ import annotations
 import random
 
 from synthetic_generator.families import (
+    TAB_SEAT_MARGIN,
     DRAWN_BEARING_MM, DRAWN_HUB_POINTS, DRAWN_WALL_FOLD_DEG, Knobs, drawn_tray_part,
 )
 from synthetic_generator.occt_build import drawn_notch_mm, drawn_tray_frames, tab_footprint_mm
@@ -40,7 +41,8 @@ def test_three_drawn_walls_two_seams_one_bent_tab():
         assert len(radii) == 1, "3本のフィレットは同じ半径(縁が円弧で収まる条件)"
         for w in dr["walls"].values():
             assert DRAWN_WALL_FOLD_DEG[0] <= w["fold_deg"] <= DRAWN_WALL_FOLD_DEG[1]
-            assert all(abs(r - b) < 1e-9 for _s, r in w["tabs"]), "タブ半径 = 必要半径"
+            # 裁定 2026-09-09: タブ円は必要半径より一回り大きい
+            assert all(abs(r - b * TAB_SEAT_MARGIN) < 1e-9 for _s, r in w["tabs"])
             tab_counts.add(len(w["tabs"]))
     assert len(tab_counts) >= 2, "タブの個数に乱数性がある"
 

@@ -8,6 +8,7 @@ import math
 import random
 
 from synthetic_generator.families import (
+    TAB_SEAT_MARGIN,
     TAB_BEARING_MM, TAB_HINGE_DEG, TAB_MIN_R_MM, TAB_WELD_COUNT, Knobs, tab_bracket_part,
 )
 from synthetic_generator.occt_build import _fillet_corner_2d, branch_frames
@@ -37,10 +38,11 @@ def test_upstand_goes_up_and_flange_goes_down_with_three_normals():
         assert fl["outline"]["kind"] == "trapezoid"
         assert TAB_HINGE_DEG[0] <= br["hinge_deg"] <= TAB_HINGE_DEG[1]
         assert min(up["radius_mm"], fl["radius_mm"], br["corner_radius"]) >= TAB_MIN_R_MM
-        # タブ半径 = 必要半径(溶接相当)
+        # タブ円は必要半径より一回り大きい(裁定 2026-09-09)。点はタブ円の中心に載るので、
+        # 半径が座面と同じだと外形を多角形で近似した瞬間に座面が割れる。
         b = spec.min_bearing_radius_mm
         assert TAB_BEARING_MM[0] <= b <= TAB_BEARING_MM[1]
-        assert all(abs(r - b) < 1e-9 for _s, r in up["outline"]["tabs"])
+        assert all(abs(r - b * TAB_SEAT_MARGIN) < 1e-9 for _s, r in up["outline"]["tabs"])
         normals = {tuple(round(c, 2) for c in p.normal_xyz) for p in spec.annotated_points}
         assert len(normals) == 3, "台 / 立ち上がり / フランジの3方向"
         assert len(spec.annotated_points) in (TAB_WELD_COUNT + 2, TAB_WELD_COUNT + 3)

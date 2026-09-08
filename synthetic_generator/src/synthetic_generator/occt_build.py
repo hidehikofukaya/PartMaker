@@ -1021,14 +1021,18 @@ def _widen_section(section, y_breaks, ext_neg: float, ext_pos: float):
     return section, y_breaks
 
 
-def _check_bearing_margin(shape, points, radii, tolerance_mm: float = 0.3) -> None:
-    """締結点から外形(自由エッジ)までの距離が座面半径以上か(ML 側の「座面比」)。
-    腕や切欠きが座面に食い込む配置を弾く(2026-09-06 夜、ML 返答: 第1期は 600 部品中 17 で
-    0.95 未満。原因は台形の腕の斜辺と、隣の腕の側辺)。"""
+def _check_bearing_margin(shape, points, radii, tolerance_mm: float = 0.3,
+                          include_internal: bool = True) -> None:
+    """締結点のまわりに座面半径ぶんの**平らな円盤**があるか(ML 側の「座面比」)。
+
+    2026-09-06 夜の初版は外形(自由エッジ)までの距離だけを見ていた。座面は本来
+    「平らな円盤」なので、折り線・ビードの足・フィレットの接線までの距離も見る
+    (裁定 2026-09-09。外形だけの判定では occt22 の 6% が折り線に座面を食われていた)。
+    """
     amap = TopTools_IndexedDataMapOfShapeListOfShape()
     topexp.MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, amap)
     free = [topods.Edge(amap.FindKey(i)) for i in range(1, amap.Size() + 1)
-            if amap.FindFromIndex(i).Size() == 1]
+            if include_internal or amap.FindFromIndex(i).Size() == 1]
     for index, (point, radius) in enumerate(zip(points, radii)):
         vertex = BRepBuilderAPI_MakeVertex(gp_Pnt(*point.position_xyz)).Vertex()
         worst = float("inf")
@@ -1038,7 +1042,7 @@ def _check_bearing_margin(shape, points, radii, tolerance_mm: float = 0.3) -> No
             worst = min(worst, dist.Value())
         if worst < radius - tolerance_mm:
             raise ValueError(
-                f"fastening point {index + 1} is {worst:.1f}mm from the outline "
+                f"fastening point {index + 1} has only {worst:.1f}mm of flat around it "
                 f"(bearing radius {radius:.1f}mm). Infeasible; resample."
             )
 
@@ -1893,7 +1897,8 @@ class OcctPartBuilder:
 
     def build_drawn_tray(self, hub_xy, walls: dict, arms, *, origin: Vec3, hub_u: Vec3,
                          hub_v: Vec3, seam_fillet_mm: float, corner_radius: float,
-                         out_dir: str, part_name: str, check_points=()) -> GeneratedPart:
+                         out_dir: str, part_name: str, check_points=(),
+                         check_radii=()) -> GeneratedPart:
         """実車057の簡略版: ハブ + 絞りの角(壁A/B) + 曲げタブ(arms、辺2・3)。
 
         1. ハブ・壁A・壁B を鋭いエッジで作って縫合(3面が頂点 v1 で出会う)。
@@ -2046,7 +2051,10 @@ class OcctPartBuilder:
         stp_path = os.path.abspath(os.path.join(out_dir, part_name + "_mid.stp"))
         _export_step(shape, named, stp_path)
         try:
-            check_shape(_read_step(stp_path), tuple(p.position_xyz for p in check_points))
+            read = _read_step(stp_path)
+            check_shape(read, tuple(p.position_xyz for p in check_points))
+            if check_radii:
+                _check_bearing_margin(read, list(check_points), list(check_radii))
         except ValueError:
             os.remove(stp_path)
             raise
