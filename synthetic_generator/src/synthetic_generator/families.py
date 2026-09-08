@@ -1021,13 +1021,13 @@ def tab_bracket_part(rng: random.Random, knobs: Knobs) -> Result | None:
 
         # 立ち上がり: 辺0 を表側(+法線)へ。高さ = 必要半径 + α、タブは半径 = 必要半径。
         up_h = bearing + rng.uniform(*TAB_UPSTAND_EXTRA_HEIGHT_MM)
-        foot = tab_footprint_mm(bearing, TAB_MIN_R_MM)      # タブ + 根元R が上端で占める片側幅
+        foot = tab_footprint_mm(bearing * TAB_SEAT_MARGIN, TAB_MIN_R_MM)      # タブ + 根元R が上端で占める片側幅
         span = length - 2.0 * (foot + 0.6)
         if span < (TAB_WELD_COUNT - 1) * (2.0 * foot + 2.0):
             continue
         s_first = rng.uniform(foot + 0.6, length - foot - 0.6 - (TAB_WELD_COUNT - 1) * (2.0 * foot + 2.0))
         pitch = rng.uniform(2.0 * foot + 2.0, (length - foot - 0.6 - s_first) / max(1, TAB_WELD_COUNT - 1))
-        tabs = [[s_first + k * pitch, bearing] for k in range(TAB_WELD_COUNT)]
+        tabs = [[s_first + k * pitch, bearing * TAB_SEAT_MARGIN] for k in range(TAB_WELD_COUNT)]
         upstand = {"edge": 0, "fold_deg": rng.uniform(*TAB_UPSTAND_FOLD_DEG),
                    "radius_mm": rng.uniform(*TAB_UPSTAND_R_MM), "side": 1, "length_mm": up_h,
                    "relief_mm": TAB_MIN_R_MM,
@@ -1124,10 +1124,19 @@ DRAWN_HUB_POINTS = 2
 DRAWN_POINT_ATTEMPTS = 80
 
 
+# 溶接タブの半円は**座面半径より大きく**する(裁定 2026-09-09)。締結点はタブ円の中心に
+# 載るので、半径が座面と同じだと「点から外形まで = 座面半径」ちょうどになり、外形を
+# 多角形で近似した瞬間に座面が割れる(ML 側の座面比が 0 近くまで落ちる)。実車の溶接タブも
+# ナゲットの座面より一回り大きい。
+TAB_SEAT_MARGIN = 1.25
+
+
 def _tabs_on(rng, b, lo, hi, root_r=MIN_NEUTRAL_PLANE_RADIUS_MM, count=None):
-    """[lo, hi] の区間に半径 b のタブ(根元R root_r つき)を 2〜3(入らなければ減らす)。
-    位置は余白を弱い乱数で配る。占有幅はタブ + 根元R の片側幅 f = sqrt(b^2 + 2 b root_r)。
+    """[lo, hi] の区間にタブ(半径 = 座面半径 b の TAB_SEAT_MARGIN 倍、根元R root_r つき)を
+    2〜3 個(入らなければ減らす)。位置は余白を弱い乱数で配る。
+    占有幅はタブ + 根元R の片側幅 f = sqrt(r^2 + 2 r root_r)。
     count を渡すとその本数から始める(0 なら空)。"""
+    b = b * TAB_SEAT_MARGIN
     f = tab_footprint_mm(b, root_r)
     usable = hi - lo
     if count == 0:
@@ -1332,7 +1341,8 @@ COMPOSE_ARMS = (0, 1, 2, 3, 4)
 COMPOSE_TABS = (0, 1, 2)
 COMPOSE_POINTS = (2, 3, 4, 5, 6, 7, 8)
 COMPOSE_BASE_KINDS = (("convex", 0.35), ("asym", 0.30), ("relief", 0.20), ("waist", 0.15))
-COMPOSE_WELD_BEARING_MM = (7.5, 11.0)      # タブ溶接(実車相当)
+# 裁定 2026-09-09: 1部品1半径。タブ溶接も部品の座面半径を使う(この範囲は使わない)。
+COMPOSE_WELD_BEARING_MM = (7.5, 11.0)
 COMPOSE_ARM_WIDTH_MM = (20.0, 50.0)
 COMPOSE_ARM_FOLD_DEG = (60.0, 110.0)      # 依頼は 60〜120。110 超は帯の裏へ回り込んで干渉が増える
 COMPOSE_ARM_R_MM = (5.0, 15.0)
@@ -1424,7 +1434,7 @@ def compose_part(rng: random.Random, knobs: Knobs) -> Result | None:
         except ValueError:
             continue
         bearing = spec.min_bearing_radius_mm
-        weld = rng.uniform(*COMPOSE_WELD_BEARING_MM)
+        weld = bearing    # 裁定 2026-09-09: 1部品1半径
 
         # ---- 断面(その因子だけ引き直す: bead -> rib -> none)
         bead = rib = None
@@ -1514,12 +1524,13 @@ def compose_part(rng: random.Random, knobs: Knobs) -> Result | None:
                 length = rng.uniform(*COMPOSE_ARM_LENGTH_MM)
                 with_tab = tab_left > 0 and rng.random() < 0.7
                 if with_tab:
-                    foot = tab_footprint_mm(weld, ARM_TIP_RELIEF_MM)
+                    tab_r = weld * TAB_SEAT_MARGIN     # タブ円は座面より一回り大きい
+                    foot = tab_footprint_mm(tab_r, ARM_TIP_RELIEF_MM)
                     if width < 2.0 * foot + 1.2:
                         continue
                     s_c = rng.uniform(foot + 0.6, width - foot - 0.6)
-                    height = weld + rng.uniform(0.0, 4.0)
-                    outline = {"kind": "tabs", "height_mm": height, "tabs": [[s_c, weld]],
+                    height = tab_r + rng.uniform(0.0, 4.0)
+                    outline = {"kind": "tabs", "height_mm": height, "tabs": [[s_c, tab_r]],
                                "root_r_mm": ARM_TIP_RELIEF_MM}
                     length = height
                 elif rng.random() < 0.4:
@@ -1596,11 +1607,11 @@ def compose_part(rng: random.Random, knobs: Knobs) -> Result | None:
                 break
             k = rng.randrange(n_panels)
             st = steps[k]
-            lo = (bearing + 2.0) if k == 0 else 0.0
-            hi = st["length"] - ((bearing + 2.0) if k == n_panels - 1 else 0.0)
-            if hi - lo < 2.0 * bearing:
+            lo = bearing + (2.0 if k == 0 else 0.0)
+            hi = st["length"] - bearing - (2.0 if k == n_panels - 1 else 0.0)
+            if hi - lo < 1.0:
                 continue
-            t = rng.uniform(lo + bearing, hi - bearing)
+            t = rng.uniform(lo, hi)
             s_arc = straight_s[k] + t
             if any(a <= s_arc <= b for a, b in blocked_s):
                 continue
@@ -1715,7 +1726,7 @@ def _draw_weighted_label(rng: random.Random, weights):
 
 # ---- 多面ブラケット族(実車002-024)。ハブ多角形 + 壁(隣り合えば角を連結 = 絞り) +
 #      壁の上端から折る深さ2のフランジ + 壁の無い辺の腕 + 溶接タブ。
-BOX_HUB_SIDES = ((4, 0.45), (5, 0.20), (6, 0.20), (3, 0.15))
+BOX_HUB_SIDES = ((4, 0.38), (5, 0.24), (6, 0.26), (3, 0.12))
 BOX_HUB_RADIUS_MM = (45.0, 95.0)            # 多角形(5,6角)の外接半径
 BOX_HUB_JITTER = 0.16                       # 頂点半径のばらつき(凸を保てる範囲)
 BOX_QUAD_LEN_MM = (70.0, 170.0)             # 四角形のハブ
@@ -1723,13 +1734,15 @@ BOX_QUAD_WID_MM = (55.0, 130.0)
 BOX_QUAD_SKEW = (0.0, 0.28)                 # 上辺の食い込み(台形)
 BOX_TRI_R_MM = (55.0, 100.0)
 BOX_CORNER_R_MM = (4.0, 10.0)               # 角のR。1部品で全部そろえる(ゲートAの都合)
-BOX_WALL_P = (0.30, 0.90)                   # 辺に壁を立てる確率(部品ごとに引く)
+BOX_WALL_P = (0.40, 0.95)                   # 辺に壁を立てる確率(部品ごとに引く)
 BOX_WALL_FOLD_DEG = (60.0, 115.0)
 BOX_WALL_HEIGHT_MM = (14.0, 60.0)
-BOX_WALL_TABS = ((0, 0.35), (1, 0.40), (2, 0.25))
-BOX_WELD_BEARING_MM = (7.5, 11.0)           # タブ溶接(実車相当)
+BOX_WALL_TABS = ((0, 0.25), (1, 0.35), (2, 0.40))
+# 裁定 2026-09-09: 1部品1半径。タブ溶接も部品の座面半径を使う(この範囲は使わない)。
+BOX_WELD_BEARING_MM = (7.5, 11.0)
 BOX_BEARING_MM = (12.5, 20.0)
-BOX_ARMS = ((0, 0.40), (1, 0.35), (2, 0.25))
+BOX_ARMS = ((0, 0.30), (1, 0.35), (2, 0.35))
+BOX_ARM_POINTS = ((1, 0.6), (2, 0.4))       # 腕 1 本に載せる点
 BOX_ARM_FOLD_DEG = (60.0, 110.0)
 BOX_ARM_R_MM = (5.0, 15.0)
 BOX_ARM_LENGTH_MM = (20.0, 50.0)
@@ -1758,10 +1771,12 @@ BOX_DEEP_FOLD_DEG = (50.0, 105.0)
 BOX_DEEP_LENGTH_MM = (12.0, 32.0)
 BOX_DEEP_MIN_ROOT_MM = 16.0
 BOX_WALLSET_TRIES = 12
-BOX_HUB_POINTS = ((0, 0.25), (1, 0.35), (2, 0.25), (3, 0.15))
-BOX_WALL_POINT_P = 0.35                     # 壁の面に締結点を置く確率
+# 実車002-024 はアノテーション修正(2026-09-09)で 13 -> 16 joints、法線 3 -> 5 方向に
+# なった。増えた3点はいずれも「継ぎ目で連結された壁の面」に載る。上限と壁1枚あたりの点数を上げる。
+BOX_HUB_POINTS = ((0, 0.15), (1, 0.25), (2, 0.25), (3, 0.20), (4, 0.15))
+BOX_WALL_POINTS = ((0, 0.25), (1, 0.35), (2, 0.40))     # 壁 1 枚に載せる面の点
 BOX_POINT_ATTEMPTS = 60
-BOX_MAX_POINTS = 10
+BOX_MAX_POINTS = 16
 BOX_TAPER_SHARE = (0.25, 0.5)
 
 
@@ -1912,7 +1927,7 @@ def box_bracket_part(rng: random.Random, knobs: Knobs) -> Result | None:
         except ValueError:
             continue
         b = rng.uniform(*(knobs.bearing_radius_mm or BOX_BEARING_MM))
-        weld_b = rng.uniform(*BOX_WELD_BEARING_MM)
+        weld_b = b        # 裁定 2026-09-09: 1部品1半径。タブも部品の座面半径で作る
         normal = spec.point1.normal_xyz
         u, v = _plane_basis(normal)
         origin = spec.point1.position_xyz
@@ -2185,14 +2200,23 @@ def _box_points(rng, lay, hub_xy, walls, spans, flanges, arms, n, b, weld_b, nor
             add([fr["a"][i] + h * fr["tip"][i] + s_c * fr["axis"][i] for i in range(3)],
                 fr["normal"], weld_b, f"wall_{edge}")
         lo, hi = spans[edge]
-        if rng.random() < BOX_WALL_POINT_P and hi - lo > 2.0 * b + 2.0 \
-                and h - tangent - 2.0 * b > 2.0:
+        want_wall = _draw_weighted(rng, BOX_WALL_POINTS)
+        placed_s: list = []
+        for _try in range(want_wall * 8):
+            if len(placed_s) >= want_wall:
+                break
+            if hi - lo <= 2.0 * b + 2.0 or h - tangent - 2.0 * b <= 2.0:
+                break
             t = rng.uniform(tangent + b, h - b)
             s = rng.uniform(lo + b, hi - b)
-            if all(abs(s - s_c) > b + tab_footprint_mm(r_, MIN_NEUTRAL_PLANE_RADIUS_MM)
+            if any(abs(s - s_c) <= b + tab_footprint_mm(r_, MIN_NEUTRAL_PLANE_RADIUS_MM)
                    for s_c, r_ in walls[edge]["tabs"]):
-                add([fr["a"][i] + t * fr["tip"][i] + s * fr["axis"][i] for i in range(3)],
-                    fr["normal"], b, f"wall_{edge}")
+                continue
+            if any(abs(s - o) < 2.0 * b + 2.0 for o in placed_s):
+                continue
+            placed_s.append(s)
+            add([fr["a"][i] + t * fr["tip"][i] + s * fr["axis"][i] for i in range(3)],
+                fr["normal"], b, f"wall_{edge}")
 
     for fl in flanges:                                          # 深さ2のフランジの上の点
         fr = lay["walls"][fl["wall"]]
@@ -2231,10 +2255,18 @@ def _box_points(rng, lay, hub_xy, walls, spans, flanges, arms, n, b, weld_b, nor
         width = arm["root_to_mm"] - arm["root_from_mm"]
         if arm["length_mm"] < 2.0 * b + 2.0 or width < 2.0 * b + 2.0:
             continue
-        t = rng.uniform(b + 1.0, arm["length_mm"] - b)
-        s = rng.uniform(b + 1.0, width - b - 1.0)
-        add([a2[i] + t * tip[i] + s * axis[i] for i in range(3)],
-            _unit(_cross3(tip, axis)), b, f"arm_{arm['edge']}")
+        want_arm = _draw_weighted(rng, BOX_ARM_POINTS)
+        got_s: list = []
+        for _try in range(want_arm * 8):
+            if len(got_s) >= want_arm:
+                break
+            t = rng.uniform(b + 1.0, arm["length_mm"] - b)
+            s = rng.uniform(b + 1.0, width - b - 1.0)
+            if any(abs(s - o) < 2.0 * b + 2.0 for o in got_s):
+                continue
+            got_s.append(s)
+            add([a2[i] + t * tip[i] + s * axis[i] for i in range(3)],
+                _unit(_cross3(tip, axis)), b, f"arm_{arm['edge']}")
 
     # ---- ハブの上の点(壁のフィレット帯・腕の根本・自由端から逃げる)
     want = _draw_weighted(rng, BOX_HUB_POINTS)
@@ -2285,6 +2317,10 @@ PANEL_ARMS = ((0, 0.20), (1, 0.25), (2, 0.25), (3, 0.20), (4, 0.10))
 PANEL_MAX_POINTS = 20
 PANEL_POINT_ATTEMPTS = 600
 PANEL_TABS = ((0, 0.35), (1, 0.35), (2, 0.30))
+# 締結点は境界(平地の端・曲げの接線・腕の縁)から座面半径の SEAT_MARGIN 倍だけ空ける。
+# ちょうど 1.0 倍で置くと座面比の中央値が 1.00 に張り付き、外形を近似した瞬間に割れる
+# (AMS 依頼 7、2026-09-09)。
+PANEL_SEAT_MARGIN = 1.15
 
 
 def _panel_beads(rng: random.Random, bearing_mm: float):
@@ -2407,9 +2443,9 @@ def panel_part(rng: random.Random, knobs: Knobs) -> Result | None:
             width = rng.uniform(max(2.0 * b + 4.0, 0.4 * (s1 - s0)), s1 - s0)
             t0 = rng.uniform(s0, s1 - width)
             length = rng.uniform(*COMPOSE_ARM_LENGTH_MM)
-            with_tab = tabs_left > 0 and width > 4.0 * COMPOSE_WELD_BEARING_MM[1]
+            with_tab = tabs_left > 0 and width > 4.0 * b
             if with_tab:
-                tab_r = rng.uniform(*COMPOSE_WELD_BEARING_MM)
+                tab_r = b        # 裁定 2026-09-09: 1部品1半径
                 tabs = _tabs_on(rng, tab_r, 2.0, width - 2.0, count=1)
                 outline = ({"kind": "tabs", "height_mm": length, "tabs": tabs}
                            if tabs else {"kind": "rect"})
@@ -2461,17 +2497,20 @@ def _panel_points(rng, spec, steps, arms, lands, bearing, n_panels):
                                spec.half_width_mm, arm["fold_deg"], arm["radius_mm"])
         width = arm["t1_mm"] - arm["t0_mm"]
         if arm["outline"]["kind"] == "tabs":
-            for s_c, r in arm["outline"]["tabs"]:
+            for s_c, _r in arm["outline"]["tabs"]:
                 pos = tuple(fr["a"][i] + arm["length_mm"] * fr["tip"][i] + s_c * fr["axis"][i]
                             for i in range(3))
                 points.append(FasteningPoint(position_xyz=pos, normal_xyz=fr["normal"]))
-                radii.append(r)
+                radii.append(bearing)   # 必要座面はタブ円の半径ではなく座面半径
                 arm["points"].append([arm["length_mm"], s_c, "weld"])
             continue
         if arm["length_mm"] < 2.0 * bearing + 2.0 or width < 2.0 * bearing + 2.0:
             continue
-        t = rng.uniform(bearing + 1.0, arm["length_mm"] - bearing)
-        s = rng.uniform(bearing + 1.0, width - bearing - 1.0)
+        m = bearing * PANEL_SEAT_MARGIN
+        if arm["length_mm"] < 2.0 * m or width < 2.0 * m:
+            continue
+        t = rng.uniform(m, arm["length_mm"] - m)
+        s = rng.uniform(m, width - m)
         pos = tuple(fr["a"][i] + t * fr["tip"][i] + s * fr["axis"][i] for i in range(3))
         points.append(FasteningPoint(position_xyz=pos, normal_xyz=fr["normal"]))
         radii.append(bearing)
@@ -2483,15 +2522,18 @@ def _panel_points(rng, spec, steps, arms, lands, bearing, n_panels):
             break
         k = rng.randrange(n_panels)
         st = steps[k]
-        lo = (bearing + 2.0) if k == 0 else 0.0
-        hi = st["length"] - ((bearing + 2.0) if k == n_panels - 1 else 0.0)
-        if hi - lo < 2.0 * bearing:
+        # 曲げの接線からも座面ぶん逃げる(裁定 2026-09-09: 座面は平らな円盤)。
+        # ちょうど 1.0 倍ではなく SEAT_MARGIN 倍空けて、座面比に余裕を持たせる。
+        m = bearing * PANEL_SEAT_MARGIN
+        lo = m + (2.0 if k == 0 else 0.0)
+        hi = st["length"] - m - (2.0 if k == n_panels - 1 else 0.0)
+        if hi - lo < 1.0:
             continue
-        t = rng.uniform(lo + bearing, hi - bearing)
+        t = rng.uniform(lo, hi)
         y_lo, y_hi = rng.choice(lands)
-        if y_hi - y_lo < 2.0 * bearing:
+        if y_hi - y_lo < 2.0 * m:
             continue
-        y = rng.uniform(y_lo + bearing, y_hi - bearing)
+        y = rng.uniform(y_lo + m, y_hi - m)
         pos = tuple(st["origin"][j] + t * st["direction"][j] + y * st["ey"][j]
                     for j in range(3))
         if any(math.dist(pos, q.position_xyz) < 2.0 * bearing + 2.0 for q in points):

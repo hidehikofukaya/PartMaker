@@ -11,7 +11,7 @@ import random
 from synthetic_generator.families import (
     ARM_TIP_RELIEF_MM, BOX_CORNER_R_MM, BOX_CORNER_R_OVER_T, BOX_DEEP_MIN_ROOT_MM,
     BOX_DRAW_RATIO, BOX_GROUPS, BOX_MAX_POINTS, BOX_RIB_FOLD_DEG, BOX_RIB_HEIGHT_MM,
-    BOX_WALL_FOLD_DEG, BOX_WALL_HEIGHT_MM, BOX_WELD_BEARING_MM, Knobs, box_bracket_part,
+    BOX_WALL_FOLD_DEG, BOX_WALL_HEIGHT_MM, Knobs, box_bracket_part,
 )
 from synthetic_generator.occt_build import box_frames
 
@@ -98,25 +98,26 @@ def test_points_carry_a_radius_and_an_owner():
         assert len(bx["point_radii"]) == n_points
         assert len(bx["point_owners"]) == n_points
         b = spec.min_bearing_radius_mm
-        weld = bx["weld_bearing_mm"]
-        assert BOX_WELD_BEARING_MM[0] <= weld <= BOX_WELD_BEARING_MM[1]
-        assert all(r in (b, weld) for r in bx["point_radii"])
+        # 裁定 2026-09-09: 1部品1半径(タブ溶接も部品の座面半径)
+        assert bx["weld_bearing_mm"] == b
+        assert all(r == b for r in bx["point_radii"])
         owners = set(bx["point_owners"])
         assert owners <= ({"hub"} | {f"wall_{k}" for k in bx["walls"]}
                           | {f"arm_{a['edge']}" for a in bx["arms"]}
                           | {f"flange_{i}" for i in range(len(bx["flanges"]))})
 
 
-def test_tab_points_use_the_weld_bearing_radius():
-    """壁の上端のタブ = 溶接。タブの本数と『壁が持ち主の溶接点』の数は一致する。"""
+def test_tabs_are_larger_than_the_seat_they_carry():
+    """タブの半円は座面半径より大きい(裁定 2026-09-09)。点はタブ円の中心に載るので、
+    半径が座面と同じだと外形を多角形で近似した瞬間に座面が割れる。"""
+    from synthetic_generator.families import TAB_SEAT_MARGIN
     for spec in _draw():
         bx = spec.box
-        weld = bx["weld_bearing_mm"]
-        for k, w in bx["walls"].items():
-            tabs = len(w["tabs"])
-            welds = sum(1 for owner, r in zip(bx["point_owners"], bx["point_radii"])
-                        if owner == f"wall_{k}" and r == weld)
-            assert welds == tabs
+        b = spec.min_bearing_radius_mm
+        for w in bx["walls"].values():
+            for _s, r in w["tabs"]:
+                assert r > b, (r, b)
+                assert abs(r - b * TAB_SEAT_MARGIN) < 1e-6
 
 
 def test_factors_span_their_ranges():

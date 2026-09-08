@@ -557,6 +557,86 @@ def _panel_variants(spec, count: int):
     return out
 
 
+def _panel_structure_variants(spec):
+    """大型パネルの**構造**変種(AMS 依頼 7 §3-2)。締結点を保持していない要素だけ落とす。
+    ビードは平地に点を置く設計なので、外しても締結点は保持される。"""
+    pn = spec.panel
+    out = []
+
+    def has_point(arm):
+        return bool(arm.get("points"))
+
+    def add(label, beads=False, walls=False, arms=False):
+        new_beads = [] if beads else pn["beads"]
+        keep = [a for a in pn["arms"]
+                if has_point(a) or (a["role"] == "wall" and not walls)
+                or (a["role"] == "arm" and not arms)]
+        if len(new_beads) == len(pn["beads"]) and len(keep) == len(pn["arms"]):
+            return
+        new = dict(pn, beads=new_beads, arms=keep,
+                   bead_spans=[] if beads else pn["bead_spans"])
+        out.append(Variant("structure", label, dataclasses.replace(spec, panel=new),
+                           None, None, None,
+                           {"structure": [{"beads": len(pn["beads"]), "arms": len(pn["arms"])},
+                                          {"beads": len(new_beads), "arms": len(keep)}]}))
+
+    add("nobeads", beads=True)
+    add("nowall", walls=True)
+    add("noarms", arms=True)
+    add("plain", beads=True, walls=True, arms=True)
+    return out
+
+
+def _box_structure_variants(spec):
+    """多面ブラケットの**構造**変種(AMS 依頼 7 §3-2、2026-09-09)。同じ締結点に対して
+    構造だけを変える。締結点を保持している要素は外せないので、`point_owners` を見て
+    「点の載っていない要素」だけを落とす。"""
+    bx = spec.box
+    owners = set(bx.get("point_owners") or ())
+    out = []
+
+    def drop(label, walls=False, arms=False, flanges=False, rib=False):
+        w = dict(bx["walls"])
+        closed = list(bx["closed"])
+        if walls:
+            w = {k: v for k, v in w.items()
+                 if f"wall_{k}" in owners or v["tabs"]
+                 or any(str(f["wall"]) == str(k) for f in bx["flanges"])}
+            closed = [c for c in closed if len(w) >= 2]
+        fl = bx["flanges"]
+        dp = bx["deep"]
+        if flanges:
+            keep = [i for i, f in enumerate(fl)
+                    if f"flange_{i}" in owners
+                    or any(d["flange"] == i and f"deep_{j}" in owners
+                           for j, d in enumerate(dp))]
+            fl = [fl[i] for i in keep]
+            remap = {old: new for new, old in enumerate(keep)}
+            dp = [dict(d, flange=remap[d["flange"]]) for d in dp if d["flange"] in remap]
+        a = bx["arms"]
+        if arms:
+            a = [x for x in a if f"arm_{x['edge']}" in owners]
+        r = None if rib else bx.get("rib")
+        new = dict(bx, walls=w, closed=closed, flanges=fl, deep=dp, arms=a, rib=r)
+        changed = {"structure": [
+            {"walls": len(bx["walls"]), "flanges": len(bx["flanges"]),
+             "arms": len(bx["arms"]), "rib": 1 if bx.get("rib") else 0},
+            {"walls": len(w), "flanges": len(fl), "arms": len(a), "rib": 0 if rib else
+             (1 if bx.get("rib") else 0)}]}
+        if changed["structure"][0] == changed["structure"][1]:
+            return
+        out.append(Variant("structure", label, dataclasses.replace(spec, box=new),
+                           None, None, None, changed))
+
+    drop("nowall", walls=True)
+    drop("noarms", arms=True)
+    drop("noflange", flanges=True)
+    if bx.get("rib"):
+        drop("norib", rib=True)
+    drop("plain", walls=True, arms=True, flanges=True, rib=True)
+    return out
+
+
 def _structure_variants(spec, bead, flange, rib, rng):
     """合成族の構造変種(依頼 原則 C)。同じ締結点に対して構造だけを変える。
     腕を消す変種は腕の上に締結点が無い部品だけ(裁定 2026-09-06)。切欠き・壁腕・断面の
@@ -629,8 +709,10 @@ def propose_variants(meta: dict, *, count: int = 8, rng: random.Random | None = 
         groups.append(_drawn_variants(spec, 3))
     elif spec.box is not None:                    # box_bracket(多面ブラケット)
         groups.append(_box_variants(spec, 3))
+        groups.append(_box_structure_variants(spec))
     elif spec.panel is not None:                  # 大型パネル
         groups.append(_panel_variants(spec, 3))
+        groups.append(_panel_structure_variants(spec))
     elif spec.compose is not None:                # 合成族: 構造レベルの変種
         groups.append(_structure_variants(spec, bead, flange, rib, rng))
     else:
@@ -668,7 +750,8 @@ def build_variant(builder, variant: Variant, out_dir: str, name: str):
             dr["hub_xy"], dr["walls"], dr["arms"], origin=tuple(dr["origin"]),
             hub_u=tuple(dr["hub_u"]), hub_v=tuple(dr["hub_v"]), seam_fillet_mm=dr["seam_fillet_mm"],
             corner_radius=dr["corner_radius"], out_dir=out_dir, part_name=name,
-            check_points=spec.annotated_points)
+            check_points=spec.annotated_points,
+            check_radii=(spec.min_bearing_radius_mm,) * len(spec.annotated_points))
     if spec.channel is not None:
         geom = {k: (tuple(v) if isinstance(v, list) else v) for k, v in spec.channel.items()
                 if k not in ("diag_deg", "seat_width_mm")}
