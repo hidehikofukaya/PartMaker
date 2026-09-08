@@ -610,7 +610,8 @@ def build_variant(builder, variant: Variant, out_dir: str, name: str):
             set(bx["closed"]), bx["arms"], origin=tuple(bx["origin"]),
             hub_u=tuple(bx["hub_u"]), hub_v=tuple(bx["hub_v"]),
             corner_r_mm=bx["corner_r_mm"], out_dir=out_dir, part_name=name,
-            flanges=bx["flanges"], check_points=spec.annotated_points,
+            flanges=bx["flanges"], rib=bx.get("rib"), deep=bx.get("deep", ()),
+            check_points=spec.annotated_points,
             check_radii=tuple(bx.get("point_radii", ())))
     if spec.drawn is not None:
         dr = spec.drawn

@@ -9,7 +9,8 @@ import math
 import random
 
 from synthetic_generator.families import (
-    BOX_CORNER_R_MM, BOX_CORNER_R_OVER_T, BOX_DRAW_RATIO, BOX_GROUPS, BOX_MAX_POINTS,
+    ARM_TIP_RELIEF_MM, BOX_CORNER_R_MM, BOX_CORNER_R_OVER_T, BOX_DEEP_MIN_ROOT_MM,
+    BOX_DRAW_RATIO, BOX_GROUPS, BOX_MAX_POINTS, BOX_RIB_FOLD_DEG, BOX_RIB_HEIGHT_MM,
     BOX_WALL_FOLD_DEG, BOX_WALL_HEIGHT_MM, BOX_WELD_BEARING_MM, Knobs, box_bracket_part,
 )
 from synthetic_generator.occt_build import box_frames
@@ -32,23 +33,32 @@ def _ccw_convex(xy) -> bool:
                for i in range(n))
 
 
-def test_hub_is_a_ccw_convex_polygon():
+def test_hub_is_a_ccw_polygon_with_two_vertices_per_relief():
+    """基の多角形は 3〜6 辺の凸。角の逃げを掘ると 1 か所につき 2 頂点増えて凹になる。"""
     for spec in _draw():
-        hub = [tuple(q) for q in spec.box["hub_xy"]]
-        assert 3 <= len(hub) <= 6
-        assert _ccw_convex(hub), hub
+        bx = spec.box
+        hub = [tuple(q) for q in bx["hub_xy"]]
+        assert 3 <= bx["factors"]["sides"] <= 6
+        assert len(hub) == bx["factors"]["sides"] + 2 * bx["relief_corners"]
+        if not bx["relief_corners"]:
+            assert _ccw_convex(hub), hub
 
 
-def test_adjacent_walls_always_share_a_sewn_corner():
-    """隣り合う辺の両方に壁があるなら角は継ぎ目にする(開けると根本フィレットが衝突する)。"""
+def test_adjacent_walls_are_either_sewn_or_relieved():
+    """隣り合う辺の両方に壁があるなら、角は継ぎ目にするか逃げを掘るかのどちらか。
+    そのまま開けると 2 本の根本フィレットが頂点で衝突して OCCT が収束しない。"""
     for spec in _draw():
         bx = spec.box
         n = len(bx["hub_xy"])
         walls = {int(k) for k in bx["walls"]}
         closed = set(bx["closed"])
+        notch = set(bx["notch_edges"])
         for k in range(n):
-            both = (k - 1) % n in walls and k % n in walls
-            assert both == (k in closed), (k, sorted(walls), sorted(closed))
+            if (k - 1) % n in walls and k % n in walls:
+                assert k in closed, (k, sorted(walls), sorted(closed))
+        # 逃げを掘った角は、2 枚の壁の辺のあいだにノッチの辺が挟まっている
+        assert (bx["relief_corners"] > 0) == bool(notch)
+        assert not (notch & walls)
 
 
 def test_arms_and_walls_never_share_an_edge():
@@ -161,3 +171,50 @@ def test_draw_depth_stays_inside_the_real_envelope():
             lam = min(lay["walls"][kx]["ends"]["right"]["t"] / lay["walls"][kx]["ends"]["right"]["dt"],
                       lay["walls"][ky]["ends"]["left"]["t"] / lay["walls"][ky]["ends"]["left"]["dt"])
             assert lam <= cap * bx["corner_r_mm"] + 1e-6, (lam, bx["corner_r_mm"])
+
+
+def test_relief_notches_separate_the_two_wall_roots():
+    """逃げを掘った角では、壁の辺どうしがノッチの辺 2 本で隔てられている。"""
+    for spec in _draw(40, group="bend"):
+        bx = spec.box
+        n = len(bx["hub_xy"])
+        walls = {int(k) for k in bx["walls"]}
+        notch = set(bx["notch_edges"])
+        assert not bx["closed"], "bend 群に継ぎ目は無い"
+        assert len(notch) == 2 * bx["relief_corners"]
+        for k in walls:
+            for step in (1, -1):
+                nb = (k + step) % n
+                assert nb not in walls, "隣り合う壁はノッチで隔てられているはず"
+
+
+def test_rib_only_on_quads_with_free_top_and_bottom_edges():
+    """リブは折り線に直交する境界が要る。四角形のハブで辺0・辺2 が空いているときだけ。"""
+    for spec in _draw(60):
+        bx = spec.box
+        rib = bx.get("rib")
+        if rib is None:
+            continue
+        assert len(bx["hub_xy"]) == 4
+        assert not bx["relief_corners"]
+        walls = {int(k) for k in bx["walls"]}
+        assert not walls & {0, 2}
+        assert not {a["edge"] for a in bx["arms"]} & {0, 2}
+        assert BOX_RIB_HEIGHT_MM[0] <= rib["height_mm"] <= BOX_RIB_HEIGHT_MM[1]
+        assert BOX_RIB_FOLD_DEG[0] <= rib["fold_deg"] <= BOX_RIB_FOLD_DEG[1]
+        run = rib["height_mm"] / math.tan(math.radians(rib["fold_deg"]))
+        assert rib["t1_mm"] - rib["t0_mm"] >= 2.0 * run + 4.0, "帯が天面を取れる幅"
+        # 帯はハブの内側(上下辺を横切る範囲)に収まる
+        assert bx["hub_xy"][3][0] < rib["t0_mm"] < rib["t1_mm"] < bx["hub_xy"][2][0]
+
+
+def test_depth3_panels_sit_on_the_flange_tip():
+    for spec in _draw(60):
+        bx = spec.box
+        for dp in bx["deep"]:
+            fl = bx["flanges"][dp["flange"]]
+            assert fl["outline"]["kind"] == "rect"
+            width = fl["to_mm"] - fl["from_mm"]
+            assert ARM_TIP_RELIEF_MM < dp["from_mm"] < dp["to_mm"] < width - ARM_TIP_RELIEF_MM
+            assert dp["to_mm"] - dp["from_mm"] >= BOX_DEEP_MIN_ROOT_MM - 1e-9
+            assert dp["side"] in (1, -1)
