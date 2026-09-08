@@ -218,6 +218,9 @@ class GeneralTwoJointSpec:
     channel: dict | None = None
     # 実車057の簡略版(ハブ + 絞りの角 + 曲げタブ)。入っていれば `build_drawn_tray` で作る。
     drawn: dict | None = None
+    # 合成族(2026-09-06、AutoMetalSheet 依頼)。掃引 + 側辺の腕 + 切欠き + 非対称余白。
+    # {"factors": {...}, "arms": [...], "notches": [...], "side_extension_mm": [neg, pos]}
+    compose: dict | None = None
 
 
 def _random_unit_vector(rng: random.Random) -> Vec3:

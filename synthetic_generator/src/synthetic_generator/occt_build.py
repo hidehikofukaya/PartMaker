@@ -803,6 +803,86 @@ class _Bend:
     normal: Vec3      # 曲げ手前のパネル法線(曲げ中心の計算に使う)
 
 
+def _widen_section(section, y_breaks, ext_neg: float, ext_pos: float):
+    """断面の両端の平地要素を外へ広げる(非対称余白)。y_breaks も揃える。"""
+    section = list(section)
+    first, last = section[0], section[-1]
+    section[0] = (first[0], (first[1][0] - ext_neg, first[1][1]), first[2], first[3])
+    section[-1] = (last[0], last[1], (last[2][0] + ext_pos, last[2][1]), last[3])
+    y_breaks = list(y_breaks)
+    y_breaks[0] -= ext_neg
+    y_breaks[-1] += ext_pos
+    return section, y_breaks
+
+
+def _check_bearing_margin(shape, points, radii, tolerance_mm: float = 0.3) -> None:
+    """締結点から外形(自由エッジ)までの距離が座面半径以上か(ML 側の「座面比」)。
+    腕や切欠きが座面に食い込む配置を弾く(2026-09-06 夜、ML 返答: 第1期は 600 部品中 17 で
+    0.95 未満。原因は台形の腕の斜辺と、隣の腕の側辺)。"""
+    amap = TopTools_IndexedDataMapOfShapeListOfShape()
+    topexp.MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, amap)
+    free = [topods.Edge(amap.FindKey(i)) for i in range(1, amap.Size() + 1)
+            if amap.FindFromIndex(i).Size() == 1]
+    for index, (point, radius) in enumerate(zip(points, radii)):
+        vertex = BRepBuilderAPI_MakeVertex(gp_Pnt(*point.position_xyz)).Vertex()
+        worst = float("inf")
+        for edge in free:
+            dist = BRepExtrema_DistShapeShape(vertex, edge)
+            dist.Perform()
+            worst = min(worst, dist.Value())
+        if worst < radius - tolerance_mm:
+            raise ValueError(
+                f"fastening point {index + 1} is {worst:.1f}mm from the outline "
+                f"(bearing radius {radius:.1f}mm). Infeasible; resample."
+            )
+
+
+def sweep_steps(plan, bend_radius_mm: float):
+    """掃引の直線区間ごとの実フレーム(合成族の腕・切欠き・追加点が使う。OCCT を呼ばない)。
+
+    戻り値: [{"panel", "origin"(区間の始点=中心線上), "ey"(幅方向 +v 側が正), "ez"(法線),
+             "direction"(単位), "vector", "length"}, ...] と、共通折り軸 w。
+    区間の始点は曲げの接線点(端パネルでは帯の端)。パネルの側辺は origin + t*direction
+    + (±half_width)*ey、t ∈ [0, length]。
+    """
+    path, start, w, normal0 = _build_path(plan, bend_radius_mm)
+    ey = w if _dot(w, plan.panel_frames[0].v) > 0 else _scale(w, -1.0)
+    frame = _Frame(start, ey, normal0)
+    steps = []
+    for step in path:
+        if isinstance(step, _Straight):
+            steps.append({"panel": step.panel, "origin": frame.origin, "ey": frame.ey,
+                          "ez": frame.ez, "direction": step.direction, "vector": step.vector,
+                          "length": step.length})
+            frame = frame.translated(step.vector)
+        else:
+            sign = 1.0 if step.angle > 0 else -1.0
+            centre = _add(frame.origin, _scale(step.normal, -sign * step.radius))
+            frame = frame.rotated(centre, w, step.angle)
+    return steps, w
+
+
+def compose_arm_frame(step: dict, side: int, t0: float, t1: float, half_width_mm: float,
+                      fold_deg: float, radius_mm: float) -> dict:
+    """掃引パネルの側辺 (t0..t1、側 side) を根本にした腕のフレーム(分岐族の腕と同じ約束:
+    裏側 = -法線側へ折る)。戻り値は branch_frames の腕と同じキー。"""
+    n = step["ez"]
+    y = side * half_width_mm
+    p0 = _add(step["origin"], _add(_scale(step["direction"], t0), _scale(step["ey"], y)))
+    p1 = _add(step["origin"], _add(_scale(step["direction"], t1), _scale(step["ey"], y)))
+    # outward = cross(axis, n) が帯の外(side*ey)を向くように根本の向きを決める
+    a, b = (p1, p0) if side > 0 else (p0, p1)
+    axis = _normalize(_add(b, _scale(a, -1.0)))
+    outward = _normalize(_cross(axis, n))
+    angle = math.radians(fold_deg)
+    centre = _add(a, _scale(n, -radius_mm))
+    tip = _normalize(_add(_scale(outward, math.cos(angle)), _scale(n, -math.sin(angle))))
+    return {"a": _rotate_about(a, centre, axis, angle), "b": _rotate_about(b, centre, axis, angle),
+            "tip": tip, "axis": axis, "width": math.dist(a, b),
+            "normal": _normalize(_cross(tip, axis)), "root_a": a, "root_b": b,
+            "centre": centre, "angle": angle, "revolve_axis": axis, "side": -1}
+
+
 def _build_path(plan, bend_radius_mm: float) -> tuple[list, Vec3, Vec3, Vec3]:
     """パネル列から (経路, 開始点, 共通折れ目軸w, 開始パネル法線) を作る。
 
@@ -1169,6 +1249,14 @@ class OcctPartBuilder:
         bead: BeadParams | None = None,
         flange: FlangeParams | None = None,
         rib: RibParams | None = None,
+        # 合成族(2026-09-06): 側辺の腕、側辺の切欠き、非対称余白
+        arms=(),
+        notches=(),
+        side_extension_mm: tuple[float, float] = (0.0, 0.0),
+        # ビードを全長ではなく区間 [s0, s3](中心線の弧長)に置く(合成族 第2期)。None なら全長。
+        bead_span: tuple[float, float] | None = None,
+        # 締結点ごとの座面半径。指定すると「点から外形までの距離 >= 半径」を最終形状で検査する。
+        check_radii: tuple = (),
     ) -> GeneratedPart:
         # 1部品1特徴が原則。例外はビード + フランジだけ(実車014型で「両側フランジ +
         # 中央ビード」が1点と2点の間の剛性を担っている。ユーザー決定 2026-09-04)。
@@ -1191,8 +1279,10 @@ class OcctPartBuilder:
             fold1_slack_mm=fold1_slack_mm,
             fold2_slack_mm=fold2_slack_mm,
             fold1_tilt_perturbation_rad=0.0,
+            side_extension_mm=side_extension_mm,
             target_folds=target_folds,
         )
+        ext_neg, ext_pos = side_extension_mm
 
         path, start, w, normal0 = _build_path(plan, bend_radius_mm)
         ey = w if _dot(w, plan.panel_frames[0].v) > 0 else _scale(w, -1.0)
@@ -1216,6 +1306,9 @@ class OcctPartBuilder:
         elif bead is not None:
             lift = self._bead_lift(path, bead, bend_radius_mm)
             section, y_breaks = _bead_section(bead, lift, half_width_mm)
+            if flange is None and (ext_neg > 0.0 or ext_pos > 0.0):
+                # 非対称余白: 断面の両端の平地要素だけを広げる(ビードの位置は帯の中心のまま)
+                section, y_breaks = _widen_section(section, y_breaks, ext_neg, ext_pos)
             flat = _flat_section(y_breaks)
             if flange is not None:
                 # ランアウトの loft は断面どうしの要素が1対1で対応する必要があるので、
@@ -1224,17 +1317,21 @@ class OcctPartBuilder:
                 section = _with_flange(section, flange, half_width_mm)
                 flat = _with_flange(flat, flange, half_width_mm)
             self._sweep_with_bead(path, frame, w, section, flat,
-                                  bead, min_bearing_radius_mm, faces)
+                                  bead, min_bearing_radius_mm, faces, placed=bead_span)
         elif rib is not None:
             self._build_rib_part(plan, w, ey, rib, half_width_mm, bend_radius_mm, faces)
         else:
             section = (_flange_section(flange, half_width_mm) if flange is not None
-                       else _flat_section([-half_width_mm, half_width_mm]))
+                       else _flat_section([-half_width_mm - ext_neg, half_width_mm + ext_pos]))
             if flange is not None:
                 self._check_flange_radii(path, flange, bend_radius_mm)
             self._sweep_uniform(path, frame, w, section, faces)
 
         shape, faces = self._sew(faces)
+        if arms:
+            steps, _w = sweep_steps(plan, bend_radius_mm)
+            shape, faces = self._attach_side_arms(shape, faces, steps, arms,
+                                                  half_width_mm, side_extension_mm)
         shape, faces = self._apply_corner_relief(
             shape, faces, path, start, ey, normal0, w,
             half_width_mm=half_width_mm,
@@ -1242,8 +1339,16 @@ class OcctPartBuilder:
             # 両側フランジは隅を落とす余地が無い(side=0で左右とも除外)。
             exclude_side=(None if flange is None else
                           (0 if flange.both_sides else flange.side)),
+            side_extension_mm=side_extension_mm,
         )
+        if notches:
+            steps, _w = sweep_steps(plan, bend_radius_mm)
+            shape, faces = self._cut_side_notches(shape, faces, steps, notches,
+                                                  half_width_mm, side_extension_mm)
         shape, faces = self._unify(shape, faces)
+        if check_radii:
+            wanted = check_points if check_points is not None else (point1, point2, *extra_points)
+            _check_bearing_margin(shape, wanted, check_radii)
         os.makedirs(out_dir, exist_ok=True)
         stp_path = os.path.abspath(os.path.join(out_dir, part_name + "_mid.stp"))
         _export_step(shape, faces, stp_path)
@@ -1259,6 +1364,124 @@ class OcctPartBuilder:
             raise
         return GeneratedPart(stp_path=stp_path, catpart_path="",
                              face_labels=tuple(describe_faces(faces)))
+
+    def _attach_side_arms(self, shape, faces, steps, arms, half_width_mm: float,
+                          side_extension_mm):
+        """掃引パネルの側辺の一部を根本にして腕を縫合する(合成族)。縫合はエッジの一部への
+        接続を扱える(2026-09-06 実証: 帯の長い側辺の一部に腕を縫っても外形ループ 1)。
+
+        arms[i] = {"panel", "side", "t0_mm", "t1_mm", "fold_deg", "radius_mm", "length_mm",
+                   "outline"(rect/trapezoid/tabs), "relief_mm"}
+        """
+        new_faces = dict(faces)
+        groups: dict = {}
+        by_panel: dict = {}
+        roots: dict = {}
+        for i, arm in enumerate(arms):
+            step = steps[arm["panel"]]
+            width = half_width_mm + (side_extension_mm[1] if arm["side"] > 0 else side_extension_mm[0])
+            fr = compose_arm_frame(step, arm["side"], arm["t0_mm"], arm["t1_mm"], width,
+                                   arm["fold_deg"], arm["radius_mm"])
+            root = BRepBuilderAPI_MakeEdge(gp_Pnt(*fr["root_a"]), gp_Pnt(*fr["root_b"])).Edge()
+            bend = topods.Face(BRepPrimAPI_MakeRevol(
+                root, gp_Ax1(gp_Pnt(*fr["centre"]), gp_Dir(*fr["axis"])), fr["angle"]).Shape())
+            outline = arm.get("outline") or {"kind": "rect"}
+            relief = arm.get("relief_mm", ARM_TIP_RELIEF_MM)
+            if outline["kind"] == "tabs":
+                face = self._tab_arm_face(fr["a"], fr["b"], fr["tip"], fr["axis"],
+                                          outline["height_mm"], outline["tabs"],
+                                          outline.get("root_r_mm", MIN_NEUTRAL_PLANE_RADIUS_MM))
+            elif outline["kind"] == "trapezoid":
+                face = self._trapezoid_arm_face(fr["a"], fr["b"], fr["tip"], fr["axis"],
+                                                arm["length_mm"], outline["shrink_a_mm"],
+                                                outline["shrink_b_mm"], relief)
+            else:
+                face = self._arm_face(fr["a"], fr["b"], fr["tip"], fr["axis"], arm["length_mm"], relief)
+            new_faces[bend] = f"bend_arm_{i}"
+            new_faces[face] = f"arm_{i}"
+            groups[i] = [bend, face]
+            by_panel[i] = arm["panel"]
+            roots[i] = root
+        # 腕どうし
+        self._check_arm_clearance(groups)
+        # 腕と帯の面。根本エッジに触れている面(根本のパネルとその隣の細片)は除く —
+        # 名前ではなく幾何で除く(ビード/リブの掃引はパネルを走行方向に細かく割るため)。
+        for i, group in groups.items():
+            root = roots[i]
+            for face, name in faces.items():
+                touch = BRepExtrema_DistShapeShape(root, face)
+                touch.Perform()
+                if touch.Value() < 0.05:
+                    continue
+                for own in group:
+                    dist = BRepExtrema_DistShapeShape(own, face)
+                    dist.Perform()
+                    if dist.Value() < ARM_CLEARANCE_MM:
+                        raise ValueError(
+                            f"arm {i} comes within {dist.Value():.2f}mm of {name}. Infeasible.")
+        return self._sew(new_faces)
+
+    def _cut_side_notches(self, shape, faces, steps, notches, half_width_mm: float,
+                          side_extension_mm):
+        """側辺の切欠き(合成族、原則 D「凸包でない基板」)。角の逃げと同じブーリアン切削。
+
+        notches[j] = {"panel", "side", "t_mm"(中心), "kind": "arc"|"rect", "radius_mm"(arc),
+                      "depth_mm", "length_mm"(rect), "corner_r_mm"(rect の内側の隅)}
+        """
+        for notch in notches:
+            step = steps[notch["panel"]]
+            side = notch["side"]
+            width = half_width_mm + (side_extension_mm[1] if side > 0 else side_extension_mm[0])
+            frame = _Frame(step["origin"], step["ey"], step["ez"])
+
+            def at(t, y):
+                return _add(frame.origin, _add(_scale(step["direction"], t), _scale(frame.ey, y)))
+            t_c, y_edge = notch["t_mm"], side * width
+            if notch["kind"] == "arc":
+                r = notch["radius_mm"]
+                p0, p1 = at(t_c - r, y_edge), at(t_c + r, y_edge)
+                mid_in = at(t_c, y_edge - side * r)
+                mid_out = at(t_c, y_edge + side * r)
+                arc_in = GC_MakeArcOfCircle(gp_Pnt(*p0), gp_Pnt(*mid_in), gp_Pnt(*p1)).Value()
+                arc_out = GC_MakeArcOfCircle(gp_Pnt(*p1), gp_Pnt(*mid_out), gp_Pnt(*p0)).Value()
+                wire = BRepBuilderAPI_MakeWire(BRepBuilderAPI_MakeEdge(arc_in).Edge(),
+                                               BRepBuilderAPI_MakeEdge(arc_out).Edge()).Wire()
+            else:
+                d, L, rc = notch["depth_mm"], notch["length_mm"], notch["corner_r_mm"]
+                # (t, y) の2D で内側の2隅を丸めた矩形。外側は辺の外へ 5mm はみ出させる。
+                y_in, y_out = y_edge - side * d, y_edge + side * 5.0
+                c0, c1 = (t_c - L / 2.0, y_in), (t_c + L / 2.0, y_in)
+                o0, o1 = (t_c - L / 2.0, y_out), (t_c + L / 2.0, y_out)
+                f0 = _fillet_corner_2d(o0, c0, c1, rc)
+                f1 = _fillet_corner_2d(c0, c1, o1, rc)
+                pts2 = [("line", o0, f0[0]), ("arc", f0[0], f0[1], f0[2]), ("line", f0[2], f1[0]),
+                        ("arc", f1[0], f1[1], f1[2]), ("line", f1[2], o1), ("line", o1, o0)]
+                maker = BRepBuilderAPI_MakeWire()
+                for e in pts2:
+                    if e[0] == "line":
+                        maker.Add(BRepBuilderAPI_MakeEdge(gp_Pnt(*at(*e[1])), gp_Pnt(*at(*e[2]))).Edge())
+                    else:
+                        arc = GC_MakeArcOfCircle(gp_Pnt(*at(*e[1])), gp_Pnt(*at(*e[2])),
+                                                 gp_Pnt(*at(*e[3]))).Value()
+                        maker.Add(BRepBuilderAPI_MakeEdge(arc).Edge())
+                wire = maker.Wire()
+            face = BRepBuilderAPI_MakeFace(wire, True).Face()
+            shift = gp_Trsf()
+            shift.SetTranslation(gp_Vec(*_scale(frame.ez, -CUT_TOOL_HALF_DEPTH_MM)))
+            face = topods.Face(BRepBuilderAPI_Transform(face, shift, True).Shape())
+            tool = BRepPrimAPI_MakePrism(face, gp_Vec(*_scale(frame.ez, 2.0 * CUT_TOOL_HALF_DEPTH_MM))).Shape()
+            cut = BRepAlgoAPI_Cut(shape, tool)
+            cut.Build()
+            if not cut.IsDone():
+                raise ValueError("side notch boolean failed. Infeasible.")
+            faces = {
+                topods.Face(m): name
+                for f, name in faces.items()
+                for m in (list(cut.Modified(f)) or [f])
+                if not cut.IsDeleted(f)
+            }
+            shape = cut.Shape()
+        return shape, faces
 
     # -------------------------------------------------------- 掃引
 
@@ -1285,8 +1508,10 @@ class OcctPartBuilder:
             frame = self._sweep_segment(step, frame, w, section, faces, tag)
 
     def _sweep_with_bead(self, path, frame: _Frame, w: Vec3, bead_section, flat_section,
-                         bead: BeadParams, min_bearing_radius_mm: float, faces) -> None:
-        """平地 -> ランアウト -> ビード -> ランアウト -> 平地 の順に掃引する。"""
+                         bead: BeadParams, min_bearing_radius_mm: float, faces,
+                         placed=None) -> None:
+        """平地 -> ランアウト -> ビード -> ランアウト -> 平地 の順に掃引する。
+        `placed=(s0, s3)` を渡すとビードをその区間に置く(合成族の区間ビード)。"""
         # 区間を s で並べ、ランアウトが収まる直線区間を探す(`general_geometry` と
         # 同じ規則。開始位置を端パネルに固定しない — 固定すると折れ目が締結点の
         # 近くにある構成が全部ビード不可になる)。
@@ -1300,7 +1525,17 @@ class OcctPartBuilder:
         # ランアウトは深さの2倍で**固定**する。空きに合わせて縮めると走り終いの壁が
         # ほぼ垂直になり、実物のビードに見えない(2026-09-04のユーザー指摘)。
         runout = max(BEAD_MIN_RUNOUT_MM, RUNOUT_DEPTH_RATIO * bead.depth_mm)
-        placed = bead_placement(spans, total, inset, runout)
+        if placed is None:
+            placed = bead_placement(spans, total, inset, runout)
+        else:
+            # 区間ビード: ランアウトは直線区間の中に完全に収まっていること
+            s0, s3 = placed
+            straights = [(a, b) for a, b, st in spans if st]
+            if not any(a - 1e-6 <= s0 and s0 + runout <= b + 1e-6 for a, b in straights) or \
+                    not any(a - 1e-6 <= s3 - runout and s3 <= b + 1e-6 for a, b in straights):
+                raise ValueError("a bead run-out would sit on a bend. Infeasible.")
+            if s0 < inset - 1e-6 or s3 > total - inset + 1e-6:
+                raise ValueError("the bead span runs into a bearing area. Infeasible.")
         if placed is None:
             raise ValueError(
                 f"a bead with {runout:.1f}mm run-outs does not fit between the bearing areas "
@@ -2467,7 +2702,8 @@ class OcctPartBuilder:
         return result, final
 
     def _apply_corner_relief(self, shape, faces, path, start: Vec3, ey: Vec3, ez: Vec3, w: Vec3,
-                             *, half_width_mm: float, radius_mm: float, exclude_side):
+                             *, half_width_mm: float, radius_mm: float, exclude_side,
+                             side_extension_mm: tuple[float, float] = (0.0, 0.0)):
         """両端の隅を R=締結点の必要最小半径 で丸めて落とす(実務の余肉カット)。
         フランジ部品はフランジ側の2隅を残す。"""
         excluded = () if exclude_side is None else (
@@ -2502,7 +2738,8 @@ class OcctPartBuilder:
             for side in (-1, 1):
                 if side in excluded:
                     continue
-                tools.append(self._relief_tool(frm, inward, side, half_width_mm, radius_mm))
+                width = half_width_mm + (side_extension_mm[1] if side > 0 else side_extension_mm[0])
+                tools.append(self._relief_tool(frm, inward, side, width, radius_mm))
         for tool in tools:
             cut = BRepAlgoAPI_Cut(shape, tool)
             cut.Build()

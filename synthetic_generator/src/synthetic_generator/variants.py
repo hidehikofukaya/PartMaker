@@ -39,7 +39,11 @@ from synthetic_generator.flange import (
     FLANGE_HEIGHT_RANGE_MM, FLANGE_ROOT_RADIUS_RANGE_MM, FlangeParams, max_flange_height_mm,
 )
 from synthetic_generator.general_geometry import check_bead_feasible_occt, plan_for
-from synthetic_generator.occt_build import ARM_TIP_RELIEF_MM, branch_frames, channel_seat_frames
+from synthetic_generator.occt_build import (
+    ARM_TIP_RELIEF_MM, branch_frames, channel_seat_frames, sweep_steps,
+)
+from synthetic_generator.families import _compose_rib
+from synthetic_generator.templates.general_two_point import resolve_bead_slacks
 from synthetic_generator.rib import RibParams, leg_room_mm, sample_rib
 from synthetic_generator.templates.general_two_point import (
     FOLD_SLACK_RANGE_MM, MAX_HALF_WIDTH_MM, GeneralTwoJointSpec, _flange_feasible,
@@ -436,6 +440,53 @@ def _drawn_variants(spec, count: int):
     return out
 
 
+def _structure_variants(spec, bead, flange, rib, rng):
+    """合成族の構造変種(依頼 原則 C)。同じ締結点に対して構造だけを変える。
+    腕を消す変種は腕の上に締結点が無い部品だけ(裁定 2026-09-06)。切欠き・壁腕・断面の
+    付け外しは締結点に依らない(第2期、ML 返答)。"""
+    cp = spec.compose
+    arm_points = any(a["points"] for a in cp["arms"] if a.get("role", "arm") == "arm")
+    out = []
+
+    def variant(label, comp, b=None, f=None, r=None, changed=None):
+        c2 = dict(comp)
+        c2["factors"] = dict(comp["factors"], structure_variant=label)
+        return Variant("structure", label, dataclasses.replace(spec, compose=c2), b, f, r, changed or {})
+
+    walls = [a for a in cp["arms"] if a.get("role") == "wall"]
+    real_arms = [a for a in cp["arms"] if a.get("role", "arm") == "arm"]
+    # plain: 断面・壁・腕・切欠き無し(腕上に点が無いときだけ)
+    if not arm_points and (bead or rib or cp["arms"] or cp["notches"]):
+        out.append(variant("plain", dict(cp, arms=[], notches=[], side_extension_mm=[0.0, 0.0]),
+                           changed={"structure": ["original", "plain"]}))
+    # 切欠き
+    if cp["notches"]:
+        out.append(variant("nonotch", dict(cp, notches=[]), bead, None, rib,
+                           {"notches": [len(cp["notches"]), 0]}))
+    # 壁腕
+    if walls:
+        out.append(variant("nowall", dict(cp, arms=real_arms), bead, None, rib, {"walls": [len(walls), 0]}))
+    # 腕
+    if real_arms and not arm_points:
+        out.append(variant("noarms", dict(cp, arms=walls), bead, None, rib, {"arms": [len(real_arms), 0]}))
+    # 断面の付け外し
+    if bead is not None:
+        out.append(variant("nobead", dict(cp, bead_span=None), None, None, None, {"section": ["bead", "none"]}))
+    elif rib is not None:
+        out.append(variant("norib", cp, None, None, None, {"section": ["rib", "none"]}))
+    else:
+        got = None
+        for _ in range(6):
+            got = resolve_bead_slacks(rng, spec, sample_bead(rng, spec.half_width_mm))
+            if got is not None:
+                break
+        if got is not None and got[0] == spec:            # slack を動かさずに載るビードだけ
+            out.append(variant("bead", cp, got[1], None, None, {"section": ["none", "bead"]}))
+        got = _compose_rib(rng, spec) if spec.target_folds != 0 else None
+        if got is not None and abs(got[0].bend_radius_mm - spec.bend_radius_mm) < 1e-9:
+            out.append(variant("rib", cp, None, None, got[1], {"section": ["none", "rib"]}))
+    return out
+
 # ---------------------------------------------------------------- 入口
 
 def propose_variants(meta: dict, *, count: int = 8, rng: random.Random | None = None):
@@ -459,6 +510,8 @@ def propose_variants(meta: dict, *, count: int = 8, rng: random.Random | None = 
         groups.append(_channel_variants(spec, 3))
     elif spec.drawn is not None:                  # drawn_tray
         groups.append(_drawn_variants(spec, 3))
+    elif spec.compose is not None:                # 合成族: 構造レベルの変種
+        groups.append(_structure_variants(spec, bead, flange, rib, rng))
     else:
         raise ValueError(f"unknown kind {kind}")
     # 交互に取る(側 -> slack -> 幅 -> ビード -> リブ -> 側の2つ目 ...)
@@ -502,6 +555,7 @@ def build_variant(builder, variant: Variant, out_dir: str, name: str):
         return builder.build_flat_plate(spec.annotated_points, margin_mm=spec.plate_margin_mm,
                                         corner_radius_mm=spec.plate_corner_radius_mm,
                                         out_dir=out_dir, part_name=name)
+    cp = spec.compose or {}
     return builder.build_general_two_point(
         spec.point1, spec.point2, min_bearing_radius_mm=spec.min_bearing_radius_mm,
         half_width_mm=spec.half_width_mm, bend_radius_mm=spec.bend_radius_mm,
@@ -510,7 +564,10 @@ def build_variant(builder, variant: Variant, out_dir: str, name: str):
         target_folds=spec.target_folds, extra_points=spec.extra_points,
         check_points=spec.annotated_points, taper_half_width_mm=spec.taper_half_width_mm,
         out_dir=out_dir, part_name=name, bead=variant.bead, flange=variant.flange,
-        rib=variant.rib)
+        rib=variant.rib, arms=cp.get("arms", ()), notches=cp.get("notches", ()),
+        side_extension_mm=tuple(cp.get("side_extension_mm", (0.0, 0.0))),
+        bead_span=(tuple(cp["bead_span"]) if cp.get("bead_span") and variant.bead is not None else None),
+        check_radii=tuple(cp.get("point_radii", ())))
 
 
 def variant_meta(meta: dict, variant: Variant, name: str) -> dict:

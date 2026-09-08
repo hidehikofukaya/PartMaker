@@ -86,9 +86,15 @@ def main() -> None:
         except Exception as exc:  # 候補が出せない(古い params 等)
             manifest["parts"][pid] = [{"status": "error", "reason": str(exc)[:200]}]
             continue
-        entries = []
+        # 既存の記録は残す(候補の規則が変わっても、ディスクにある変種を manifest から落とさない)。
+        entries = [e for e in manifest["parts"].get(pid, [])
+                   if e.get("name") and ((out / f"{e['name']}_mid.stp").exists()
+                                         or (out / f"{e['name']}.infeasible").exists())]
+        known = {e["name"] for e in entries}
         for v in variants:
             name = v.name(pid)
+            if name in known:
+                continue
             stp = out / f"{name}_mid.stp"
             bad = out / f"{name}.infeasible"
             entry = {"name": name, "knob": v.knob, "value": v.value, "changed": v.changed}
