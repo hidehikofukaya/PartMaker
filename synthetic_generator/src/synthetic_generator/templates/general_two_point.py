@@ -221,6 +221,9 @@ class GeneralTwoJointSpec:
     # 合成族(2026-09-06、AutoMetalSheet 依頼)。掃引 + 側辺の腕 + 切欠き + 非対称余白。
     # {"factors": {...}, "arms": [...], "notches": [...], "side_extension_mm": [neg, pos]}
     compose: dict | None = None
+    # 多面ブラケット族(2026-09-08、実車002-024)。ハブ多角形 + 壁 + 角の連結 + 深さ2フランジ。
+    # {"hub_xy", "walls", "closed", "arms", "flanges", "corner_r_mm", "factors", ...}
+    box: dict | None = None
 
 
 def _random_unit_vector(rng: random.Random) -> Vec3:

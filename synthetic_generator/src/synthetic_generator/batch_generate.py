@@ -176,6 +176,16 @@ def build_general_part(builder, spec, bead, flange, out_dir: str, part_name: str
             hub_u=tuple(drawn["hub_u"]), hub_v=tuple(drawn["hub_v"]),
             seam_fillet_mm=drawn["seam_fillet_mm"], corner_radius=drawn["corner_radius"],
             out_dir=out_dir, part_name=part_name, check_points=spec.annotated_points), None
+    # 多面ブラケット(実車002-024): ハブ多角形 + 壁 + 角の連結 + 深さ2フランジ。
+    box = getattr(spec, "box", None)
+    if box is not None:
+        return builder.build_box_bracket(
+            [tuple(q) for q in box["hub_xy"]], {int(k): w for k, w in box["walls"].items()},
+            set(box["closed"]), box["arms"], origin=tuple(box["origin"]),
+            hub_u=tuple(box["hub_u"]), hub_v=tuple(box["hub_v"]),
+            corner_r_mm=box["corner_r_mm"], out_dir=out_dir, part_name=part_name,
+            flanges=box["flanges"], check_points=spec.annotated_points,
+            check_radii=box.get("point_radii", ())), None
     # チャンネル + 座面(実車144)。
     channel = getattr(spec, "channel", None)
     if channel is not None:
@@ -476,7 +486,9 @@ def generate_recipe_batch(
             branch = getattr(spec, "branch", None)
             channel = getattr(spec, "channel", None)
             drawn = getattr(spec, "drawn", None)
-            custom = plate or branch is not None or channel is not None or drawn is not None
+            box = getattr(spec, "box", None)
+            custom = (plate or branch is not None or channel is not None
+                      or drawn is not None or box is not None)
             plan = None if custom else plan_for(spec)
             params_dir = out_dir / "params"
             params_dir.mkdir(parents=True, exist_ok=True)
@@ -498,9 +510,15 @@ def generate_recipe_batch(
                             else (f"drawn tray, walls {drawn['walls']['A']['fold_deg']:.0f}/"
                                   f"{drawn['walls']['B']['fold_deg']:.0f} deg, "
                                   f"{len(spec.annotated_points)} joints") if drawn
+                            else (f"box bracket, {len(box['hub_xy'])}-gon hub, "
+                                  f"{len(box['walls'])} walls ({len(box['closed'])} sewn), "
+                                  f"{len(box['flanges'])} flanges, {len(box['arms'])} arms, "
+                                  f"{len(spec.annotated_points)} joints") if box
                             else plan.geometry_label),
                         "folds": (0 if plate else len(branch["arms"]) if branch
                                   else 4 if channel else 4 if drawn
+                                  else (len(box["walls"]) + len(box["arms"])
+                                        + len(box["flanges"])) if box
                                   else len(plan.panel_frames) - 1),
                         "fold_tilts_deg": [] if custom else [
                             [math.degrees(a), math.degrees(b)] for a, b in plan.fold_tilts

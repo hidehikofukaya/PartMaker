@@ -167,6 +167,51 @@ def _build_drawn(meta: dict, spec: dict) -> dict:
     }
 
 
+def _build_box(meta: dict, spec: dict) -> dict:
+    """多面ブラケット(実車002-024)。ハブ多角形・壁・角の連結・深さ2フランジ・腕を真値にする。"""
+    bx = spec["box"]
+    points = spec.get("annotated_points") or []
+    walls = bx["walls"]
+    return {
+        "schema": SCHEMA,
+        "part_id": meta["part_id"],
+        "geometry_label": meta["geometry_label"],
+        "half_width_mm": None,
+        "min_bearing_radius_mm": spec["min_bearing_radius_mm"],
+        "thickness_mm": spec["thickness_mm"],
+        # 折り = 壁の根本 + 腕の根本 + 深さ2フランジの根本。パネル = ハブ + 壁 + 腕 + フランジ。
+        "folds": len(walls) + len(bx["arms"]) + len(bx["flanges"]),
+        "panels": 1 + len(walls) + len(bx["arms"]) + len(bx["flanges"]),
+        "has_inflection": False,
+        "bead": None, "flange": None, "rib": None,
+        "corner_relief": None,
+        "box": {
+            "hub_xy": bx["hub_xy"],
+            "corner_r_mm": bx["corner_r_mm"],
+            "closed_corners": bx["closed"],
+            "walls": {k: {"fold_deg": w["fold_deg"], "height_mm": w["height_mm"],
+                          "tabs": w["tabs"], "taper_from_mm": w.get("taper_from_mm")}
+                      for k, w in walls.items()},
+            "flanges": [{"wall": f["wall"], "root_mm": [f["from_mm"], f["to_mm"]],
+                         "side": f["side"], "fold_deg": f["fold_deg"],
+                         "bend_radius_mm": f["radius_mm"], "length_mm": f["length_mm"]}
+                        for f in bx["flanges"]],
+            "arms": [{"edge": a["edge"], "fold_deg": a["fold_deg"],
+                      "bend_radius_mm": a["radius_mm"], "length_mm": a["length_mm"],
+                      "root_mm": [a["root_from_mm"], a["root_to_mm"]],
+                      "outline": a.get("outline")} for a in bx["arms"]],
+            "factors": bx.get("factors"),
+            "point_radii": bx.get("point_radii"),
+            "joints": len(points),
+            "joint_positions_xyz": [list(p["position_xyz"]) for p in points],
+            "joint_normals_xyz": [list(p["normal_xyz"]) for p in points],
+        },
+        "notes": "box bracket: a convex polygon hub with walls on any of its edges; adjacent "
+                 "walls are sewn sharp at the corner and filleted (the vertex blend is the "
+                 "draw), plus depth-2 flanges on wall tops and arms on wall-free edges",
+    }
+
+
 def _build_flat_plate(meta: dict, spec: dict) -> dict:
     """平板×多点締結(実車031 / 1285-20)。掃引の計画が無いので真値も別立てで出す。"""
     points = spec.get("annotated_points") or []
@@ -203,6 +248,8 @@ def build(meta: dict) -> dict:
         return _build_channel(meta, spec)
     if spec.get("drawn") is not None:
         return _build_drawn(meta, spec)
+    if spec.get("box") is not None:
+        return _build_box(meta, spec)
     truth = _build_sweep(meta, spec)
     if spec.get("compose") is not None:
         cp = spec["compose"]
