@@ -297,6 +297,83 @@ def _bead_section(bead, lift: int, half_width_mm: float, *, role: str = "bead") 
     return section, y_breaks
 
 
+def _bead_bump(bead, lift: int, y_c: float, role: str) -> tuple[list[Elem], float, float]:
+    """1本のビードの「足R - 壁 - 稜線R - 頂部 - 稜線R - 壁 - 足R」7要素を、中心 y_c に置く。
+    `_bead_section` の中央部分と同じ幾何。戻り値は (要素列, 左端 y, 右端 y)。"""
+    theta = math.radians(bead.wall_angle_deg)
+    depth, radius = bead.depth_mm, bead.ridge_radius_mm
+    yt = bead.top_width_mm / 2.0
+    yf = yt + depth / math.tan(theta)
+    sb = radius * math.tan(theta / 2.0)
+    if yt - sb <= 0.1:
+        raise ValueError("bead top ridge fillets consume the whole top width. Infeasible.")
+    cos_t, sin_t = math.cos(theta), math.sin(theta)
+    # 壁は z = sb*sin(θ) から depth - sb*sin(θ) まで。浅くて稜線Rが大きいと**反転**し、
+    # 掃引すると法線が裏返って隣の面と 180 度になる(2026-09-08 実測: 3割が落ちた)。
+    if depth - 2.0 * sb * sin_t <= 0.2:
+        raise ValueError(
+            f"the bead wall vanishes between the ridge and foot fillets "
+            f"(depth {depth:.1f}mm, setback {sb:.1f}mm each). Infeasible.")
+    foot_c = (yf + sb, radius)
+    top_c = (yt - sb, depth - radius)
+    foot_mid = (foot_c[0] - radius * math.sin(theta / 2.0),
+                foot_c[1] - radius * math.cos(theta / 2.0))
+    top_mid = (top_c[0] + radius * math.sin(theta / 2.0),
+               top_c[1] + radius * math.cos(theta / 2.0))
+
+    def p(y: float, z: float) -> tuple[float, float]:
+        return (y_c + y, lift * z)
+
+    section = [
+        ("arc", p(-(yf + sb), 0.0), p(-foot_mid[0], foot_mid[1]),
+         p(-(yf - sb * cos_t), sb * sin_t), f"{role}_foot_l"),
+        ("line", p(-(yf - sb * cos_t), sb * sin_t),
+         p(-(yt + sb * cos_t), depth - sb * sin_t), f"{role}_wall_l"),
+        ("arc", p(-(yt + sb * cos_t), depth - sb * sin_t), p(-top_mid[0], top_mid[1]),
+         p(-(yt - sb), depth), f"{role}_ridge_l"),
+        ("line", p(-(yt - sb), depth), p(yt - sb, depth), f"{role}_top"),
+        ("arc", p(yt - sb, depth), p(top_mid[0], top_mid[1]),
+         p(yt + sb * cos_t, depth - sb * sin_t), f"{role}_ridge_r"),
+        ("line", p(yt + sb * cos_t, depth - sb * sin_t),
+         p(yf - sb * cos_t, sb * sin_t), f"{role}_wall_r"),
+        ("arc", p(yf - sb * cos_t, sb * sin_t), p(foot_mid[0], foot_mid[1]),
+         p(yf + sb, 0.0), f"{role}_foot_r"),
+    ]
+    return section, y_c - (yf + sb), y_c + (yf + sb)
+
+
+def multi_bead_section(beads, lift: int, half_width_mm: float,
+                       ext_neg: float = 0.0, ext_pos: float = 0.0,
+                       min_land_mm: float = 2.0):
+    """幅方向に複数のビードを並べた断面(全長を走る)。beads = [(中心 y, BeadParams), ...]。
+
+    大型パネル族(2026-09-08)。実車の大きなパネルは断面に 2〜4 本のビードを持つ
+    (002-033 は断面R 59 か所)。既存の `_bead_section` は 1 本だけだった。
+    戻り値は (断面, 平地のブレークポイント, 各ビードの [左端, 右端])。
+    """
+    lo, hi = -half_width_mm - ext_neg, half_width_mm + ext_pos
+    items = sorted(beads, key=lambda b: b[0])
+    section: list = []
+    breaks = [lo]
+    spans: list = []
+    cursor = lo
+    for i, (y_c, bead) in enumerate(items):
+        bump, left, right = _bead_bump(bead, lift, y_c, f"bead{i}")
+        if left - cursor < min_land_mm:
+            raise ValueError(f"bead {i} leaves no land on its left ({left - cursor:.1f}mm). "
+                             "Infeasible.")
+        section.append(("line", (cursor, 0.0), (left, 0.0), f"base_{i}"))
+        section += bump
+        breaks += [left, right]
+        spans.append([left, right])
+        cursor = right
+    if hi - cursor < min_land_mm:
+        raise ValueError("the last bead leaves no land on its right. Infeasible.")
+    section.append(("line", (cursor, 0.0), (hi, 0.0), "base_r"))
+    breaks.append(hi)
+    return section, breaks, spans
+
+
 def _flange_walls(flange: FlangeParams, half_width_mm: float):
     """基準面の端に継ぐ「根本R + 壁」を (左側の要素列, 右側の要素列) で返す。
 
@@ -1386,11 +1463,16 @@ class OcctPartBuilder:
         bead_span: tuple[float, float] | None = None,
         # 締結点ごとの座面半径。指定すると「点から外形までの距離 >= 半径」を最終形状で検査する。
         check_radii: tuple = (),
+        # 大型パネル族(2026-09-08): 幅方向に並べたビード [(中心 y, BeadParams), ...]。
+        # 全長を走る。単一の `bead` とは併用しない。
+        beads=(),
     ) -> GeneratedPart:
         # 1部品1特徴が原則。例外はビード + フランジだけ(実車014型で「両側フランジ +
         # 中央ビード」が1点と2点の間の剛性を担っている。ユーザー決定 2026-09-04)。
         if rib is not None and (bead is not None or flange is not None):
             raise ValueError("a rib cannot be combined with a bead or a flange")
+        if beads and (bead is not None or rib is not None):
+            raise ValueError("multi-bead panels take neither a single bead nor a rib")
         if abs(fold1_tilt_perturbation_rad) > 1e-9:
             # 折れ目軸が共通でなくなる(実測: 摂動ありで軸間角 最大7.3度)ため、
             # 断面掃引の前提が崩れる。サンプラー側で0に固定してある。
@@ -1447,6 +1529,16 @@ class OcctPartBuilder:
                 flat = _with_flange(flat, flange, half_width_mm)
             self._sweep_with_bead(path, frame, w, section, flat,
                                   bead, min_bearing_radius_mm, faces, placed=bead_span)
+        elif beads:
+            # 大型パネル: 幅方向に複数のビード。全長を走るので走り出し/走り終わりは無い。
+            lift = self._bead_lift(path, beads[0][1], bend_radius_mm,
+                                   forced=flange.direction if flange else None)
+            section, _breaks, _spans = multi_bead_section(
+                beads, lift, half_width_mm, ext_neg, ext_pos)
+            if flange is not None:
+                self._check_flange_radii(path, flange, bend_radius_mm)
+                section = _with_flange(section, flange, half_width_mm)
+            self._sweep_uniform(path, frame, w, section, faces)
         elif rib is not None:
             self._build_rib_part(plan, w, ey, rib, half_width_mm, bend_radius_mm, faces)
         else:

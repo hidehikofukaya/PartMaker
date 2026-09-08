@@ -224,6 +224,9 @@ class GeneralTwoJointSpec:
     # 多面ブラケット族(2026-09-08、実車002-024)。ハブ多角形 + 壁 + 角の連結 + 深さ2フランジ。
     # {"hub_xy", "walls", "closed", "arms", "flanges", "corner_r_mm", "factors", ...}
     box: dict | None = None
+    # 大型パネル族(2026-09-08)。幅の広い帯 + 幅方向に複数のビード + 側辺の壁/腕 + 多点締結。
+    # {"half_width_mm", "beads": [[y, BeadParams...]], "arms": [...], "point_radii", "factors"}
+    panel: dict | None = None
 
 
 def _random_unit_vector(rng: random.Random) -> Vec3:

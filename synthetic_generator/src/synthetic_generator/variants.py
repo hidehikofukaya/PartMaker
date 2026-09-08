@@ -510,6 +510,53 @@ def _box_variants(spec, count: int):
     return out
 
 
+def _panel_variants(spec, count: int):
+    """大型パネル: 締結点が決めていない選択 = ビードの断面、腕の長さ、帯幅(広げる側だけ)。"""
+    pn = spec.panel
+    b = spec.min_bearing_radius_mm
+    out = []
+    beads = pn["beads"]
+    if beads:
+        base = dict(beads[0][1])
+        for scale in (0.7, 1.3):
+            depth = base["depth_mm"] * scale
+            sb = base["ridge_radius_mm"] * math.tan(math.radians(base["wall_angle_deg"]) / 2.0)
+            if depth - 2.0 * sb * math.sin(math.radians(base["wall_angle_deg"])) <= 0.5:
+                continue
+            if abs(depth - base["depth_mm"]) < NEAR_MM:
+                continue
+            new = [[y, dict(bd, depth_mm=depth)] for y, bd in beads]
+            out.append(Variant("bead_depth", _fmt(depth),
+                               dataclasses.replace(spec, panel=dict(pn, beads=new)),
+                               None, None, None,
+                               {"panel.bead.depth_mm": [base["depth_mm"], depth]}))
+    if pn["arms"]:
+        for delta in (0.0, 10.0, 20.0):
+            arms = []
+            for a in pn["arms"]:
+                floor = (2.0 * b + 2.0) if a.get("points") else 12.0
+                arms.append(dict(a, length_mm=min(max(floor + delta, 12.0), 60.0)))
+            if all(abs(a["length_mm"] - o["length_mm"]) < NEAR_MM
+                   for a, o in zip(arms, pn["arms"])):
+                continue
+            out.append(Variant("arm_len", f"d{delta:.0f}",
+                               dataclasses.replace(spec, panel=dict(pn, arms=arms)),
+                               None, None, None,
+                               {"panel.arms.length_mm": [[a["length_mm"] for a in pn["arms"]],
+                                                         [a["length_mm"] for a in arms]]}))
+    # 帯幅は広げる方向だけ(狭めると縁の締結点が座面を失う)
+    for extra in (6.0, 14.0):
+        hw = min(pn["half_width_mm"] + extra, 70.0)
+        if hw - pn["half_width_mm"] < NEAR_MM:
+            continue
+        out.append(Variant("half_width", _fmt(hw),
+                           dataclasses.replace(spec, half_width_mm=hw,
+                                               panel=dict(pn, half_width_mm=hw)),
+                           None, None, None,
+                           {"half_width_mm": [pn["half_width_mm"], hw]}))
+    return out
+
+
 def _structure_variants(spec, bead, flange, rib, rng):
     """合成族の構造変種(依頼 原則 C)。同じ締結点に対して構造だけを変える。
     腕を消す変種は腕の上に締結点が無い部品だけ(裁定 2026-09-06)。切欠き・壁腕・断面の
@@ -582,6 +629,8 @@ def propose_variants(meta: dict, *, count: int = 8, rng: random.Random | None = 
         groups.append(_drawn_variants(spec, 3))
     elif spec.box is not None:                    # box_bracket(多面ブラケット)
         groups.append(_box_variants(spec, 3))
+    elif spec.panel is not None:                  # 大型パネル
+        groups.append(_panel_variants(spec, 3))
     elif spec.compose is not None:                # 合成族: 構造レベルの変種
         groups.append(_structure_variants(spec, bead, flange, rib, rng))
     else:
@@ -638,6 +687,18 @@ def build_variant(builder, variant: Variant, out_dir: str, name: str):
                                         corner_radius_mm=spec.plate_corner_radius_mm,
                                         out_dir=out_dir, part_name=name)
     cp = spec.compose or {}
+    pn = spec.panel or {}
+    if pn:
+        from synthetic_generator.bead import BeadParams as _BP
+        return builder.build_general_two_point(
+            spec.point1, spec.point2, min_bearing_radius_mm=spec.min_bearing_radius_mm,
+            half_width_mm=spec.half_width_mm, bend_radius_mm=spec.bend_radius_mm,
+            fold1_slack_mm=spec.fold1_slack_mm, fold2_slack_mm=spec.fold2_slack_mm,
+            fold1_tilt_perturbation_rad=spec.fold1_tilt_perturbation_rad,
+            target_folds=spec.target_folds, check_points=spec.annotated_points,
+            out_dir=out_dir, part_name=name,
+            beads=[(y, _BP(**bd)) for y, bd in pn["beads"]], arms=pn["arms"],
+            check_radii=tuple(pn.get("point_radii", ())))
     return builder.build_general_two_point(
         spec.point1, spec.point2, min_bearing_radius_mm=spec.min_bearing_radius_mm,
         half_width_mm=spec.half_width_mm, bend_radius_mm=spec.bend_radius_mm,

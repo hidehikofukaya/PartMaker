@@ -211,6 +211,7 @@ def build_general_part(builder, spec, bead, flange, out_dir: str, part_name: str
             out_dir=out_dir, part_name=part_name), None
 
     compose = getattr(spec, "compose", None) or {}
+    panel = getattr(spec, "panel", None) or {}
 
     def attempt(candidate_flange):
         return builder.build_general_two_point(
@@ -232,6 +233,9 @@ def build_general_part(builder, spec, bead, flange, out_dir: str, part_name: str
             flange=candidate_flange,
             rib=rib,
             # 合成族だけ側辺の腕・切欠き・非対称余白を渡す(他の族のビルダー呼び出しは不変)
+            **({"beads": [(y, BeadParams(**bd)) for y, bd in panel["beads"]],
+                "arms": panel["arms"],
+                "check_radii": tuple(panel.get("point_radii", ()))} if panel else {}),
             **({"arms": compose.get("arms", ()), "notches": compose.get("notches", ()),
                 "side_extension_mm": tuple(compose.get("side_extension_mm", (0.0, 0.0))),
                 "bead_span": (tuple(compose["bead_span"]) if compose.get("bead_span") else None),

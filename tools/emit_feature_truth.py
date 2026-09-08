@@ -224,6 +224,31 @@ def _build_box(meta: dict, spec: dict) -> dict:
     }
 
 
+def _build_panel(meta: dict, spec: dict) -> dict:
+    """大型パネル(実車002-002/017/049/062 ほか)。幅方向に並んだビードと側辺の壁/腕。"""
+    pn = spec["panel"]
+    points = spec.get("annotated_points") or []
+    truth = _build_sweep(meta, spec)
+    truth["panel"] = {
+        "half_width_mm": pn["half_width_mm"],
+        "beads": [{"centre_y_mm": y, **bd} for y, bd in pn["beads"]],
+        "bead_spans_y_mm": pn["bead_spans"],
+        "lands_y_mm": pn["lands"],
+        "arms": [{"panel": a["panel"], "side": a["side"],
+                  "root_mm": [a["t0_mm"], a["t1_mm"]], "fold_deg": a["fold_deg"],
+                  "bend_radius_mm": a["radius_mm"], "length_mm": a["length_mm"],
+                  "role": a["role"], "outline": a.get("outline"), "points": a.get("points")}
+                 for a in pn["arms"]],
+        "factors": pn.get("factors"),
+        "point_radii": pn.get("point_radii"),
+        "joints": len(points),
+    }
+    truth["notes"] = ("large panel: a wide swept band carrying 1-4 full-length beads across "
+                      "its width, with short walls and arms sewn onto the side edges and "
+                      "many fastening points on the flat lands")
+    return truth
+
+
 def _build_flat_plate(meta: dict, spec: dict) -> dict:
     """平板×多点締結(実車031 / 1285-20)。掃引の計画が無いので真値も別立てで出す。"""
     points = spec.get("annotated_points") or []
@@ -262,6 +287,8 @@ def build(meta: dict) -> dict:
         return _build_drawn(meta, spec)
     if spec.get("box") is not None:
         return _build_box(meta, spec)
+    if spec.get("panel") is not None:
+        return _build_panel(meta, spec)
     truth = _build_sweep(meta, spec)
     if spec.get("compose") is not None:
         cp = spec["compose"]
