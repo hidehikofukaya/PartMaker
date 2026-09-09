@@ -334,6 +334,39 @@ def _plate_variants(spec, count: int):
     return out
 
 
+def _offset_free_edges(xy, free_edges, delta_mm: float):
+    """凸多角形(反時計回り)の指定した辺だけを外向きに delta 押し出す。
+    腕はハブの辺を丸ごと根本に使うので、**腕の無い辺**だけを動かせば腕は不変のまま
+    外形が変わる(AMS 依頼 7 §7: 同一入力で外形がどれだけ散るかを測るための自由度)。"""
+    n = len(xy)
+    lines = []
+    for i in range(n):
+        a0, b0 = xy[i], xy[(i + 1) % n]
+        dx, dy = b0[0] - a0[0], b0[1] - a0[1]
+        k = math.hypot(dx, dy)
+        if k < 1e-9:
+            return None
+        dx, dy = dx / k, dy / k
+        nx, ny = dy, -dx                      # 反時計回りの外向き法線
+        shift = delta_mm if i in free_edges else 0.0
+        lines.append((dx, dy, a0[0] + nx * shift, a0[1] + ny * shift))
+    out = []
+    for i in range(n):
+        d1x, d1y, p1x, p1y = lines[(i - 1) % n]
+        d2x, d2y, p2x, p2y = lines[i]
+        det = d1x * (-d2y) - d1y * (-d2x)
+        if abs(det) < 1e-9:
+            return None
+        rhs = (p2x - p1x, p2y - p1y)
+        t = (rhs[0] * (-d2y) - rhs[1] * (-d2x)) / det
+        out.append((p1x + d1x * t, p1y + d1y * t))
+    for i in range(n):                        # 凸性(反時計回り)を保っているか
+        o, q, r = out[i], out[(i + 1) % n], out[(i + 2) % n]
+        if (q[0] - o[0]) * (r[1] - o[1]) - (q[1] - o[1]) * (r[0] - o[0]) <= 1e-6:
+            return None
+    return out
+
+
 def _branch_variants(spec, count: int):
     br = spec.branch
     out = []
@@ -377,8 +410,32 @@ def _branch_variants(spec, count: int):
                            None, None, None,
                            {"branch.arms.length_mm": [[a["length_mm"] for a in br["arms"]],
                                                       [a["length_mm"] for a in arms]]}))
+    # --- ハブの「腕の無い辺」を外へ押し出す(AMS 依頼 7 §7、2026-09-10)
+    # 腕はハブの辺を丸ごと根本に使うので、腕の無い辺だけなら腕も締結点も動かずに
+    # 外形だけが変わる。締結点の近くの外形にも自由度が出るのが狙い。
+    hub = [tuple(q) for q in br["hub_xy"]]
+    free = set(range(len(hub))) - edges
+    if free:
+        for delta in (6.0, 14.0):
+            # 短い辺を押し出すと多角形が折り返るので、辺長が delta の 4 倍ある辺だけ動かす
+            wide = {i for i in free
+                    if math.dist(hub[i], hub[(i + 1) % len(hub)]) >= 4.0 * delta}
+            if not wide:
+                continue
+            moved = _offset_free_edges(hub, wide, delta)
+            if moved is None:
+                continue
+            out.append(Variant("hub_margin", _fmt(delta),
+                               dataclasses.replace(spec, branch=dict(br, hub_xy=[list(q) for q in moved])),
+                               None, None, None,
+                               {"branch.hub_margin_mm": [0.0, delta]}))
+    # --- ガセットを外す(構造変種)
+    if br.get("gussets"):
+        out.append(Variant("structure", "nogusset",
+                           dataclasses.replace(spec, branch=dict(br, gussets=[])),
+                           None, None, None,
+                           {"branch.gussets": [list(br["gussets"]), []]}))
     return out
-
 
 def _channel_variants(spec, count: int):
     ch = spec.channel
