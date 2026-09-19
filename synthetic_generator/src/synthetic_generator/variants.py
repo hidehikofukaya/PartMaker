@@ -367,6 +367,54 @@ def _offset_free_edges(xy, free_edges, delta_mm: float):
     return out
 
 
+def _branch_need(spec) -> dict:
+    """腕ごとの最小長 = 腕上の締結点の走行位置の最大 + 座面半径 + 先端の逃げ。"""
+    br = spec.branch
+    fillet = {int(k): v for k, v in (br.get("fillet_radius") or {}).items()}
+    lay = branch_frames(br["hub_xy"], br["arms"], origin=tuple(br["origin"]),
+                        hub_u=tuple(br["hub_u"]), hub_v=tuple(br["hub_v"]),
+                        corner_radius=br["corner_radius"], fillet_radius=fillet or None)
+    need = {}
+    for arm in br["arms"]:
+        fr = lay["arms"][arm["edge"]]
+        runs = [sum((p.position_xyz[i] - fr["a"][i]) * fr["tip"][i] for i in range(3))
+                for p in spec.annotated_points]
+        on_arm = [r for r, p in zip(runs, spec.annotated_points)
+                  if abs(sum((p.position_xyz[i] - fr["a"][i]) * fr["normal"][i]
+                             for i in range(3))) < 0.5 and r > 0.0]
+        need[arm["edge"]] = ((max(on_arm) if on_arm else 0.0) + spec.min_bearing_radius_mm
+                             + arm.get("relief_mm", ARM_TIP_RELIEF_MM))
+    return need
+
+
+def reseed_branch(spec, rng: random.Random):
+    """分岐族を「同じ締結点・同じ spec のまま、生成器を別シードで再実行」した部品の spec。
+
+    AMS 依頼 8 ⑤(2026-09-19): knob を 1 つずつ動かす変種は元の部品の近くに留まりやすい。
+    締結点が決めていない**生成器の乱数**を全部同時に引き直すと、入力から決まらない部分の
+    教師の散らばりそのものを測れる。分岐族の生成器(`families.branch_part`)が乱数で決め、
+    締結点を固定しても動かせるのは次の 2 つだけ:
+
+      - 腕の長さ  U(30, 70)mm。ただし腕上の締結点 + 座面 + 先端の逃げ 以上
+      - ハブの隅R U(6, 12)mm(隣り合う腕のあいだの角があるときだけ効く)
+
+    ハブの形・腕の折れ角と曲げR は締結点の位置を決めるので固定。`hub_margin` は生成器が
+    引く値ではない(変種の knob)ので入れない。
+    """
+    br = spec.branch
+    need = _branch_need(spec)
+    arms = []
+    for a in br["arms"]:
+        if (a.get("outline") or {}).get("kind") == "tabs":
+            arms.append(dict(a))        # タブ付きの腕は高さ = タブの寸法で決まる
+            continue
+        lo = max(BRANCH_ARM_LENGTH_MM[0], need[a["edge"]])
+        hi = max(lo, BRANCH_ARM_LENGTH_MM[1])
+        arms.append(dict(a, length_mm=rng.uniform(lo, hi)))
+    new = dict(br, arms=arms, corner_radius=rng.uniform(*BRANCH_CORNER_R_MM))
+    return dataclasses.replace(spec, branch=new)
+
+
 def _branch_variants(spec, count: int):
     br = spec.branch
     out = []

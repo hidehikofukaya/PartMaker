@@ -8,7 +8,7 @@ AMS 依頼 7 §7(2026-09-10): モデルの角の誤差は最近傍の締結点�
   u        = 締結点の間隔(各点から最近傍の点までの距離の平均)
   散らばり = 元の部品と変種の外形どうしの距離(両方向。片側だと要素を削った変種で 0 になる)
 
-使い方: python tools/measure_variant_spread.py [チャンク名 ...]
+使い方: python tools/measure_variant_spread.py [--knob reseed] [チャンク名 ...]
         既定は occt18 occt20。出力は最近傍の締結点までの距離(u 単位)で層別した中央値と p90。
 """
 
@@ -68,7 +68,13 @@ def one_sided(a, b):
 
 
 def main():
-    fams = sys.argv[1:] or ["occt18", "occt20"]
+    args = sys.argv[1:]
+    knob = None
+    if "--knob" in args:        # 例: --knob reseed で別シード再生成だけを測る
+        i = args.index("--knob")
+        knob = args[i + 1]
+        del args[i:i + 2]
+    fams = args or ["occt18", "occt20"]
     for fam in fams:
         base = pathlib.Path("synthetic_parts") / fam / "chunk_01"
         mf = base / "variants" / "manifest.json"
@@ -81,9 +87,10 @@ def main():
         bins = collections.defaultdict(list)
         n_pairs = 0
         for pid in ids:
-            if n_pairs >= 40:
+            if not knob and n_pairs >= 40:     # knob 指定時は全件
                 break
-            oks = [e for e in man["parts"][pid] if e.get("status") == "ok"]
+            oks = [e for e in man["parts"][pid] if e.get("status") == "ok"
+                   and (knob is None or e.get("knob") == knob)]
             if len(oks) < 2:
                 continue
             meta = json.load(io.open(base / "params" / f"{pid}.json", encoding="utf-8"))
@@ -96,7 +103,7 @@ def main():
                 a = outline_points(base / "mid" / f"{pid}_mid.stp")
             except Exception:
                 continue
-            for e in oks[:6]:
+            for e in (oks if knob else oks[:6]):
                 vp = base / "variants" / (e["name"] + "_mid.stp")
                 if not vp.exists():
                     continue

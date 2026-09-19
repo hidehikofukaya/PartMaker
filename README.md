@@ -76,6 +76,14 @@ python tools/survey_real_parts.py                          # 実車が掃引モ�
 面内に動かして再生成した対と面ラベルの差分を `<chunk>/perturb/` に置く
 （`docs/REPLY_variants_2026-09-06.md`、`tools/emit_variants.py`、`tools/emit_perturbations.py`）。
 
+## 世代管理（AutoMetalSheet 依頼 8、2026-09-19）
+
+**作り直しは必ず新しいチャンク名で出す**（`run_occt_batch.py` は既存チャンクへの上書きを拒否する。
+レシピに `supersedes` を書く）。manifest・params・変種 params に `generation` / `generated_at` を刻み、
+全事象を `synthetic_parts/GENERATIONS.jsonl` に追記する。照合は `tools/check_generation_consistency.py`。
+params の `structure` に座面比 `seat_ratio_min`（全エッジ・3次元）を入れる契約
+（`docs/REPLY_generation_versioning_2026-09-19.md`）。
+
 ## 今後やるべき型
 
 ### 1. 分岐は作れた。次は角の閉じ方
