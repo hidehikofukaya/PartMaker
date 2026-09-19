@@ -31,6 +31,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "synthet
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 import emit_feature_truth  # noqa: E402
+import _generations  # noqa: E402
 from OCC.Core.TopAbs import TopAbs_EDGE, TopAbs_FACE  # noqa: E402
 from OCC.Core.TopExp import topexp  # noqa: E402
 from OCC.Core.TopTools import TopTools_IndexedMapOfShape  # noqa: E402
@@ -71,7 +72,12 @@ def main() -> None:
 
     out_dir = DEFAULT_OUTPUT_ROOT / family / f"chunk_{chunk:02d}"
     if out_dir.exists() and any(out_dir.iterdir()):
-        raise SystemExit(f"{out_dir} は既に存在する。")
+        # 世代管理(AMS 依頼 8): 既存チャンクは上書きしない。再生成は新しいチャンク番号で。
+        raise SystemExit(f"{out_dir} は既に存在する。再生成はレシピの chunk を上げて新しい"
+                         f"チャンクに出すこと(同じ ID の旧部品が下流に残る事故を防ぐため)。")
+    generation = _generations.next_generation(family)
+    generated_at = _generations.now_iso()
+    commit = _generations.git_commit()
 
     wanted: collections.Counter = collections.Counter()   # 同じ kind の複数エントリを足す
     for e in recipe["parts"]:
@@ -136,6 +142,7 @@ def main() -> None:
         meta = json.loads(params_path.read_text(encoding="utf-8"))
         meta["backend"] = "occt"
         meta["generator_version"] = GENERATOR_VERSION
+        meta["generation"] = _generations.stamp(generation, generated_at)
         params_path.write_text(json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
 
         feature = emit_feature_truth.build(meta)
@@ -158,6 +165,12 @@ def main() -> None:
         "schema": "partmaker_manifest/1",
         "family": family,
         "chunk": f"chunk_{chunk:02d}",
+        # 世代(AMS 依頼 8): 族ごとの連番・生成時刻(UTC)・生成に使ったコミット
+        "generation": generation,
+        "generated_at": generated_at,
+        "git_commit": commit,
+        # このチャンクが置き換える旧チャンク(レシピの "supersedes")。下流はそれを捨てる。
+        "supersedes": list(recipe.get("supersedes", [])),
         "generator_version": GENERATOR_VERSION,
         "backend": "occt",
         "seed": seed,
@@ -178,6 +191,12 @@ def main() -> None:
     (out_dir / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=1), encoding="utf-8")
     (out_dir / "_COMPLETE").write_text(f"{len(records)}\n", encoding="utf-8")
+    _generations.append_ledger({
+        "event": "chunk", "family": family, "chunk": f"chunk_{chunk:02d}",
+        "generation": generation, "generated_at": generated_at,
+        "completed_at": _generations.now_iso(), "n_parts": len(records),
+        "git_commit": commit, "recipe": recipe_path.name,
+        "supersedes": list(recipe.get("supersedes", []))})
 
     total = time.time() - t0
     print(f"\nCHUNK DONE: {len(records)}部品 / {total / 60:.1f}分 "

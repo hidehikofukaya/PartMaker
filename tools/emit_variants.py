@@ -29,6 +29,9 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "synthetic_generator" / "src"))
 
 from synthetic_generator.occt_build import OcctPartBuilder  # noqa: E402
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import _generations  # noqa: E402
 from synthetic_generator.variants import (  # noqa: E402
     build_variant, part_rng, propose_variants, variant_meta,
 )
@@ -72,6 +75,21 @@ def main() -> None:
     (out / "features").mkdir(exist_ok=True)
     manifest_path = out / "manifest.json"
     manifest = load_manifest(manifest_path)
+
+    # 世代管理(AMS 依頼 8): どの世代の部品に対して作った変種かを刻み、世代が違う変種とは混ぜない。
+    base_manifest = json.loads((chunk / "manifest.json").read_text(encoding="utf-8"))
+    base_gen = base_manifest.get("generation")
+    base_at = base_manifest.get("generated_at")
+    if base_at is None:
+        raise SystemExit(f"{chunk}/manifest.json に generated_at が無い。"
+                         f"tools/backfill_generation.py を先に流すこと。")
+    old_at = manifest.get("base_generated_at")
+    if old_at is not None and old_at != base_at:
+        raise SystemExit(f"{out} の変種は別の世代の部品({old_at})に対して作られている。"
+                         f"今の部品は {base_at}。古い変種を退避してから流すこと。")
+    emitted_at = _generations.now_iso()
+    manifest.update(base_generation=base_gen, base_generated_at=base_at,
+                    emitted_at=emitted_at)
     ids = order_ids(chunk, a.ids, a.holdout_first)
     if a.limit:
         ids = ids[:a.limit]
@@ -108,9 +126,11 @@ def main() -> None:
                 try:
                     with contextlib.redirect_stdout(io.StringIO()):
                         part = build_variant(builder, v, str(out), name)
+                    vmeta = variant_meta(meta, v, name)
+                    vmeta["generation"] = _generations.stamp(
+                        base_gen, base_at, variant_emitted_at=emitted_at)
                     (out / "params" / f"{name}.json").write_text(
-                        json.dumps(variant_meta(meta, v, name), ensure_ascii=False, indent=1),
-                        encoding="utf-8")
+                        json.dumps(vmeta, ensure_ascii=False, indent=1), encoding="utf-8")
                     (out / "features" / f"{name}.json").write_text(
                         json.dumps({"schema": "partmaker_features/2", "part_id": name,
                                     "source_part_id": pid, "kind": meta["kind"],
@@ -131,6 +151,11 @@ def main() -> None:
             print(f"{chunk.parent.name} {n}/{len(ids)}: built {built}, infeasible {infeasible}, "
                   f"skipped {skipped}, {time.time() - t0:.0f}s", flush=True)
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+    _generations.append_ledger({
+        "event": "variants", "family": chunk.parent.name, "chunk": chunk.name,
+        "base_generation": base_gen, "base_generated_at": base_at,
+        "emitted_at": emitted_at, "built": built, "infeasible": infeasible,
+        "skipped": skipped, "git_commit": _generations.git_commit()})
     print(f"{chunk}: built {built}, infeasible {infeasible}, skipped {skipped} -> {out}")
 
 
