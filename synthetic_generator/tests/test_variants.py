@@ -8,10 +8,12 @@ import dataclasses
 import random
 
 from synthetic_generator.families import (
-    Knobs, bead_part, branch_part, channel_seat_part, flat_plate_part, flange_part, rib_part,
-    three_point_part,
+    Knobs, bead_part, box_bracket_part, branch_part, channel_seat_part, flat_plate_part,
+    flange_part, panel_part, rib_part, three_point_part,
 )
-from synthetic_generator.variants import face_diff, perturb_spec, propose_variants, spec_from_meta
+from synthetic_generator.variants import (
+    face_diff, part_rng, perturb_spec, propose_variants, reseed_part, spec_from_meta,
+)
 
 
 def _meta(kind, generator, seed=20260906):
@@ -82,3 +84,24 @@ def test_face_diff_reports_moved_added_removed():
              {"name": "new", "area_mm2": 5.0, "centroid": [0, 0, 0]}]
     d = face_diff(before, after)
     assert d == {"changed": ["b"], "unchanged": ["a"], "added": ["new"], "removed": ["gone"]}
+
+
+def test_reseed_keeps_fastening_points_and_tab_arms():
+    """別シード(AMS 依頼 9 §1): 締結点と spec は固定、溶接タブ付きの腕の長さも固定。"""
+    for kind, gen in (("flange", flange_part), ("bead", bead_part), ("branch", branch_part),
+                      ("panel", panel_part), ("box_bracket", box_bracket_part)):
+        meta = _meta(kind, gen)
+        spec, bead, flange, rib = spec_from_meta(meta)
+        got = None
+        for k in range(1, 6):
+            got = reseed_part(kind, spec, bead, flange, rib, part_rng("T", salt=f"reseed{k}"))
+            if got is not None:
+                break
+        assert got is not None, f"{kind}: 別シードが 1 本も作れない"
+        new, *_, changed = got
+        assert _fixed(new) == _fixed(spec), f"{kind}: 固定すべき値が動いた"
+        assert changed
+        if spec.panel is not None:
+            for a, b in zip(spec.panel["arms"], new.panel["arms"]):
+                if (a.get("outline") or {}).get("kind") == "tabs":
+                    assert a["length_mm"] == b["length_mm"], "タブ付きの腕が伸びた"
