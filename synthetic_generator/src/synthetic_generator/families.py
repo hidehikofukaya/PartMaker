@@ -25,7 +25,7 @@ import random
 from synthetic_generator.bead import BeadParams, sample_bead
 from synthetic_generator.classify import FasteningPoint, classify
 from synthetic_generator.occt_build import (
-    ARM_TIP_RELIEF_MM, box_frames, branch_frames, channel_seat_frames, compose_arm_frame,
+    ARM_TIP_RELIEF_MM, WELD_MIN_BEND_MM, box_frames, branch_frames, channel_seat_frames, compose_arm_frame,
     drawn_notch_mm, drawn_tray_frames, step_frame, sweep_steps, tab_footprint_mm,
 )
 from synthetic_generator.classify import MIN_NEUTRAL_PLANE_RADIUS_MM
@@ -95,6 +95,8 @@ class Knobs:
     # 多面ブラケット族の下位グループ。"plate"(壁なし+腕) / "bend"(壁はあるが角の連結なし)
     # / "draw"(角を連結 = 絞り)。None なら制限なし。
     box_group: str | None = None
+    # スポット溶接列を載せる(パネル族・多面ブラケット族。AMS 依頼 9 §3.1/3.2、2026-09-24)。
+    weld_rows: bool = False
 
     @staticmethod
     def from_dict(data: dict) -> "Knobs":
@@ -110,6 +112,7 @@ class Knobs:
             turn_range_deg=(tuple(data["turn_range_deg"])
                             if data.get("turn_range_deg") else None),
             box_group=data.get("box_group"),
+            weld_rows=bool(data.get("weld_rows", False)),
             half_width_ratio=(tuple(data["half_width_ratio"])
                               if data.get("half_width_ratio") else None),
             max_half_width_mm=(float(data["max_half_width_mm"])
@@ -1780,17 +1783,18 @@ BOX_MAX_POINTS = 16
 BOX_TAPER_SHARE = (0.25, 0.5)
 
 
-def _box_hub(rng: random.Random, n: int):
-    """反時計回りの凸多角形。四角形は台形、3/5/6角形は半径をばらした正多角形。"""
+def _box_hub(rng: random.Random, n: int, scale: float = 1.0):
+    """反時計回りの凸多角形。四角形は台形、3/5/6角形は半径をばらした正多角形。
+    scale は寸法の倍率(溶接列版は外周を稼ぐため BOX_WELD_HUB_SCALE)。"""
     if n == 4:
-        length = rng.uniform(*BOX_QUAD_LEN_MM)
-        width = rng.uniform(*BOX_QUAD_WID_MM)
+        length = scale * rng.uniform(*BOX_QUAD_LEN_MM)
+        width = scale * rng.uniform(*BOX_QUAD_WID_MM)
         s0 = length * rng.uniform(*BOX_QUAD_SKEW)
         s1 = length * rng.uniform(*BOX_QUAD_SKEW)
         if length - s0 - s1 < 30.0:
             return None
         return [(0.0, 0.0), (length, 0.0), (length - s1, width), (s0, width)]
-    radius = rng.uniform(*(BOX_TRI_R_MM if n == 3 else BOX_HUB_RADIUS_MM))
+    radius = scale * rng.uniform(*(BOX_TRI_R_MM if n == 3 else BOX_HUB_RADIUS_MM))
     phase = rng.uniform(0.0, 2.0 * math.pi)
     xy = []
     for i in range(n):
@@ -1928,6 +1932,8 @@ def box_bracket_part(rng: random.Random, knobs: Knobs) -> Result | None:
             continue
         b = rng.uniform(*(knobs.bearing_radius_mm or BOX_BEARING_MM))
         weld_b = b        # 裁定 2026-09-09: 1部品1半径。タブも部品の座面半径で作る
+        weld = ({"edge_mm": rng.uniform(*WELD_EDGE_MM), "pitch_mm": rng.uniform(*WELD_PITCH_MM)}
+                if knobs.weld_rows else None)
         normal = spec.point1.normal_xyz
         u, v = _plane_basis(normal)
         origin = spec.point1.position_xyz
@@ -1937,7 +1943,7 @@ def box_bracket_part(rng: random.Random, knobs: Knobs) -> Result | None:
         want_rib = knobs.box_group != "draw" and rng.random() < BOX_RIB_P
         n = 4 if want_rib else _draw_weighted(rng, BOX_HUB_SIDES)
         base_sides = n
-        hub_xy = _box_hub(rng, n)
+        hub_xy = _box_hub(rng, n, BOX_WELD_HUB_SCALE if weld else 1.0)
         if hub_xy is None:
             continue
         # 角のR は実車の下限(R/板厚 >= 2.4)を守る
@@ -1961,6 +1967,8 @@ def box_bracket_part(rng: random.Random, knobs: Knobs) -> Result | None:
             fold = rng.uniform(*BOX_WALL_FOLD_DEG)
             tangent = corner_r * math.tan(math.radians(fold) / 2.0)
             lo_h = max(BOX_WALL_HEIGHT_MM[0], tangent + weld_b + 6.0)
+            if weld:        # 上端から d の列が曲げ接線から 3mm 以上離れる高さ
+                lo_h = max(lo_h, tangent + weld["edge_mm"] + WELD_MIN_BEND_MM + 1.0)
             if lo_h > BOX_WALL_HEIGHT_MM[1]:
                 continue
             base[i] = {"fold_deg": fold, "height_mm": rng.uniform(lo_h, BOX_WALL_HEIGHT_MM[1]),
@@ -2153,9 +2161,12 @@ def box_bracket_part(rng: random.Random, knobs: Knobs) -> Result | None:
             continue
         group = ("plate" if not walls else "draw" if closed else "bend")
         points, radii, owners = _box_points(rng, lay, hub_xy, walls, spans, flanges, arms,
-                                            n, b, weld_b, normal, notch_edges, rib, corner_r)
-        if points is None or not 2 <= len(points) <= BOX_MAX_POINTS:
+                                            n, b, weld_b, normal, notch_edges, rib, corner_r,
+                                            weld=weld, deep=deep)
+        lo_n, hi_n = BOX_WELD_POINTS if weld else (2, BOX_MAX_POINTS)
+        if points is None or not lo_n <= len(points) <= hi_n:
             continue
+        kinds = ["bolt" if r is not None else "spot_weld" for r in radii]
 
         box = {"hub_xy": [list(q) for q in hub_xy], "walls": {str(k): w for k, w in walls.items()},
                "closed": sorted(closed), "arms": arms, "flanges": flanges, "deep": deep,
@@ -2164,13 +2175,14 @@ def box_bracket_part(rng: random.Random, knobs: Knobs) -> Result | None:
                "draw_ratio": draw_ratio if closed else None, "group": group,
                "notch_edges": sorted(notch_edges), "relief_corners": len(relieved),
                "rib": rib,
-               "point_radii": radii, "point_owners": owners,
+               "point_radii": radii, "point_owners": owners, "point_kinds": kinds,
+               "weld": weld,
                "factors": {"group": group, "sides": base_sides, "walls": len(walls),
                            "closed": len(closed), "relief": len(relieved),
                            "rib": 1 if rib else 0, "deep": len(deep),
                            "tabs": sum(len(w["tabs"]) for w in walls.values()),
                            "flanges": len(flanges), "arms": len(arms),
-                           "points": len(points)}}
+                           "points": len(points), "welds": kinds.count("spot_weld")}}
         return (dataclasses.replace(spec, point1=points[0], point2=points[1], extra_points=(),
                                     annotated_points=tuple(points), box=box,
                                     target_folds=None, min_bearing_radius_mm=b),
@@ -2179,8 +2191,12 @@ def box_bracket_part(rng: random.Random, knobs: Knobs) -> Result | None:
 
 
 def _box_points(rng, lay, hub_xy, walls, spans, flanges, arms, n, b, weld_b, normal,
-                notch_edges=(), rib=None, corner_r=0.0):
+                notch_edges=(), rib=None, corner_r=0.0, weld=None, deep=()):
     """締結点: 壁の溶接タブ / 壁の面 / 深さ2フランジ / 腕 / ハブ。半径と持ち主も併せて返す。
+
+    weld が与えられたら、壁の上端(タブとフランジの根本を避けた空き区間)と、深さ3の
+    付いていない深さ2フランジの先端と、腕の先端に、縁から weld["edge_mm"] でスポット溶接列を置く(半径 None)。
+    列を置いた壁・フランジには面の点を置かない。
 
     持ち主(`owners`)は「その点を保持している要素」。設計等価バリアントで
     「点の載っていない要素だけ動かす」ために要る。
@@ -2194,12 +2210,28 @@ def _box_points(rng, lay, hub_xy, walls, spans, flanges, arms, n, b, weld_b, nor
         radii.append(r)
         owners.append(owner)
 
+    deepened = {dp["flange"] for dp in deep}
     for edge, fr in sorted(lay["walls"].items()):
         h, tangent = fr["height"], walls[edge]["tangent_mm"]
         for s_c, _r in walls[edge]["tabs"]:                     # タブの円の中心 = 溶接
             add([fr["a"][i] + h * fr["tip"][i] + s_c * fr["axis"][i] for i in range(3)],
                 fr["normal"], weld_b, f"wall_{edge}")
         lo, hi = spans[edge]
+        if weld and h - weld["edge_mm"] - tangent >= WELD_MIN_BEND_MM + 1.0:
+            # タブとフランジの根本を避けた空き区間ごとに列を置く(縁は区間の両端にもある)
+            t = h - weld["edge_mm"]
+            blocked = [(s_c - tab_footprint_mm(r_, MIN_NEUTRAL_PLANE_RADIUS_MM),
+                        s_c + tab_footprint_mm(r_, MIN_NEUTRAL_PLANE_RADIUS_MM))
+                       for s_c, r_ in walls[edge]["tabs"]]
+            blocked += [(fl["from_mm"] - fl["radius_mm"], fl["to_mm"] + fl["radius_mm"])
+                        for fl in flanges if fl["wall"] == edge]
+            row = [g0 + s for g0, g1 in _box_gaps(lo, hi, blocked)
+                   for s in _weld_row(g1 - g0, weld["edge_mm"], weld["pitch_mm"])]
+            for s in row:
+                add([fr["a"][i] + t * fr["tip"][i] + s * fr["axis"][i] for i in range(3)],
+                    fr["normal"], None, f"wall_{edge}")
+            if row:
+                continue
         want_wall = _draw_weighted(rng, BOX_WALL_POINTS)
         placed_s: list = []
         for _try in range(want_wall * 8):
@@ -2233,6 +2265,16 @@ def _box_points(rng, lay, hub_xy, walls, spans, flanges, arms, n, b, weld_b, nor
         p0 = [fr["a"][i] + h * fr["tip"][i] + fl["from_mm"] * fr["axis"][i] for i in range(3)]
         rot = [fr["axis"][i] * side for i in range(3)]
         a2 = _rotate3(p0, centre, rot, angle)
+        j = flanges.index(fl)
+        if (weld and j not in deepened
+                and fl["length_mm"] - weld["edge_mm"] >= WELD_MIN_BEND_MM + 1.0):
+            t = fl["length_mm"] - weld["edge_mm"]
+            row = _weld_row(root, weld["edge_mm"], weld["pitch_mm"])
+            for s in row:
+                add([a2[i] + t * tip_f[i] + s * fr["axis"][i] for i in range(3)],
+                    _unit(_cross3(tip_f, fr["axis"])), None, f"flange_{j}")
+            if row:
+                continue
         t = rng.uniform(b + 1.0, fl["length_mm"] - b)
         s = rng.uniform(b + 1.0, root - b - 1.0)
         add([a2[i] + t * tip_f[i] + s * fr["axis"][i] for i in range(3)],
@@ -2253,6 +2295,14 @@ def _box_points(rng, lay, hub_xy, walls, spans, flanges, arms, n, b, weld_b, nor
         centre = [a[i] - normal[i] * arm["radius_mm"] for i in range(3)]
         a2 = _rotate3(a, centre, axis, angle)
         width = arm["root_to_mm"] - arm["root_from_mm"]
+        if weld and arm["length_mm"] - weld["edge_mm"] >= WELD_MIN_BEND_MM + 1.0:
+            t = arm["length_mm"] - weld["edge_mm"]
+            row = _weld_row(width, weld["edge_mm"], weld["pitch_mm"])
+            for s in row:
+                add([a2[i] + t * tip[i] + s * axis[i] for i in range(3)],
+                    _unit(_cross3(tip, axis)), None, f"arm_{arm['edge']}")
+            if row:
+                continue
         if arm["length_mm"] < 2.0 * b + 2.0 or width < 2.0 * b + 2.0:
             continue
         want_arm = _draw_weighted(rng, BOX_ARM_POINTS)
@@ -2321,6 +2371,30 @@ PANEL_TABS = ((0, 0.35), (1, 0.35), (2, 0.30))
 # ちょうど 1.0 倍で置くと座面比の中央値が 1.00 に張り付き、外形を近似した瞬間に割れる
 # (AMS 依頼 7、2026-09-09)。
 PANEL_SEAT_MARGIN = 1.15
+
+# ---- スポット溶接列(AMS 依頼 9 §3.1/3.2 の着手依頼、2026-09-24。計画 PLAN_spot_weld_rows)
+# 529 の実測: ピッチ中央 43.6mm(実質 30〜70)、縁距離 中央 10.2mm(p25 8.5 / p75 13.9)。
+WELD_EDGE_MM = (7.0, 14.0)          # 縁から列まで(部品ごとに 1 つ)
+WELD_PITCH_MM = (30.0, 70.0)        # 列のピッチ(部品ごとに 1 つ)
+WELD_WALL_HEIGHT_MM = (15.0, 40.0)  # 列を載せる壁腕の平らな長さ(裁定 2026-09-24)
+PANEL_WELD_WALL_P = 0.85            # 空き区間に全長の壁腕を立てる確率
+PANEL_WELD_POINTS = (20, 40)        # 溶接 + ボルトの合計
+BOX_WELD_POINTS = (10, 30)
+# 溶接列版の多面ブラケットはハブを 1.8 倍にする(裁定 2026-09-24)。002-024 の寸法では外周
+# 300〜600mm にピッチ 30〜70 の列しか載らず、溶接 2〜11・合計 10〜16 に偏ったため。
+BOX_WELD_HUB_SCALE = 1.8
+
+
+def _weld_row(width: float, edge_mm: float, pitch_mm: float) -> list[float]:
+    """長さ width の縁に沿った列の s 座標。両端から edge_mm 空け、ピッチ pitch_mm に
+    いちばん近い等間隔で並べる(実際の間隔は pitch の 0.8〜1.33 倍)。"""
+    usable = width - 2.0 * edge_mm
+    if usable < 0.0:
+        return []
+    gaps = round(usable / pitch_mm)
+    if gaps == 0:
+        return [width / 2.0]
+    return [edge_mm + usable * i / gaps for i in range(gaps + 1)]
 
 
 def _panel_beads(rng: random.Random, bearing_mm: float):
@@ -2415,7 +2489,25 @@ def panel_part(rng: random.Random, knobs: Knobs) -> Result | None:
         arms: list = []
         taken: dict = {}
         used_sides: set = set()
-        for _w_i in range(_draw_weighted(rng, PANEL_WALLS)):
+        weld = None
+        if knobs.weld_rows:
+            # 溶接列の載る壁腕は、曲げで区切られた区間ごと・両側に全長で立てる(実車の側面フランジ)
+            weld = {"edge_mm": rng.uniform(*WELD_EDGE_MM), "pitch_mm": rng.uniform(*WELD_PITCH_MM)}
+            h_lo = max(WELD_WALL_HEIGHT_MM[0], weld["edge_mm"] + WELD_MIN_BEND_MM + 1.0)
+            free = _compose_free_segments(steps, taken, b, n_panels)
+            for (k, side), segs in sorted(free.items()):
+                for s0, s1 in segs:
+                    if s1 - s0 < 30.0 or rng.random() >= PANEL_WELD_WALL_P:
+                        continue
+                    height = rng.uniform(h_lo, WELD_WALL_HEIGHT_MM[1])
+                    arms.append({"panel": k, "side": side, "t0_mm": s0, "t1_mm": s1,
+                                 "fold_deg": rng.uniform(*COMPOSE_WALL_FOLD_DEG),
+                                 "radius_mm": rng.uniform(*COMPOSE_ARM_R_MM),
+                                 "length_mm": height,
+                                 "relief_mm": min(ARM_TIP_RELIEF_MM, 0.5 * height - 1.0),
+                                 "outline": {"kind": "rect"}, "role": "wall", "points": []})
+                    taken.setdefault((k, side), []).append((s0, s1))
+        for _w_i in range(0 if weld else _draw_weighted(rng, PANEL_WALLS)):
             free = _compose_free_segments(steps, taken, b, n_panels)
             cands = [(k, s, seg) for (k, s), segs in free.items() for seg in segs
                      if seg[1] - seg[0] >= 30.0 and s not in used_sides]
@@ -2460,20 +2552,24 @@ def panel_part(rng: random.Random, knobs: Knobs) -> Result | None:
                          "role": "arm", "points": []})
             taken.setdefault((k, side), []).append((t0, t0 + width))
 
-        points, radii = _panel_points(rng, spec, steps, arms, lands, b, n_panels)
+        points, radii = _panel_points(rng, spec, steps, arms, lands, b, n_panels, weld)
         if points is None or len(points) < 2:
+            continue
+        kinds = ["bolt" if r is not None else "spot_weld" for r in radii]
+        if weld and not PANEL_WELD_POINTS[0] <= len(points) <= PANEL_WELD_POINTS[1]:
             continue
 
         panel = {"half_width_mm": half_width, "beads": [[y, dataclasses.asdict(bd)]
                                                         for y, bd in beads],
                  "bead_spans": [list(s) for s in spans], "lands": [list(s) for s in lands],
-                 "arms": arms, "point_radii": radii,
+                 "arms": arms, "point_radii": radii, "point_kinds": kinds, "weld": weld,
                  "factors": {"folds": len(steps) - 1, "beads": len(beads),
                              "walls": sum(1 for a in arms if a["role"] == "wall"),
                              "arms": sum(1 for a in arms if a["role"] == "arm"),
                              "tabs": sum(1 for a in arms
                                          if a["outline"]["kind"] == "tabs"),
                              "points": len(points),
+                             "welds": kinds.count("spot_weld"),
                              "half_width_mm": round(half_width, 1)}}
         return (dataclasses.replace(spec, point1=points[0], point2=points[1], extra_points=(),
                                     annotated_points=tuple(points), panel=panel),
@@ -2481,8 +2577,12 @@ def panel_part(rng: random.Random, knobs: Knobs) -> Result | None:
     return None
 
 
-def _panel_points(rng, spec, steps, arms, lands, bearing, n_panels):
-    """締結点: 帯の両端のアンカー + 平地の上 + 腕の上。最大 20。"""
+def _panel_points(rng, spec, steps, arms, lands, bearing, n_panels, weld=None):
+    """締結点: 帯の両端のアンカー + 腕の上 + 壁腕の溶接列 + 平地の上。
+
+    ボルト(アンカー・腕・平地)は最大 20。溶接列(weld が与えられたとき)は壁腕の先端から
+    weld["edge_mm"] の位置に並べ、必要座面半径は None(座面円盤ではなく縁距離の契約)。
+    合計は PANEL_WELD_POINTS の上限まで。"""
     points: list = []
     radii: list = []
     # アンカー(掃引の解が置く2点)。中心線上(y=0)なので中央の平地に載る。
@@ -2492,6 +2592,19 @@ def _panel_points(rng, spec, steps, arms, lands, bearing, n_panels):
 
     for arm in arms:
         if arm["role"] == "wall":
+            if weld is None:
+                continue
+            fr = compose_arm_frame(steps[arm["panel"]], arm["side"], arm["t0_mm"], arm["t1_mm"],
+                                   spec.half_width_mm, arm["fold_deg"], arm["radius_mm"])
+            d = weld["edge_mm"]
+            t = arm["length_mm"] - d
+            if t < WELD_MIN_BEND_MM + 1.0:
+                continue
+            for s in _weld_row(arm["t1_mm"] - arm["t0_mm"], d, weld["pitch_mm"]):
+                pos = tuple(fr["a"][i] + t * fr["tip"][i] + s * fr["axis"][i] for i in range(3))
+                points.append(FasteningPoint(position_xyz=pos, normal_xyz=fr["normal"]))
+                radii.append(None)
+                arm["points"].append([t, s, "spot_weld"])
             continue
         fr = compose_arm_frame(steps[arm["panel"]], arm["side"], arm["t0_mm"], arm["t1_mm"],
                                spec.half_width_mm, arm["fold_deg"], arm["radius_mm"])
@@ -2516,9 +2629,11 @@ def _panel_points(rng, spec, steps, arms, lands, bearing, n_panels):
         radii.append(bearing)
         arm["points"].append([t, s, "bolt"])
 
-    # 平地の上に散らす
+    # 平地の上に散らす(ボルトは 20 まで、溶接と合わせて PANEL_WELD_POINTS の上限まで)
+    welds = sum(1 for r in radii if r is None)
+    cap = min(PANEL_MAX_POINTS + welds, PANEL_WELD_POINTS[1]) if welds else PANEL_MAX_POINTS
     for _ in range(PANEL_POINT_ATTEMPTS):
-        if len(points) >= PANEL_MAX_POINTS:
+        if len(points) >= cap:
             break
         k = rng.randrange(n_panels)
         st = steps[k]

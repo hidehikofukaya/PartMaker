@@ -476,6 +476,11 @@ def reseed_sweep(kind, spec, bead, flange, rib, rng: random.Random, tries: int =
     return None
 
 
+def _has_weld(arm) -> bool:
+    """スポット溶接列(2026-09-24)の載った腕か。"""
+    return any(len(q) > 2 and q[2] == "spot_weld" for q in arm.get("points") or ())
+
+
 def reseed_panel(spec, rng: random.Random, tries: int = 200):
     """大型パネル族を別シードで再実行した設計。
 
@@ -510,6 +515,9 @@ def reseed_panel(spec, rng: random.Random, tries: int = 200):
             break
     arms = []
     for a in pn["arms"]:
+        if _has_weld(a):         # 溶接列は先端から d の位置にあるので長さを動かせない
+            arms.append(a)
+            continue
         if a["role"] == "wall":
             # 低い壁は先端の隅Rを高さに合わせる(生成器と同じ規則。固定のままだと
             # 「先端の逃げが先端を食い尽くす」で落ちる)
@@ -851,6 +859,9 @@ def _panel_variants(spec, count: int):
         for delta in (0.0, 10.0, 20.0):
             arms = []
             for a in pn["arms"]:
+                if _has_weld(a):
+                    arms.append(a)
+                    continue
                 floor = (2.0 * b + 2.0) if a.get("points") else 12.0
                 arms.append(dict(a, length_mm=min(max(floor + delta, 12.0), 60.0)))
             if all(abs(a["length_mm"] - o["length_mm"]) < NEAR_MM

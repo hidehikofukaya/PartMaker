@@ -209,6 +209,8 @@ def structure_of(spec, plan, kind: str) -> dict:
         out.update(panels=1)
     elif plan is not None:
         out.update(folds=len(plan.panel_frames) - 1, panels=len(plan.panel_frames))
+    kinds = ((box or panel or {}).get("point_kinds") or ())
+    out["welds"] = sum(1 for k in kinds if k == "spot_weld")
     return out
 
 
@@ -605,7 +607,10 @@ def generate_recipe_batch(
             # 011型は掃引アンカーが締結点ではないので annotated_points が優先する。
             points = (getattr(spec, "annotated_points", None)
                       or (spec.point1, spec.point2, *getattr(spec, "extra_points", ())))
-            for joint in build_joints(part_id, points, spec.hole_diameter_mm):
+            blk = getattr(spec, "panel", None) or getattr(spec, "box", None) or {}
+            for joint in build_joints(part_id, points, spec.hole_diameter_mm,
+                                      kinds=blk.get("point_kinds"),
+                                      thickness_mm=spec.thickness_mm):
                 doc.add_joint(joint)
             if len(records) % 25 == 0:
                 doc.save()

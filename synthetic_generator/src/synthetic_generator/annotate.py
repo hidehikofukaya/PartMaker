@@ -36,11 +36,30 @@ def build_fastening_joint(joint_id: str, part_id: str, point: FasteningPoint, ho
     )
 
 
-def build_joints(part_id: str, points, hole_diameter_mm: float) -> list[Joint]:
-    """締結点を並び順どおりに j0001, j0002, ... として起こす(点数は任意)。"""
+def build_weld_joint(joint_id: str, part_id: str, point: FasteningPoint, thickness_mm: float) -> Joint:
+    """スポット溶接(2026-09-24)。529 の実注釈と同じく穴ではないので contact_xyz + 板厚。"""
+    return Joint(
+        joint_id=joint_id,
+        type="weld",
+        parts=[part_id],
+        axis=Axis(start_xyz=point.position_xyz, direction_xyz=point.normal_xyz,
+                  length_mm=thickness_mm),
+        per_part=[PartRef(part_id=part_id, contact_xyz=point.position_xyz,
+                          local_thickness_mm=thickness_mm, detection_method="manual")],
+        confidence="synthetic",
+    )
+
+
+def build_joints(part_id: str, points, hole_diameter_mm: float, kinds=None,
+                 thickness_mm: float | None = None) -> list[Joint]:
+    """締結点を並び順どおりに j0001, j0002, ... として起こす(点数は任意)。
+    kinds[i] == "spot_weld" の点は weld ジョイントにする。"""
+    kinds = kinds or ["bolt"] * len(points)
     return [
+        build_weld_joint(f"{part_id}_j{i:04d}", part_id, point, thickness_mm)
+        if kind == "spot_weld" else
         build_fastening_joint(f"{part_id}_j{i:04d}", part_id, point, hole_diameter_mm)
-        for i, point in enumerate(points, start=1)
+        for i, (point, kind) in enumerate(zip(points, kinds), start=1)
     ]
 
 
