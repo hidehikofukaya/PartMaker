@@ -31,10 +31,36 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 import _generations  # noqa: E402
 from synthetic_generator.occt_build import OcctPartBuilder  # noqa: E402
+import measure_variant_spread as _spread
 from synthetic_generator.variants import (  # noqa: E402
-    Variant, build_variant, part_rng, reseed_branch, spec_from_meta, variant_meta,
+    SWEEP_KINDS, Variant, build_variant, part_rng, reseed_part, spec_from_meta, variant_meta,
 )
 
+
+
+# ゲートで落ちたシードを引き直すときに種に足す接尾辞(最初は "" = 元の種)
+RETRY_SUFFIXES = ("", "b", "c", "d", "e", "f", "g", "h")
+
+def _outline_distance_u(base_stp: pathlib.Path, variant_stp: pathlib.Path, meta: dict):
+    """元の部品と変種の外形の距離を u(締結点の間隔)で割った (平均, ハウスドルフ)。
+
+    AMS 依頼 9 §2(2026-09-23): 新しく作る変種に `outline_distance_u_mean` を付ける。
+    閾値はこちらで決めず数値だけ出す。両方向の最近傍距離を取る(片側だと要素を
+    削った変種で 0 になる)。
+    """
+    try:
+        pts = [tuple(q["position_xyz"]) for q in (meta["spec"].get("annotated_points") or [])]
+        if not pts:
+            pts = [tuple(meta["spec"][k]["position_xyz"]) for k in ("point1", "point2")]
+        u = _spread.spacing(pts)
+        a = _spread.outline_points(base_stp)
+        b = _spread.outline_points(variant_stp)
+        if not a or not b or u <= 0.0:
+            return None
+        both = _spread.one_sided(a, b) + _spread.one_sided(b, a)
+        return sum(both) / len(both) / u, max(both) / u
+    except Exception:
+        return None
 
 def main() -> None:
     ap = argparse.ArgumentParser()
@@ -65,39 +91,59 @@ def main() -> None:
     for pid in ids:
         meta = json.loads((chunk / "params" / f"{pid}.json").read_text(encoding="utf-8"))
         spec, bead, flange, rib = spec_from_meta(meta)
-        if spec.branch is None:
-            raise SystemExit(f"{pid}: 別シードの再実行は今は分岐族だけ対応")
+        if not (spec.branch or spec.panel or spec.box or meta["kind"] in SWEEP_KINDS):
+            raise SystemExit(f"{pid}: この族({meta['kind']})は別シードの再実行に未対応")
         entries = [e for e in manifest["parts"].get(pid, []) if e.get("knob") != "reseed"]
         for k in range(1, a.seeds + 1):
-            rng = part_rng(pid, salt=f"reseed{k}")
-            new = reseed_branch(spec, rng)
-            changed = {"branch.arms.length_mm": [[x["length_mm"] for x in spec.branch["arms"]],
-                                                  [x["length_mm"] for x in new.branch["arms"]]],
-                       "branch.corner_radius": [spec.branch["corner_radius"],
-                                                new.branch["corner_radius"]]}
-            v = Variant("reseed", f"s{k}", new, bead, flange, rib, changed)
-            name = v.name(pid)
-            entry = {"name": name, "knob": "reseed", "value": f"s{k}", "changed": changed,
-                     "seed_salt": f"reseed{k}"}
-            try:
-                with contextlib.redirect_stdout(io.StringIO()):
-                    part = build_variant(builder, v, str(out), name)
-                vmeta = variant_meta(meta, v, name)
-                vmeta["generation"] = _generations.stamp(base_gen, base_at,
-                                                         variant_emitted_at=emitted_at)
-                (out / "params" / f"{name}.json").write_text(
-                    json.dumps(vmeta, ensure_ascii=False, indent=1), encoding="utf-8")
-                (out / "features" / f"{name}.json").write_text(
-                    json.dumps({"schema": "partmaker_features/2", "part_id": name,
-                                "source_part_id": pid, "kind": meta["kind"],
-                                "knob": "reseed", "value": f"s{k}",
-                                "faces": list(part.face_labels)}, ensure_ascii=False),
-                    encoding="utf-8")
-                entry.update(status="ok", file=f"variants/{name}_mid.stp")
+            # ゲートで落ちたシードは種を足して引き直す(依頼 9 §1: 30 部品 x 5 本を揃える)。
+            # 名前は s<k> のまま、実際に使った種を seed_salt に残す。
+            entry = None
+            for suffix in RETRY_SUFFIXES:
+                salt = f"reseed{k}{suffix}"
+                got = reseed_part(meta["kind"], spec, bead, flange, rib, part_rng(pid, salt=salt))
+                if got is None:
+                    entry = {"name": f"{pid}__reseed=s{k}", "knob": "reseed", "value": f"s{k}",
+                             "seed_salt": salt, "status": "infeasible",
+                             "reason": "no feasible reseed for this part"}
+                    continue
+                new, nb, nf, nr, changed = got
+                v = Variant("reseed", f"s{k}", new, nb, nf, nr, changed)
+                name = v.name(pid)
+                entry = {"name": name, "knob": "reseed", "value": f"s{k}", "changed": changed,
+                         "seed_salt": salt}
+                try:
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        part = build_variant(builder, v, str(out), name)
+                    vmeta = variant_meta(meta, v, name)
+                    vmeta["generation"] = _generations.stamp(base_gen, base_at,
+                                                             variant_emitted_at=emitted_at)
+                    vmeta["seed_salt"] = salt
+                    dist = _outline_distance_u(chunk / "mid" / f"{pid}_mid.stp",
+                                               pathlib.Path(part.stp_path), meta)
+                    if dist is not None:
+                        entry["outline_distance_u_mean"] = round(dist[0], 5)
+                        entry["outline_distance_u_hausdorff"] = round(dist[1], 5)
+                        vmeta["outline_distance_u_mean"] = round(dist[0], 5)
+                        vmeta["outline_distance_u_hausdorff"] = round(dist[1], 5)
+                    (out / "params" / f"{name}.json").write_text(
+                        json.dumps(vmeta, ensure_ascii=False, indent=1), encoding="utf-8")
+                    (out / "features" / f"{name}.json").write_text(
+                        json.dumps({"schema": "partmaker_features/2", "part_id": name,
+                                    "source_part_id": pid, "kind": meta["kind"],
+                                    "knob": "reseed", "value": f"s{k}",
+                                    "faces": list(part.face_labels)}, ensure_ascii=False),
+                        encoding="utf-8")
+                    stale = out / f"{name}.infeasible"
+                    if stale.exists():
+                        stale.unlink()
+                    entry.update(status="ok", file=f"variants/{name}_mid.stp")
+                    break
+                except Exception as exc:
+                    (out / f"{name}.infeasible").write_text(str(exc)[:300], encoding="utf-8")
+                    entry.update(status="infeasible", reason=str(exc)[:200])
+            if entry["status"] == "ok":
                 built += 1
-            except Exception as exc:
-                (out / f"{name}.infeasible").write_text(str(exc)[:300], encoding="utf-8")
-                entry.update(status="infeasible", reason=str(exc)[:200])
+            else:
                 infeasible += 1
             entries.append(entry)
         manifest["parts"][pid] = entries

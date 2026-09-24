@@ -29,6 +29,11 @@ import zlib
 from synthetic_generator.bead import BeadParams, sample_bead
 from synthetic_generator.classify import FasteningPoint
 from synthetic_generator.families import (
+    BOX_CORNER_R_MM, BOX_CORNER_R_OVER_T, BOX_DEEP_FOLD_DEG, BOX_DEEP_LENGTH_MM,
+    BOX_FLANGE_FOLD_DEG, BOX_FLANGE_LENGTH_MM, BOX_RIB_FOLD_DEG, BOX_RIB_HEIGHT_MM,
+    BOX_WALL_HEIGHT_MM, COMPOSE_ARM_LENGTH_MM, COMPOSE_WALL_HEIGHT_MM,
+    PANEL_BEAD_DEPTH_MM, PANEL_BEAD_RIDGE_MM, PANEL_BEAD_TOP_MM, PANEL_BEAD_WALL_DEG,
+    PANEL_HALF_WIDTH_MM,
     BRANCH_ARM_LENGTH_MM, BRANCH_CORNER_R_MM, CHANNEL_SEAT_DEPTH_MM, CHANNEL_WEB_LENGTH_MM,
     FLAT_PLATE_CORNER_RADIUS_MM, FLAT_PLATE_MARGIN_RATIO, THREE_POINT_MAX_HALF_WIDTH_MM,
     THREE_POINT_SPAN_BEAD_DEPTH_MM, THREE_POINT_SPAN_BEAD_TOP_WIDTH_MM,
@@ -413,6 +418,213 @@ def reseed_branch(spec, rng: random.Random):
         arms.append(dict(a, length_mm=rng.uniform(lo, hi)))
     new = dict(br, arms=arms, corner_radius=rng.uniform(*BRANCH_CORNER_R_MM))
     return dataclasses.replace(spec, branch=new)
+
+
+def reseed_sweep(kind, spec, bead, flange, rib, rng: random.Random, tries: int = 400):
+    """掃引族(occt11 など)を別シードで再実行した設計。
+
+    締結点を固定しても生成器が自由に引けるのは、折り位置(2曲げのみ)・帯の半幅・
+    ビード断面・フランジの側/高さ/根本R。knob の変種はこれを 1 つずつ動かすが、
+    ここでは**全部同時に**引き直す(AMS 依頼 8 ⑤ / 依頼 9 §1)。
+    """
+    lo_w = max(spec.min_bearing_radius_mm, _lateral_need_mm(spec))
+    if getattr(spec, "taper_half_width_mm", None):
+        lo_w = max(lo_w, spec.taper_half_width_mm + 2.0)
+    if rib is not None:
+        lo_w = max(lo_w, rib.half_width_mm + 3.0)
+    hi_w = _width_cap(kind)
+    for _ in range(tries):
+        cand = spec
+        if spec.target_folds == 2:
+            cand = dataclasses.replace(
+                cand, fold1_slack_mm=rng.uniform(*FOLD_SLACK_RANGE_MM),
+                fold2_slack_mm=rng.uniform(*FOLD_SLACK_RANGE_MM))
+        if hi_w - lo_w > NEAR_MM:
+            cand = dataclasses.replace(cand, half_width_mm=rng.uniform(lo_w, hi_w))
+        nb = sample_bead(rng, cand.half_width_mm) if bead is not None else None
+        nf = flange
+        if flange is not None:
+            try:
+                plan = plan_for(cand)
+                h_max = min(FLANGE_HEIGHT_RANGE_MM[1],
+                            max_flange_height_mm(plan.panel_frames, flange.direction,
+                                                 cand.bend_radius_mm))
+            except ValueError:
+                continue
+            # 高さの余裕が無い部品は元の高さのまま(他の要素だけ引き直す)
+            h = (flange.height_mm if h_max <= FLANGE_HEIGHT_RANGE_MM[0] + NEAR_MM
+                 else rng.uniform(FLANGE_HEIGHT_RANGE_MM[0], h_max))
+            side = flange.side
+            if not flange.both_sides and rng.random() < 0.5:
+                side = -side
+            nf = dataclasses.replace(
+                flange, side=side, height_mm=h,
+                root_radius_mm=rng.uniform(*FLANGE_ROOT_RADIUS_RANGE_MM))
+        if not _feasible(cand, nb, nf, rib):
+            continue
+        changed = {"half_width_mm": [spec.half_width_mm, cand.half_width_mm]}
+        if spec.target_folds == 2:
+            changed["fold1_slack_mm"] = [spec.fold1_slack_mm, cand.fold1_slack_mm]
+            changed["fold2_slack_mm"] = [spec.fold2_slack_mm, cand.fold2_slack_mm]
+        if nb is not None:
+            changed["bead"] = [[bead.depth_mm, bead.top_width_mm],
+                               [nb.depth_mm, nb.top_width_mm]]
+        if nf is not None:
+            changed["flange"] = [[flange.side, flange.height_mm, flange.root_radius_mm],
+                                 [nf.side, nf.height_mm, nf.root_radius_mm]]
+        return cand, nb, nf, rib, changed
+    return None
+
+
+def reseed_panel(spec, rng: random.Random, tries: int = 200):
+    """大型パネル族を別シードで再実行した設計。
+
+    締結点は平地(ビードの間と外)と腕の上に載っているので、
+    **ビードの足幅を元より広げない**(平地が痩せない)・**帯幅は広げる側だけ**・
+    **点の載る腕は座面が入る長さを保つ**、の 3 つを守れば点はそのまま使える。
+    ビードの本数と中心は据え置き、断面の形だけを引き直す。
+    """
+    pn = spec.panel
+    b = spec.min_bearing_radius_mm
+    spans = pn.get("bead_spans") or []
+    fp_old = min(((hi - lo) / 2.0 for lo, hi in spans), default=None)
+    beads = pn["beads"]
+    new_beads, fp_new = beads, fp_old
+    if beads and fp_old:
+        for _ in range(tries):
+            wall = rng.uniform(*PANEL_BEAD_WALL_DEG)
+            ridge = rng.uniform(*PANEL_BEAD_RIDGE_MM)
+            depth = rng.uniform(*PANEL_BEAD_DEPTH_MM)
+            top = rng.uniform(*PANEL_BEAD_TOP_MM)
+            theta = math.radians(wall)
+            sb = ridge * math.tan(theta / 2.0)
+            fp = top / 2.0 + depth / math.tan(theta) + sb
+            if fp > fp_old or top / 2.0 <= sb + 0.2:
+                continue
+            if depth - 2.0 * sb * math.sin(theta) <= 0.5:
+                continue
+            new_beads = [[y, dict(bd, depth_mm=depth, top_width_mm=top,
+                                  wall_angle_deg=wall, ridge_radius_mm=ridge)]
+                         for y, bd in beads]
+            fp_new = fp
+            break
+    arms = []
+    for a in pn["arms"]:
+        if a["role"] == "wall":
+            # 低い壁は先端の隅Rを高さに合わせる(生成器と同じ規則。固定のままだと
+            # 「先端の逃げが先端を食い尽くす」で落ちる)
+            h = rng.uniform(*COMPOSE_WALL_HEIGHT_MM)
+            arms.append(dict(a, length_mm=h,
+                             relief_mm=min(ARM_TIP_RELIEF_MM, 0.5 * h - 1.0)))
+            continue
+        if (a.get("outline") or {}).get("kind") == "tabs":
+            arms.append(dict(a))        # 溶接タブは腕の先端そのもの = 長さを動かすと点が動く
+            continue
+        # 点を載せた腕を短くすると点が先端の外に出る。点の走行位置 + 座面を下限にする
+        held = [t for t, _s, _k in (a.get("points") or [])]
+        lo = max(COMPOSE_ARM_LENGTH_MM[0],
+                 2.0 * a.get("relief_mm", ARM_TIP_RELIEF_MM) + 2.0,
+                 (max(held) + b + 1.0) if held else 0.0)
+        arms.append(dict(a, length_mm=rng.uniform(lo, max(lo + 1.0, COMPOSE_ARM_LENGTH_MM[1]))))
+    # 腕は帯の側辺(中心線から半幅の位置)に付くので、帯幅を変えると腕ごと動く。
+    # 点を載せた腕があるときは帯幅を固定する(2026-09-23 実測: 半幅だけ変えると腕の点が浮く)
+    if any(a.get("points") for a in pn["arms"]):
+        hw = pn["half_width_mm"]
+    else:
+        hw = rng.uniform(pn["half_width_mm"], max(pn["half_width_mm"] + 1.0,
+                                                  PANEL_HALF_WIDTH_MM[1]))
+    new = dict(pn, beads=new_beads, arms=arms, half_width_mm=hw,
+               bead_spans=([[y - fp_new, y + fp_new] for y, _bd in new_beads]
+                           if fp_new else pn.get("bead_spans", [])))
+    changed = {"half_width_mm": [pn["half_width_mm"], hw],
+               "panel.bead_footprint_mm": [fp_old, fp_new],
+               "panel.arms.length_mm": [[a["length_mm"] for a in pn["arms"]],
+                                        [a["length_mm"] for a in arms]]}
+    return dataclasses.replace(spec, half_width_mm=hw, panel=new), None, None, None, changed
+
+
+def reseed_box(spec, rng: random.Random):
+    """多面ブラケット族を別シードで再実行した設計。
+
+    締結点はハブ・壁の面・壁の上端のタブ・腕・深さ2フランジに載る。タブは壁の上端
+    そのものなので**タブのある壁の高さは動かせない**。角のR を大きくすると壁の面の点が
+    フィレット帯に掛かるので**小さい側だけ**。それ以外(点の載っていない壁の高さ、
+    腕・フランジ・深さ3の長さ、リブの断面)は全部同時に引き直す。
+    """
+    bx = spec.box
+    b = spec.min_bearing_radius_mm
+    owners = set(bx.get("point_owners") or ())
+    r_lo = max(BOX_CORNER_R_MM[0], BOX_CORNER_R_OVER_T * spec.thickness_mm)
+    r_hi = max(r_lo, bx["corner_r_mm"])
+    corner_r = rng.uniform(r_lo, r_hi)
+    walls = {}
+    for k, w in bx["walls"].items():
+        tangent = corner_r * math.tan(math.radians(w["fold_deg"]) / 2.0)
+        on_wall = "wall_" + str(k)
+        free = (on_wall not in owners and not w["tabs"]
+                and not any(str(f["wall"]) == str(k) for f in bx["flanges"]))
+        h = w["height_mm"]
+        if free:
+            lo = max(BOX_WALL_HEIGHT_MM[0], tangent + 8.0)
+            h = rng.uniform(lo, max(lo + 1.0, BOX_WALL_HEIGHT_MM[1]))
+        walls[k] = dict(w, height_mm=h, fillet_mm=corner_r, tangent_mm=tangent)
+    flanges = []
+    for i, f in enumerate(bx["flanges"]):
+        held = ("flange_" + str(i)) in owners
+        # 点を持つ要素は局所座標を記録していないので**伸ばす側だけ**にする
+        lo = f["length_mm"] if held else BOX_FLANGE_LENGTH_MM[0]
+        flanges.append(dict(f, length_mm=rng.uniform(lo, max(lo + 1.0, BOX_FLANGE_LENGTH_MM[1])),
+                            fold_deg=(f["fold_deg"] if held
+                                      else rng.uniform(*BOX_FLANGE_FOLD_DEG))))
+    deep = []
+    for j, d in enumerate(bx.get("deep", [])):
+        held = ("deep_" + str(j)) in owners
+        lo = d["length_mm"] if held else BOX_DEEP_LENGTH_MM[0]
+        deep.append(dict(d, length_mm=rng.uniform(lo, max(lo + 1.0, BOX_DEEP_LENGTH_MM[1])),
+                         fold_deg=(d["fold_deg"] if held
+                                   else rng.uniform(*BOX_DEEP_FOLD_DEG))))
+    arms = []
+    for a in bx["arms"]:
+        held = ("arm_" + str(a["edge"])) in owners
+        lo = max(a["length_mm"] if held else 15.0,
+                 2.0 * a.get("relief_mm", ARM_TIP_RELIEF_MM) + 2.0)
+        arms.append(dict(a, length_mm=rng.uniform(lo, max(lo + 1.0, 55.0))))
+    rib = bx.get("rib")
+    if rib:
+        band = rib["t1_mm"] - rib["t0_mm"]
+        for _ in range(40):
+            h = rng.uniform(*BOX_RIB_HEIGHT_MM)
+            fold = rng.uniform(*BOX_RIB_FOLD_DEG)
+            if band > 2.0 * h / math.tan(math.radians(fold)) + 6.0:
+                rib = dict(rib, height_mm=h, fold_deg=fold)
+                break
+    new = dict(bx, corner_r_mm=corner_r, walls=walls, flanges=flanges, deep=deep,
+               arms=arms, rib=rib)
+    changed = {"box.corner_r_mm": [bx["corner_r_mm"], corner_r],
+               "box.walls.height_mm": [{k: w["height_mm"] for k, w in bx["walls"].items()},
+                                       {k: w["height_mm"] for k, w in walls.items()}],
+               "box.arms.length_mm": [[a["length_mm"] for a in bx["arms"]],
+                                      [a["length_mm"] for a in arms]]}
+    return dataclasses.replace(spec, box=new), None, None, None, changed
+
+
+def reseed_part(kind, spec, bead, flange, rib, rng: random.Random):
+    """族に依らず「同じ締結点・同じ spec のまま生成器を別シードで再実行」した設計。
+    戻り値 (spec, bead, flange, rib, changed)、作れなければ None。"""
+    if spec.branch is not None:
+        new = reseed_branch(spec, rng)
+        changed = {"branch.arms.length_mm": [[x["length_mm"] for x in spec.branch["arms"]],
+                                             [x["length_mm"] for x in new.branch["arms"]]],
+                   "branch.corner_radius": [spec.branch["corner_radius"],
+                                            new.branch["corner_radius"]]}
+        return new, bead, flange, rib, changed
+    if spec.panel is not None:
+        return reseed_panel(spec, rng)
+    if spec.box is not None:
+        return reseed_box(spec, rng)
+    if kind in SWEEP_KINDS:
+        return reseed_sweep(kind, spec, bead, flange, rib, rng)
+    return None
 
 
 def _branch_variants(spec, count: int):
