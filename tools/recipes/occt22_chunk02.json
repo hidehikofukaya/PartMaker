@@ -1,0 +1,10 @@
+{
+  "family": "occt22",
+  "chunk": 2,
+  "seed": 20260925,
+  "note": "多面ブラケット族 + スポット溶接列(AMS 依頼 9 §3.1/3.2 の着手依頼、2026-09-24)300部品。bend / draw 各150(plate は壁が無いので除く)。ハブを 1.8 倍(002-024 の寸法では溶接 2〜11 点にしかならないため、裁定 2026-09-24)。壁の上端(タブ・フランジの根本を避けた空き区間)・深さ2フランジの先端・腕の先端に d=7〜14mm、ピッチ 30〜70mm の列。合計 10〜30。計画 docs/PLAN_spot_weld_rows_2026-09-24.md。",
+  "parts": [
+    { "kind": "box_bracket", "count": 150, "knobs": { "box_group": "bend", "weld_rows": true } },
+    { "kind": "box_bracket", "count": 150, "knobs": { "box_group": "draw", "weld_rows": true } }
+  ]
+}

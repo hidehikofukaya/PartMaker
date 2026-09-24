@@ -119,6 +119,10 @@ ARM_CLEARANCE_MM = 1.0
 # 腕の根元(曲げ線の両端)の逃がしノッチ半径。応力集中を防ぐための最低R。
 # 腕の先の隅を落とす量。矩形をある程度保つため最小Rに留める。
 ARM_TIP_RELIEF_MM = MIN_NEUTRAL_PLANE_RADIUS_MM
+# スポット溶接の契約(AMS 依頼 9 の着手依頼、2026-09-24): 座面円盤ではなく
+# 自由縁まで WELD_MIN_EDGE_MM、曲げ接線(他の面との境界)まで WELD_MIN_BEND_MM。
+WELD_MIN_EDGE_MM = 5.0
+WELD_MIN_BEND_MM = 3.0
 # ガセット(腕どうしを繋ぐ面取り壁)の曲げRと最小高さ。
 GUSSET_BEND_R_MM = MIN_NEUTRAL_PLANE_RADIUS_MM
 GUSSET_MIN_HEIGHT_MM = 10.0
@@ -1028,13 +1032,24 @@ def _check_bearing_margin(shape, points, radii, tolerance_mm: float = 0.3,
     2026-09-06 夜の初版は外形(自由エッジ)までの距離だけを見ていた。座面は本来
     「平らな円盤」なので、折り線・ビードの足・フィレットの接線までの距離も見る
     (裁定 2026-09-09。外形だけの判定では occt22 の 6% が折り線に座面を食われていた)。
+
+    半径が None の点はスポット溶接: 自由縁まで WELD_MIN_EDGE_MM、他の辺まで WELD_MIN_BEND_MM。
     """
     amap = TopTools_IndexedDataMapOfShapeListOfShape()
     topexp.MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, amap)
-    free = [topods.Edge(amap.FindKey(i)) for i in range(1, amap.Size() + 1)
-            if include_internal or amap.FindFromIndex(i).Size() == 1]
+    edges = [(topods.Edge(amap.FindKey(i)), amap.FindFromIndex(i).Size() == 1)
+             for i in range(1, amap.Size() + 1)]
+    free = [e for e, is_free in edges if include_internal or is_free]
     for index, (point, radius) in enumerate(zip(points, radii)):
         vertex = BRepBuilderAPI_MakeVertex(gp_Pnt(*point.position_xyz)).Vertex()
+        if radius is None:
+            d_edge, d_bend = weld_distances(vertex, edges)
+            if d_edge < WELD_MIN_EDGE_MM - tolerance_mm or d_bend < WELD_MIN_BEND_MM - tolerance_mm:
+                raise ValueError(
+                    f"spot weld {index + 1} is {d_edge:.1f}mm from the free edge and "
+                    f"{d_bend:.1f}mm from the nearest bend/boundary (need "
+                    f"{WELD_MIN_EDGE_MM:.0f} / {WELD_MIN_BEND_MM:.0f}mm). Infeasible; resample.")
+            continue
         worst = float("inf")
         for edge in free:
             dist = BRepExtrema_DistShapeShape(vertex, edge)
@@ -1045,6 +1060,19 @@ def _check_bearing_margin(shape, points, radii, tolerance_mm: float = 0.3,
                 f"fastening point {index + 1} has only {worst:.1f}mm of flat around it "
                 f"(bearing radius {radius:.1f}mm). Infeasible; resample."
             )
+
+
+def weld_distances(vertex, edges) -> tuple[float, float]:
+    """溶接点(vertex)から (自由縁までの最短, 他の辺までの最短)。edges = [(edge, 自由か), ...]。"""
+    d_edge = d_bend = float("inf")
+    for edge, is_free in edges:
+        dist = BRepExtrema_DistShapeShape(vertex, edge)
+        dist.Perform()
+        if is_free:
+            d_edge = min(d_edge, dist.Value())
+        else:
+            d_bend = min(d_bend, dist.Value())
+    return d_edge, d_bend
 
 
 def sweep_steps(plan, bend_radius_mm: float):

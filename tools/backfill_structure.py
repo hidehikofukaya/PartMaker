@@ -63,8 +63,11 @@ def _points(meta: dict) -> list[tuple]:
     return [tuple(p["position_xyz"]) for p in pts]
 
 
-def seat_ratios(stp: pathlib.Path, points, radii) -> tuple[float, float]:
-    """(全エッジでの最小座面比, 外形だけでの最小座面比)。"""
+def seat_ratios(stp: pathlib.Path, points, radii, welds: list | None = None) -> tuple[float, float]:
+    """(全エッジでの最小座面比, 外形だけでの最小座面比)。
+
+    半径が None の点(スポット溶接、2026-09-24)は座面比に入れず、welds が渡されていれば
+    (自由縁まで, 他の辺まで) の実測を追記する。"""
     import synthetic_generator.occt_build as ob
     from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_MakeVertex
     from OCC.Core.BRepExtrema import BRepExtrema_DistShapeShape
@@ -83,6 +86,10 @@ def seat_ratios(stp: pathlib.Path, points, radii) -> tuple[float, float]:
     worst_all = worst_out = float("inf")
     for p, r in zip(points, radii):
         v = BRepBuilderAPI_MakeVertex(gp_Pnt(*p)).Vertex()
+        if r is None:
+            if welds is not None:
+                welds.append(ob.weld_distances(v, edges))
+            continue
         d_all = d_out = float("inf")
         for e, free in edges:
             dist = BRepExtrema_DistShapeShape(v, e)
@@ -95,6 +102,8 @@ def seat_ratios(stp: pathlib.Path, points, radii) -> tuple[float, float]:
                 d_out = min(d_out, d)
         worst_all = min(worst_all, d_all / r)
         worst_out = min(worst_out, d_out / r)
+    if worst_all == float("inf"):      # ボルト点が無い(全部溶接)
+        return None, None
     return round(worst_all, 4), round(worst_out, 4)
 
 
@@ -126,9 +135,14 @@ def work_part(args) -> tuple[str, str]:
     if stp.exists() and pts:
         try:
             radii, source = _radii(meta, len(pts))
-            st["seat_ratio_min"], st["seat_ratio_outline_min"] = seat_ratios(stp, pts, radii)
+            welds: list = []
+            st["seat_ratio_min"], st["seat_ratio_outline_min"] = seat_ratios(stp, pts, radii, welds)
             st["seat_ratio_definition"] = "min(dist(point, nearest edge) / bearing_radius)"
-            st["bearing_radii"] = [round(r, 4) for r in radii]
+            st["bearing_radii"] = [None if r is None else round(r, 4) for r in radii]
+            if welds:     # スポット溶接(半径 None)は座面比から外し、縁距離の実測を渡す
+                st["seat_ratio_scope"] = "bolt points only (spot welds excluded)"
+                st["spot_weld_d_edge_mm"] = [round(e, 3) for e, _b in welds]
+                st["spot_weld_d_bend_mm"] = [round(b_, 3) for _e, b_ in welds]
             st["bearing_radii_source"] = source
         except Exception as exc:     # 読めない STEP は値を入れず理由を残す
             st["seat_ratio_error"] = str(exc)[:120]
